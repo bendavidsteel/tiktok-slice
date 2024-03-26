@@ -1,0 +1,6 @@
+dask
+distributed
+dask-cloudprovider[aws]
+httpx
+tqdm
+python-dotenv

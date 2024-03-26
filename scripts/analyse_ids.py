@@ -1,4 +1,5 @@
 import collections
+import datetime
 import json
 import os
 
@@ -6,6 +7,86 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
+
+def plot_found_segments(video_other_bits, fig_dir_path):
+    found_intervals = [(0,9), (10,13), (14,17), (18,29), (30,31)]
+    bit_sections = []
+    for interval in found_intervals:
+        bit_sections.append([int(b[interval[0]:interval[1]+1], 2) for b in video_other_bits])
+
+    # plot histogram of each section
+    fig, ax = plt.subplots(ncols=len(bit_sections), figsize=(len(bit_sections) * 4, 5))
+    for i, (interval, section) in enumerate(zip(found_intervals, bit_sections)):
+        num_unique = len(set(section))
+        counter = collections.Counter(section)
+        bins = np.array([j for j in range(2 ** (interval[1] + 1 - interval[0]))])
+        counts = np.array([counter[j] for j in range(2 ** (interval[1] + 1 - interval[0]))])
+        if (interval[1] + 1 - interval[0]) <= 4:
+            ax[i].bar(bins, counts)
+        else:
+            ax[i].plot(bins, counts)
+            ax[i].set_ylim([0, max(counts) * 1.1])
+        ax[i].set_title(f'Section {interval[0]}-{interval[1]}, {num_unique} unique values')
+        ax[i].set_xlabel('Value')
+        ax[i].set_ylabel('Count')
+    fig.savefig(os.path.join(fig_dir_path, 'found_segments_distribution.png'))
+
+def get_most_probable_bits(video_other_bits, fig_dir_path):
+    interval = (10,31)
+    section = [int(b[interval[0]:interval[1]+1], 2) for b in video_other_bits]
+
+    # plot percentage of potential IDs hit vs number of combinations
+    probs = [1 - (10 ** i) for i in range(-1, -7, -1)]
+    all_num_combos = []
+    for prob in probs:
+        num_combos = 1
+        counter = collections.Counter(section)
+        bins = np.array([j for j in range(2 ** (interval[1] + 1 - interval[0]))])
+        counts = np.array([counter[j] for j in range(2 ** (interval[1] + 1 - interval[0]))])
+        bin_probs = counts / np.sum(counts)
+        bin_probs = np.sort(bin_probs)[::-1]
+        cum_probs = np.cumsum(bin_probs)
+        # get all bins that cover prob of the data
+        num_bins = np.argmax(cum_probs > prob) + 1
+        num_combos *= num_bins
+        all_num_combos.append(num_combos)
+
+    fig, ax = plt.subplots()
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+    ax.plot(probs, all_num_combos)
+    ax.set_title('Number of combinations vs percentage of potential IDs hit')
+    ax.set_xlabel('Percentage of potential IDs hit')
+    ax.set_ylabel('Number of combinations')
+    fig.savefig(os.path.join(fig_dir_path, 'potential_ids_vs_combinations.png'))
+
+    prob = 0.999
+    combos = {}
+    counter = collections.Counter(section)
+    bins = np.array([j for j in range(2 ** (interval[1] + 1 - interval[0]))])
+    counts = np.array([counter[j] for j in range(2 ** (interval[1] + 1 - interval[0]))])
+
+    fig, ax = plt.subplots()
+    ax.plot(bins, counts)
+    ax.set_title(f'Section {interval[0]}-{interval[1]}')
+    ax.set_xlabel('Value')
+    ax.set_ylabel('Count')
+    fig.savefig(os.path.join(fig_dir_path, 'section_distribution.png'))
+
+    bin_probs = counts / np.sum(counts)
+    prob_order = np.argsort(bin_probs)[::-1]
+    bins_ordered = bins[prob_order]
+    bin_probs = bin_probs[prob_order]
+    cum_probs = np.cumsum(bin_probs)
+    # get all bins that cover prob of the data
+    num_bins = np.argmax(cum_probs > prob) + 1
+    combos[str(interval)] = bins_ordered[:num_bins].tolist()
+
+    with open(os.path.join(fig_dir_path, f"{str(prob).replace('.', '_')}_found_segments_combinations.json"), 'w') as file:
+        json.dump(combos, file, indent=4)
+
+    with open(os.path.join(fig_dir_path, 'all_found_segments_combinations.json'), 'w') as file:
+        json.dump({str(interval): list(set(section))}, file, indent=4)
 
 def do_analysis(video_ids, fig_dir_path):
     video_bits = [format(int(id), '064b') for id in video_ids]
@@ -34,7 +115,7 @@ def do_analysis(video_ids, fig_dir_path):
         fig.savefig(os.path.join(fig_dir_path, 'time_distribution.png'))
 
     video_other_bits = [b[32:] for b in video_bits]
-    if True:
+    if False:
         for section_size in [1, 2, 4, 8]:
             bit_sections = [[] for _ in range(32 // section_size)]
             for other_bits in video_other_bits:
@@ -109,74 +190,11 @@ def do_analysis(video_ids, fig_dir_path):
         fig.savefig(os.path.join(fig_dir_path, 'bit_attention_map.png'))
 
     if True:
+        plot_found_segments(video_other_bits, fig_dir_path)
+        
 
-        found_intervals = [(0,9), (10,13), (14,17), (18,29), (30,31)]
-        bit_sections = []
-        for interval in found_intervals:
-            bit_sections.append([int(b[interval[0]:interval[1]+1], 2) for b in video_other_bits])
-
-        # plot histogram of each section
-        fig, ax = plt.subplots(ncols=len(bit_sections), figsize=(len(bit_sections) * 4, 5))
-        for i, (interval, section) in enumerate(zip(found_intervals, bit_sections)):
-            num_unique = len(set(section))
-            counter = collections.Counter(section)
-            bins = np.array([j for j in range(2 ** (interval[1] + 1 - interval[0]))])
-            counts = np.array([counter[j] for j in range(2 ** (interval[1] + 1 - interval[0]))])
-            if (interval[1] + 1 - interval[0]) <= 4:
-                ax[i].bar(bins, counts)
-            else:
-                ax[i].plot(bins, counts)
-                ax[i].set_ylim([0, max(counts) * 1.1])
-            ax[i].set_title(f'Section {interval[0]}-{interval[1]}, {num_unique} unique values')
-            ax[i].set_xlabel('Value')
-            ax[i].set_ylabel('Count')
-        fig.savefig(os.path.join(fig_dir_path, 'found_segments_distribution.png'))
-
-        # plot percentage of potential IDs hit vs number of combinations
-        probs = [1 - (10 ** i) for i in range(-1, -7, -1)]
-        all_num_combos = []
-        for prob in probs:
-            num_combos = 1
-            for i, (interval, section) in enumerate(zip(found_intervals, bit_sections)):
-                num_unique = len(set(section))
-                counter = collections.Counter(section)
-                bins = np.array([j for j in range(2 ** (interval[1] + 1 - interval[0]))])
-                counts = np.array([counter[j] for j in range(2 ** (interval[1] + 1 - interval[0]))])
-                bin_probs = counts / np.sum(counts)
-                bin_probs = np.sort(bin_probs)[::-1]
-                cum_probs = np.cumsum(bin_probs)
-                # get all bins that cover prob of the data
-                num_bins = np.argmax(cum_probs > prob) + 1
-                num_combos *= num_bins
-            all_num_combos.append(num_combos)
-
-        fig, ax = plt.subplots()
-        ax.set_xscale('log')
-        ax.set_yscale('log')
-        ax.plot(probs, all_num_combos)
-        ax.set_title('Number of combinations vs percentage of potential IDs hit')
-        ax.set_xlabel('Percentage of potential IDs hit')
-        ax.set_ylabel('Number of combinations')
-        fig.savefig(os.path.join(fig_dir_path, 'potential_ids_vs_combinations.png'))
-
-        prob = 0.999
-        combos = {}
-        for i, (interval, section) in enumerate(zip(found_intervals, bit_sections)):
-            num_unique = len(set(section))
-            counter = collections.Counter(section)
-            bins = np.array([j for j in range(2 ** (interval[1] + 1 - interval[0]))])
-            counts = np.array([counter[j] for j in range(2 ** (interval[1] + 1 - interval[0]))])
-            bin_probs = counts / np.sum(counts)
-            prob_order = np.argsort(bin_probs)[::-1]
-            bins_ordered = bins[prob_order]
-            bin_probs = bin_probs[prob_order]
-            cum_probs = np.cumsum(bin_probs)
-            # get all bins that cover prob of the data
-            num_bins = np.argmax(cum_probs > prob) + 1
-            combos[str(interval)] = bins_ordered[:num_bins].tolist()
-
-        with open(os.path.join(fig_dir_path, f'{str(prob).replace('.', '_')}_found_segments_combinations.json'), 'w') as file:
-            json.dump(combos, file, indent=4)
+    if True:
+        get_most_probable_bits(video_other_bits, fig_dir_path)
 
 
 def main():
@@ -185,27 +203,42 @@ def main():
 
     countries = ['brazil', 'canada', 'germany', 'indonesia', 'nigeria']
 
-    all_country_video_ids = []
+    all_videos = []
     for country in countries:
-        country_video_ids = []
+        country_videos = []
         for filename in os.listdir(os.path.join(data_dir_path, country, 'videos')):
             if filename.endswith(".json"):
                 with open(os.path.join(data_dir_path, country, 'videos', filename), 'r') as file:
                     videos = json.load(file)
-                country_video_ids.extend([v['id'] for v in videos])
+                country_videos.extend([{'id': v['id'], 'createtime': datetime.datetime.fromtimestamp(v['createTime'])} for v in videos])
             elif 'parquet' in filename:
                 video_df = pd.read_parquet(os.path.join(data_dir_path, country, 'videos', filename))
                 if 'id' in video_df.columns:
-                    file_ids = video_df['id'].to_list()
+                    video_df = video_df.rename(columns={'createTime': 'createtime'})
+                    file_videos = video_df[['id', 'createtime']].to_dict('records')
+                    file_videos = [{'id': v['id'], 'createtime': datetime.datetime.fromtimestamp(v['createtime'])} for v in file_videos]
                 elif 'video_id' in video_df.columns:
-                    file_ids = video_df['video_id'].to_list()
-                country_video_ids.extend(file_ids)
+                    video_df = video_df.rename(columns={'video_id': 'id'})
+                    file_videos = video_df[['id', 'createtime']].to_dict('records')
+                    file_videos = [{'id': v['id'], 'createtime': v['createtime'].to_pydatetime()} for v in file_videos]
+                
+                country_videos.extend(file_videos)
+        country_video_ids = [v['id'] for v in country_videos]
         country_video_ids = list(set(country_video_ids))
         country_fig_dir_path = os.path.join(this_dir_path, "..", "figs", country)
         if not os.path.exists(country_fig_dir_path):
             os.makedirs(country_fig_dir_path)
         do_analysis(country_video_ids, country_fig_dir_path)
-        all_country_video_ids.extend(country_video_ids)
+        all_videos.extend(country_videos)
+
+    createtimes = [v['createtime'] for v in country_videos]
+    years = set(c.year for c in createtimes)
+    for year in years:
+        year_ids = [v['id'] for v in all_videos if v['createtime'].year == year]
+        year_fig_dir_path = os.path.join(this_dir_path, '..', 'figs', str(year))
+        if not os.path.exists(year_fig_dir_path):
+            os.makedirs(year_fig_dir_path)
+        do_analysis(year_ids, year_fig_dir_path)
 
     canadian_comment_ids = []
     for filename in os.listdir(os.path.join(data_dir_path, 'canada', 'comments')):
@@ -230,7 +263,10 @@ def main():
     do_analysis(canadian_user_ids, canadian_fig_user_dir_path)
 
     all_fig_dir_path = os.path.join(this_dir_path, "..", "figs", "all_videos")
-    do_analysis(all_country_video_ids, all_fig_dir_path)
+    all_video_ids = [v['id'] for v in all_videos]
+    do_analysis(all_video_ids, all_fig_dir_path)
+
+
 
     
 

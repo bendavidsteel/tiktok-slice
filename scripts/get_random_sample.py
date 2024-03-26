@@ -1,19 +1,22 @@
 import asyncio
-import collections
 import datetime
 import itertools
 import json
 import multiprocessing
 import os
 import random
-import urllib.parse as url_parsers
+import time
+import traceback
+from typing import Callable, Coroutine, Iterable, List, Optional
 
+from dask.distributed import Client as DaskClient
+from dask.distributed import LocalCluster as DaskLocalCluster
+from distributed.scheduler import KilledWorker
+from dask_cloudprovider.aws import FargateCluster as DaskFargateCluster
+import dotenv
 import httpx
 from tqdm.asyncio import tqdm as atqdm
 from tqdm import tqdm
-
-import asyncio
-from typing import Callable, Coroutine, Iterable, List, Optional
 
 
 async def aworker(
@@ -115,7 +118,7 @@ async def amap(
         results.append(res)
     return results
 
-async def amap_all(coroutine, data, num_workers=10):
+async def async_map(coroutine, data, num_workers=10):
     pbar = atqdm(total=len(data))  # track progress tqdm
 
     def callback(*_):
@@ -125,11 +128,94 @@ async def amap_all(coroutine, data, num_workers=10):
     pbar.close()
     return res
 
-def map_pool(function, data):
+def pool_map(function, data):
     with multiprocessing.Pool(10) as pool:
         res = list(tqdm(pool.imap(function, data), total=len(data)))  # track progress tqdm
     pool.join()
     return res
+
+def wait_until(condition, interval=0.1, timeout=1, *args):
+    start = time.time()
+    while not condition(*args) and time.time() - start < timeout:
+        time.sleep(interval)
+    if time.time() - start >= timeout:
+        raise TimeoutError("Timed out waiting for condition")
+
+class DaskCluster:
+    def __init__(self, cluster_type):
+        if cluster_type == 'fargate':
+            self.cluster = DaskFargateCluster(
+                fargate_spot=True,
+                image="daskdev/dask:latest-py3.10", 
+                environment={'EXTRA_PIP_PACKAGES': 'httpx==0.27.0 tqdm==4.66.2 lz4==4.3.3 msgpack==1.0.8 toolz==0.12.1'},
+                worker_cpu=256,
+                worker_nthreads=1,
+                worker_mem=512,
+                n_workers=0,
+                aws_access_key_id=os.environ['AWS_ACCESS_KEY'],
+                aws_secret_access_key=os.environ['AWS_SECRET_KEY']
+            )
+        elif cluster_type == 'local':
+            self.cluster = DaskLocalCluster()
+
+    def __enter__(self):
+        return self.cluster
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.cluster is not None:
+            self.cluster.close()
+
+def dask_map(function, args, num_workers=16, reqs_per_ip=1000, max_task_tries=3, max_tries=3):
+    function = DaskFunc(function).func_wrapper
+    tasks = [DaskTask(arg) for arg in args]
+    dotenv.load_dotenv()
+    batch_size = num_workers * reqs_per_ip
+    num_tries = 0
+    tasks_progress_bar = tqdm(total=len(tasks), desc="All Tasks")
+    batch_progress_bar = tqdm(total=batch_size, desc="Batch Tasks")
+    with DaskCluster('fargate') as cluster:
+        with DaskClient(cluster) as client:
+            num_left = len([t for t in tasks if not t.completed])
+            while num_left > 0:
+                try:
+                    if hasattr(cluster, 'adapt'):
+                        cluster.adapt(minimum=1, maximum=num_workers)
+                        # wait for workers to start
+                        wait_until(lambda: len(client.scheduler_info()["workers"]) > 0, timeout=120) 
+                    batch_tasks = [t for t in tasks if not t.completed][:batch_size]
+                    batch_args = [t.args for t in batch_tasks]
+                    batch_progress_bar.reset(total=batch_size)
+                    task_futures = client.map(function, batch_args)
+                    for f in task_futures:
+                        f.add_done_callback(lambda x: batch_progress_bar.update(1))
+                    batch_result = client.gather(task_futures)
+
+                    # sort out task returns, either they complete, 
+                    # or had exceptions (which we want to keep track of), and need to be tried, or we give up
+                    for t, r in zip(batch_tasks, batch_result):
+                        if r['exception'] is not None:
+                            t.exceptions.append(r['exception'])
+                            if len(t.exceptions) >= max_task_tries:
+                                t.completed = True
+                                tasks_progress_bar.update(1)
+                        else:
+                            t.result = r
+                            t.completed = True
+                            tasks_progress_bar.update(1)
+                    if hasattr(cluster, 'scale'):
+                        # recreate workers to get new IPs
+                        cluster.scale(0)
+                        wait_until(lambda: len(client.scheduler_info()["workers"]) == 0, timeout=120) 
+                    num_left = len([t for t in tasks if not t.completed])
+                except KilledWorker as e:
+                    pass
+                except Exception as e:
+                    print(f"Num Tries: {num_tries}, Error: {e}, Stacktrace: {traceback.format_exc()}")
+                    continue
+    tasks_progress_bar.close()
+    batch_progress_bar.close()
+
+    return tasks
 
 class InvalidResponseException(Exception):
     pass
@@ -137,7 +223,7 @@ class InvalidResponseException(Exception):
 class NotFoundException(Exception):
     pass
 
-async def get_video(url):
+def get_headers():
     headers = {
         'upgrade-insecure-requests': '1',
         'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/121.0.0.0 Safari/537.36',
@@ -145,17 +231,12 @@ async def get_video(url):
         'sec-ch-ua-mobile': '?0',
         'sec-ch-ua-platform': '"Linux"'
     }
+    return headers
 
-    try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(url, headers=headers)
-    except Exception:
-        raise InvalidResponseException(
-            "TikTok returned an invalid response."
-        )
+def process_response(r):
     if r.status_code != 200:
         raise InvalidResponseException(
-            r.text, "TikTok returned an invalid response."
+            r.text, f"TikTok returned a {r.status_code} status code."
         )
 
     # Try SIGI_STATE first
@@ -183,7 +264,7 @@ async def get_video(url):
     start = r.text.find('<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">')
     if start == -1:
         raise InvalidResponseException(
-            r.text, "TikTok returned an invalid response."
+            r.text, "Could not find normal JSON section in returned HTML."
         )
 
     start += len('<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">')
@@ -191,7 +272,7 @@ async def get_video(url):
 
     if end == -1:
         raise InvalidResponseException(
-            r.text, "TikTok returned an invalid response."
+            r.text, "Could not find normal JSON section in returned HTML."
         )
 
     data = json.loads(r.text[start:end])
@@ -200,57 +281,75 @@ async def get_video(url):
     if video_detail.get("statusCode", 0) != 0: # assume 0 if not present
         # TODO move this further up to optimize for fast fail
         if video_detail.get("statusCode", 0) == 10204:
-            raise NotFoundException(
-                r.text, "TikTok indicated that the content does not exist."
-            )
+            return None
         else:
             raise InvalidResponseException(
-                r.text, "TikTok returned an invalid response structure."
+                r.text, "TikTok JSON had an unrecognised status code."
             )
     video_info = video_detail.get("itemInfo", {}).get("itemStruct")
     if video_info is None:
         raise InvalidResponseException(
-            r.text, "TikTok returned an invalid response structure."
+            r.text, "TikTok JSON did not contain expected JSON."
         )
         
     return video_info
 
-async def is_get_existing_video(video_id):
+async def async_get_video(url):
+    headers = get_headers()
 
-    if not isinstance(video_id, list):
-        video_ids = [video_id]
-    else:
-        video_ids = video_id
-        preds = []
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(url, headers=headers)
+    except Exception:
+        raise InvalidResponseException(
+            "TikTok returned an invalid response."
+        )
+    
+    return process_response(r)
 
-    ms_token = None
-    for valid_video_id in video_ids:
-        url = f"https://www.tiktok.com/@therock/video/{valid_video_id}"
-        try:
-            video_data = await get_video(url)
-            predicted_truth = 'exists'
-        except NotFoundException:
-            predicted_truth = 'not exists'
-            video_data = None
-        except InvalidResponseException:
-            predicted_truth = 'invalid response'
-            video_data = None
-        if isinstance(video_id, list):
-            preds.append((predicted_truth, video_data))
-        else:
-            return predicted_truth, video_data
-    if isinstance(video_id, list):
-        return preds
-   
+def get_video(video_id):
+    url = f"https://www.tiktok.com/@therock/video/{video_id}"
+    headers = get_headers()
+
+    try:
+        with httpx.Client() as client:
+            r = client.get(url, headers=headers)
+    except Exception:
+        raise InvalidResponseException(
+            "TikTok returned an invalid response."
+        )
+    
+    return process_response(r)
+
+class DaskFunc:
+    def __init__(self, func):
+        self.func = func
+
+    def func_wrapper(self, arg):
         
-async def test_real_video(video_id):
-    does_exist, video_data = await is_get_existing_video(video_id)
-    if does_exist == 'exists':
-        return 1, 1, video_data
-    elif does_exist == 'invalid response':
-        return 0, 0, video_data
-    else:
-        return 0, 1, video_data
+        pre_time = datetime.datetime.now()
+        try:
+            res = self.func(arg)
+            exception = None
+        except Exception as e:
+            res = None
+            exception = e
+        post_time = datetime.datetime.now()
+
+        return {
+            'res': res,
+            'exception': exception,
+            'pre_time': pre_time,
+            'post_time': post_time,
+        }
+
+class DaskTask:
+    def __init__(self, args):
+        self.args = args
+        self.exceptions = []
+        self.result = None
+        self.completed = False
+    
 
 def test_1_month_ago(i):
     timestamp_1year_time = int((datetime.datetime.now() - datetime.timedelta(days=30)).timestamp())
@@ -289,43 +388,43 @@ def test_1_year_ahead(i):
 def iterate_binary(b):
     pass
 
-async def main():
+def main():
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
-    if False:
+    # if False:
         # test real
         
-        data_dir_path = os.path.join(this_dir_path, "..", "data", "germany")
-        with open(os.path.join(data_dir_path, 'videos', 'all_010324.json'), 'r') as file:
-            videos = json.load(file)
+        # data_dir_path = os.path.join(this_dir_path, "..", "data", "germany")
+        # with open(os.path.join(data_dir_path, 'videos', 'all_010324.json'), 'r') as file:
+        #     videos = json.load(file)
 
-        num_test = 1000
+        # num_test = 1000
 
-        r = await amap_all(test_real_video, [videos[i]['id'] for i in range(num_test)])
-        score = sum([x[0] for x in r if x[1] == 1])
-        num_valid = sum([x[1] for x in r])
+        # r = await async_map(test_real_video, [videos[i]['id'] for i in range(num_test)])
+        # score = sum([x[0] for x in r if x[1] == 1])
+        # num_valid = sum([x[1] for x in r])
 
-        assert score == num_valid
-        print(f"Score for real video IDs: {score / num_valid}")
-        print(f"Number of valid responses: {num_valid / num_test}")
+        # assert score == num_valid
+        # print(f"Score for real video IDs: {score / num_valid}")
+        # print(f"Number of valid responses: {num_valid / num_test}")
 
-        # # test random 1 month ago timestamps
-        r = await amap_all(test_1_month_ago, range(num_test))
-        score = sum([x[0] for x in r if x[1] == 1])
-        num_valid = sum([x[1] for x in r])
+        # # # test random 1 month ago timestamps
+        # r = await async_map(test_1_month_ago, range(num_test))
+        # score = sum([x[0] for x in r if x[1] == 1])
+        # num_valid = sum([x[1] for x in r])
 
-        print(f"Score for real video IDs 1 month ago: {score / num_valid}")
-        print(f"Number of valid responses: {num_valid / num_test}")
+        # print(f"Score for real video IDs 1 month ago: {score / num_valid}")
+        # print(f"Number of valid responses: {num_valid / num_test}")
 
-        # test random 1 year ahead timestamps
-        r = await amap_all(test_1_year_ahead, range(num_test))
-        score = sum([x[0] for x in r if x[1] == 1])
-        num_valid = sum([x[1] for x in r])
+        # # test random 1 year ahead timestamps
+        # r = await async_map(test_1_year_ahead, range(num_test))
+        # score = sum([x[0] for x in r if x[1] == 1])
+        # num_valid = sum([x[1] for x in r])
 
-        print(f"Score for real video IDs 1 year ahead: {score / num_valid}")
-        print(f"Number of valid responses: {num_valid / num_test}")
+        # print(f"Score for real video IDs 1 year ahead: {score / num_valid}")
+        # print(f"Number of valid responses: {num_valid / num_test}")
 
     if True:
-        with open(os.path.join(this_dir_path, '..', 'figs', '0_999_found_segments_combinations.json'), 'r') as file:
+        with open(os.path.join(this_dir_path, '..', 'figs', 'all_videos', 'all_found_segments_combinations.json'), 'r') as file:
             data = json.load(file)
 
         # get bits of non timestamp sections of ID
@@ -333,7 +432,7 @@ async def main():
         data = [(tuple(map(int, interval.strip('()').split(', '))), vals) for interval, vals in data.items()]
         data = sorted(data, key=lambda x: x[0][0])
         # get rid of millisecond bits
-        data = data[1:]
+        data = [t for t in data if t[0] != (0,9)]
         interval_bits = []
         for interval, vals in data:
             # format ints to binary
@@ -344,8 +443,15 @@ async def main():
         other_bit_sequences = [''.join(bits) for bits in other_bit_sequences]
 
         # get all videos in 1 millisecond
+        num_time = 100
+        time_unit = 'ms'
+        unit_map = {
+            'ms': 'milliseconds',
+            's': 'seconds',
+        }
+        time_delta = datetime.timedelta(**{unit_map[time_unit]: num_time})
         start_time = datetime.datetime(2024, 3, 1, 20, 0, 0)
-        end_time = start_time + datetime.timedelta(milliseconds=10)
+        end_time = start_time + time_delta
         start_timestamp = start_time.timestamp()
         end_timestamp = end_time.timestamp()
         c_time = start_timestamp
@@ -361,12 +467,33 @@ async def main():
         potential_video_bits = itertools.product(all_timestamp_bits, other_bit_sequences)
         potential_video_bits = [''.join(bits) for bits in potential_video_bits]
         potential_video_ids = [int(bits, 2) for bits in potential_video_bits]
-        r = await amap_all(test_real_video, potential_video_ids, num_workers=64)
-        num_hits = sum([x[0] for x in r if x[1] == 1])
-        num_valid = sum([x[1] for x in r])
+        num_workers = 64
+        reqs_per_ip = 100
+        # r = await async_map(test_real_video, potential_video_ids, num_workers=64)
+        results = dask_map(get_video, potential_video_ids, num_workers=num_workers, reqs_per_ip=reqs_per_ip)
+        num_hits = len([r for r in results if r.result and r.result['res'] is not None])
+        num_valid = len([r for r in results if r.completed])
         print(f"Num hits: {num_hits}, Num valid: {num_valid}, Num potential video IDs: {len(potential_video_ids)}")
         print(f"Fraction hits: {num_hits / num_valid}")
         print(f"Fraction valid: {num_valid / len(potential_video_ids)}")
+        # convert to jsonable format
+        json_results = [
+            {
+                'args': r.args, 
+                'exceptions': [str(e) for e in r.exceptions], 
+                'result': r.result['res'] if r.result is not None else None,
+                'pre_time': r.result['pre_time'].isoformat() if r.result is not None else None,
+                'post_time': r.result['post_time'].isoformat() if r.result is not None else None, 
+                'completed': r.completed
+            }
+            for r in results
+        ]
+
+        results_dir_path = os.path.join(this_dir_path, '..', 'data', 'results')
+        results_dirs = [dir_name for dir_name in os.listdir(results_dir_path)]
+
+        with open(os.path.join(this_dir_path, '..', 'data', f'{num_time}{time_unit}_nw{num_workers}_rpip{reqs_per_ip}_potential_video_ids.json'), 'w') as f:
+            json.dump(json_results, f)
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    main()
