@@ -1,13 +1,12 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import datetime
 import itertools
 import json
-import multiprocessing
 import os
-import random
 import time
 import traceback
-from typing import Callable, Coroutine, Iterable, List, Optional
+from typing import Coroutine, Iterable, List, Optional, Callable
 
 from dask.distributed import Client as DaskClient
 from dask.distributed import LocalCluster as DaskLocalCluster
@@ -15,9 +14,7 @@ from distributed.scheduler import KilledWorker
 from dask_cloudprovider.aws import FargateCluster as DaskFargateCluster
 import dotenv
 import httpx
-from tqdm.asyncio import tqdm as atqdm
 from tqdm import tqdm
-
 
 async def aworker(
     coroutine: Coroutine,
@@ -119,20 +116,13 @@ async def amap(
     return results
 
 async def async_map(coroutine, data, num_workers=10):
-    pbar = atqdm(total=len(data))  # track progress tqdm
 
-    def callback(*_):
-        pbar.update()
-
-    res = await amap(coroutine, data, num_workers, callback=callback)
-    pbar.close()
+    res = await amap(coroutine, data, num_workers)
     return res
 
-def pool_map(function, data):
-    with multiprocessing.Pool(10) as pool:
-        res = list(tqdm(pool.imap(function, data), total=len(data)))  # track progress tqdm
-    pool.join()
-    return res
+def thread_map(function, args, num_workers=10):
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        return list(executor.map(function, args))
 
 def wait_until(condition, interval=0.1, timeout=1, *args):
     start = time.time()
@@ -142,16 +132,15 @@ def wait_until(condition, interval=0.1, timeout=1, *args):
         raise TimeoutError("Timed out waiting for condition")
 
 class DaskCluster:
-    def __init__(self, cluster_type):
+    def __init__(self, cluster_type, worker_nthreads=1, worker_cpu=256, worker_mem=512):
         if cluster_type == 'fargate':
             self.cluster = DaskFargateCluster(
                 fargate_spot=True,
                 image="daskdev/dask:latest-py3.10", 
                 environment={'EXTRA_PIP_PACKAGES': 'httpx==0.27.0 tqdm==4.66.2 lz4==4.3.3 msgpack==1.0.8 toolz==0.12.1'},
-                worker_cpu=256,
-                worker_nthreads=1,
-                worker_mem=512,
-                n_workers=0,
+                worker_cpu=worker_cpu,
+                worker_nthreads=worker_nthreads,
+                worker_mem=worker_mem,
                 aws_access_key_id=os.environ['AWS_ACCESS_KEY'],
                 aws_secret_access_key=os.environ['AWS_SECRET_KEY']
             )
@@ -165,53 +154,68 @@ class DaskCluster:
         if self.cluster is not None:
             self.cluster.close()
 
-def dask_map(function, args, num_workers=16, reqs_per_ip=1000, max_task_tries=3, max_tries=3):
-    function = DaskFunc(function).func_wrapper
+def dask_map(function, args, num_workers=16, reqs_per_ip=1000, task_batch_size=1000, max_task_tries=3, task_nthreads=1, worker_cpu=256, worker_mem=512, cluster_type='local'):
+    function = DaskBatchFunc(DaskFunc(function), task_nthreads=task_nthreads)
     tasks = [DaskTask(arg) for arg in args]
     dotenv.load_dotenv()
     batch_size = num_workers * reqs_per_ip
     num_tries = 0
     tasks_progress_bar = tqdm(total=len(tasks), desc="All Tasks")
-    batch_progress_bar = tqdm(total=batch_size, desc="Batch Tasks")
-    with DaskCluster('fargate') as cluster:
-        with DaskClient(cluster) as client:
-            num_left = len([t for t in tasks if not t.completed])
-            while num_left > 0:
-                try:
-                    if hasattr(cluster, 'adapt'):
-                        cluster.adapt(minimum=1, maximum=num_workers)
-                        # wait for workers to start
-                        wait_until(lambda: len(client.scheduler_info()["workers"]) > 0, timeout=120) 
-                    batch_tasks = [t for t in tasks if not t.completed][:batch_size]
-                    batch_args = [t.args for t in batch_tasks]
-                    batch_progress_bar.reset(total=batch_size)
-                    task_futures = client.map(function, batch_args)
-                    for f in task_futures:
-                        f.add_done_callback(lambda x: batch_progress_bar.update(1))
-                    batch_result = client.gather(task_futures)
-
-                    # sort out task returns, either they complete, 
-                    # or had exceptions (which we want to keep track of), and need to be tried, or we give up
-                    for t, r in zip(batch_tasks, batch_result):
-                        if r['exception'] is not None:
-                            t.exceptions.append(r['exception'])
-                            if len(t.exceptions) >= max_task_tries:
-                                t.completed = True
-                                tasks_progress_bar.update(1)
-                        else:
-                            t.result = r
-                            t.completed = True
-                            tasks_progress_bar.update(1)
-                    if hasattr(cluster, 'scale'):
-                        # recreate workers to get new IPs
-                        cluster.scale(0)
-                        wait_until(lambda: len(client.scheduler_info()["workers"]) == 0, timeout=120) 
-                    num_left = len([t for t in tasks if not t.completed])
-                except KilledWorker as e:
-                    pass
-                except Exception as e:
-                    print(f"Num Tries: {num_tries}, Error: {e}, Stacktrace: {traceback.format_exc()}")
-                    continue
+    batch_progress_bar = tqdm(total=min(batch_size, len(tasks)), desc="Batch Tasks", leave=False)
+    while len([t for t in tasks if not t.completed]) > 0:
+        try:
+            with DaskCluster(cluster_type, worker_cpu=worker_cpu, worker_mem=worker_mem) as cluster:
+                with DaskClient(cluster) as client:
+                    while len([t for t in tasks if not t.completed]) > 0:
+                        try:
+                            if hasattr(cluster, 'adapt'):
+                                cluster.adapt(minimum=1, maximum=num_workers)
+                                # wait for workers to start
+                                wait_until(lambda: len(client.scheduler_info()["workers"]) > 0, timeout=120)
+                            current_batch_size = min(batch_size, len([t for t in tasks if not t.completed])) 
+                            batch_tasks = [t for t in tasks if not t.completed][:current_batch_size]
+                            all_batch_args = [t.args for t in batch_tasks]
+                            batch_args = []
+                            for i in range(0, len(all_batch_args), task_batch_size):
+                                batch_args.append(all_batch_args[i:i+task_batch_size])
+                            batch_progress_bar.reset(total=current_batch_size)
+                            task_futures = client.map(function, batch_args)
+                            for f in task_futures:
+                                # TODO update with specific task arg size, not larger batch size
+                                f.add_done_callback(lambda _: batch_progress_bar.update(task_batch_size))
+                            batch_result = client.gather(task_futures)
+                            batch_result = [r for batch in batch_result for r in batch]
+                            # sort out task returns, either they complete, 
+                            # or had exceptions (which we want to keep track of), and need to be tried, or we give up
+                            for t, r in zip(batch_tasks, batch_result):
+                                if r['exception'] is not None:
+                                    t.exceptions.append(r)
+                                    if len(t.exceptions) >= max_task_tries:
+                                        t.completed = True
+                                        tasks_progress_bar.update(1)
+                                else:
+                                    t.result = r
+                                    t.completed = True
+                                    tasks_progress_bar.update(1)
+                            if hasattr(cluster, 'scale'):
+                                # recreate workers to get new IPs
+                                cluster.scale(0)
+                                wait_until(lambda: len(client.scheduler_info()["workers"]) == 0, timeout=120)
+                        # catch exceptions that are recoverable without restarting the cluster
+                        except KilledWorker as e:
+                            continue
+                        except KeyError as e:
+                            # something is wrong with the cluster, restart the cluster
+                            if e.args[0] == 'workers':
+                                raise
+                            else:
+                                print(f"Batch Error: {e}, Stacktrace: {traceback.format_exc()}")
+                                continue
+                        except Exception as e:
+                            print(f"Batch Error: {e}, Stacktrace: {traceback.format_exc()}")
+                            continue
+        except Exception as ex:
+            print(f"Cluster Restart Error: {ex}, Stacktrace: {traceback.format_exc()}")
     tasks_progress_bar.close()
     batch_progress_bar.close()
 
@@ -238,28 +242,6 @@ def process_response(r):
         raise InvalidResponseException(
             r.text, f"TikTok returned a {r.status_code} status code."
         )
-
-    # Try SIGI_STATE first
-    # extract tag <script id="SIGI_STATE" type="application/json">{..}</script>
-    # extract json in the middle
-
-    # start = r.text.find('<script id="SIGI_STATE" type="application/json">')
-    # if start != -1:
-    #     start += len('<script id="SIGI_STATE" type="application/json">')
-    #     end = r.text.find("</script>", start)
-
-    #     if end == -1:
-    #         raise InvalidResponseException(
-    #             r.text, "TikTok returned an invalid response.", error_code=r.status_code
-    #         )
-
-    #     data = json.loads(r.text[start:end])
-    #     video_info = data["ItemModule"][self.id]
-    # else:
-    # Try __UNIVERSAL_DATA_FOR_REHYDRATION__ next
-
-    # extract tag <script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">{..}</script>
-    # extract json in the middle
 
     start = r.text.find('<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">')
     if start == -1:
@@ -325,7 +307,7 @@ class DaskFunc:
     def __init__(self, func):
         self.func = func
 
-    def func_wrapper(self, arg):
+    def __call__(self, arg):
         
         pre_time = datetime.datetime.now()
         try:
@@ -342,6 +324,14 @@ class DaskFunc:
             'pre_time': pre_time,
             'post_time': post_time,
         }
+    
+class DaskBatchFunc:
+    def __init__(self, func, task_nthreads=1):
+        self.func = func
+        self.task_nthreads = task_nthreads
+
+    def __call__(self, batch_args):
+        return thread_map(self.func, batch_args, num_workers=self.task_nthreads)
 
 class DaskTask:
     def __init__(self, args):
@@ -351,149 +341,121 @@ class DaskTask:
         self.completed = False
     
 
-def test_1_month_ago(i):
-    timestamp_1year_time = int((datetime.datetime.now() - datetime.timedelta(days=30)).timestamp())
-    # convert to binary
-    timestamp_binary = format(timestamp_1year_time, '032b')
-    # create random 32 bit number
-    random_32bit = format(random.getrandbits(32), '032b')
-    # concatenate into 64 bit number
-    random_video_id = int(timestamp_binary + random_32bit, 2)
-    does_exist = is_existing_video(random_video_id)
-    if does_exist == 'exists':
-        return 1, 1, None
-    elif does_exist == 'invalid response':
-        return 0, 0, None
-    else:
-        video = get_existing_video(random_video_id)
-        return 0, 1, video
-
-def test_1_year_ahead(i):
-    timestamp_1year_time = int((datetime.datetime.now() + datetime.timedelta(days=365)).timestamp())
-    # convert to binary
-    timestamp_binary = format(timestamp_1year_time, '032b')
-    # create random 32 bit number
-    random_32bit = format(random.getrandbits(32), '032b')
-    # concatenate into 64 bit number
-    random_video_id = int(timestamp_binary + random_32bit, 2)
-    does_exist = is_existing_video(random_video_id)
-    if does_exist == 'exists':
-        return 1, 1, None
-    elif does_exist == 'invalid response':
-        return 0, 0, None
-    else:
-        video = get_existing_video(random_video_id)
-        return 0, 1, video
-
-def iterate_binary(b):
-    pass
-
 def main():
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
-    # if False:
-        # test real
-        
-        # data_dir_path = os.path.join(this_dir_path, "..", "data", "germany")
-        # with open(os.path.join(data_dir_path, 'videos', 'all_010324.json'), 'r') as file:
-        #     videos = json.load(file)
+    
+    with open(os.path.join(this_dir_path, '..', 'figs', 'all_videos', 'all_found_segments_combinations.json'), 'r') as file:
+        data = json.load(file)
 
-        # num_test = 1000
+    # get bits of non timestamp sections of ID
+    # order dict according to interval
+    data = [(tuple(map(int, interval.strip('()').split(', '))), vals) for interval, vals in data.items()]
+    data = sorted(data, key=lambda x: x[0][0])
+    # get rid of millisecond bits
+    data = [t for t in data if t[0] != (0,9)]
+    interval_bits = []
+    for interval, vals in data:
+        # format ints to binary
+        num_bits = interval[1] - interval[0] + 1
+        bits = [format(i, f'0{num_bits}b') for i in vals]
+        interval_bits.append(bits)
+    other_bit_sequences = itertools.product(*interval_bits)
+    other_bit_sequences = [''.join(bits) for bits in other_bit_sequences]
 
-        # r = await async_map(test_real_video, [videos[i]['id'] for i in range(num_test)])
-        # score = sum([x[0] for x in r if x[1] == 1])
-        # num_valid = sum([x[1] for x in r])
+    # get all videos in 1 millisecond
+    num_time = 10
+    time_unit = 'ms'
+    unit_map = {
+        'ms': 'milliseconds',
+        's': 'seconds',
+    }
+    time_delta = datetime.timedelta(**{unit_map[time_unit]: num_time})
+    start_time = datetime.datetime(2024, 3, 1, 20, 0, 0)
+    end_time = start_time + time_delta
+    start_timestamp = start_time.timestamp()
+    end_timestamp = end_time.timestamp()
+    c_time = start_timestamp
+    all_timestamp_bits = []
+    while c_time < end_timestamp:
+        unix_timestamp_bits = format(int(c_time), '032b')
+        milliseconds = int(format(c_time, '.3f').split('.')[1])
+        milliseconds_bits = format(milliseconds, '010b')
+        timestamp_bits = unix_timestamp_bits + milliseconds_bits
+        all_timestamp_bits.append(timestamp_bits)
+        c_time += 0.001
 
-        # assert score == num_valid
-        # print(f"Score for real video IDs: {score / num_valid}")
-        # print(f"Number of valid responses: {num_valid / num_test}")
-
-        # # # test random 1 month ago timestamps
-        # r = await async_map(test_1_month_ago, range(num_test))
-        # score = sum([x[0] for x in r if x[1] == 1])
-        # num_valid = sum([x[1] for x in r])
-
-        # print(f"Score for real video IDs 1 month ago: {score / num_valid}")
-        # print(f"Number of valid responses: {num_valid / num_test}")
-
-        # # test random 1 year ahead timestamps
-        # r = await async_map(test_1_year_ahead, range(num_test))
-        # score = sum([x[0] for x in r if x[1] == 1])
-        # num_valid = sum([x[1] for x in r])
-
-        # print(f"Score for real video IDs 1 year ahead: {score / num_valid}")
-        # print(f"Number of valid responses: {num_valid / num_test}")
-
-    if True:
-        with open(os.path.join(this_dir_path, '..', 'figs', 'all_videos', 'all_found_segments_combinations.json'), 'r') as file:
-            data = json.load(file)
-
-        # get bits of non timestamp sections of ID
-        # order dict according to interval
-        data = [(tuple(map(int, interval.strip('()').split(', '))), vals) for interval, vals in data.items()]
-        data = sorted(data, key=lambda x: x[0][0])
-        # get rid of millisecond bits
-        data = [t for t in data if t[0] != (0,9)]
-        interval_bits = []
-        for interval, vals in data:
-            # format ints to binary
-            num_bits = interval[1] - interval[0] + 1
-            bits = [format(i, f'0{num_bits}b') for i in vals]
-            interval_bits.append(bits)
-        other_bit_sequences = itertools.product(*interval_bits)
-        other_bit_sequences = [''.join(bits) for bits in other_bit_sequences]
-
-        # get all videos in 1 millisecond
-        num_time = 100
-        time_unit = 'ms'
-        unit_map = {
-            'ms': 'milliseconds',
-            's': 'seconds',
-        }
-        time_delta = datetime.timedelta(**{unit_map[time_unit]: num_time})
-        start_time = datetime.datetime(2024, 3, 1, 20, 0, 0)
-        end_time = start_time + time_delta
-        start_timestamp = start_time.timestamp()
-        end_timestamp = end_time.timestamp()
-        c_time = start_timestamp
-        all_timestamp_bits = []
-        while c_time < end_timestamp:
-            unix_timestamp_bits = format(int(c_time), '032b')
-            milliseconds = int(format(c_time, '.3f').split('.')[1])
-            milliseconds_bits = format(milliseconds, '010b')
-            timestamp_bits = unix_timestamp_bits + milliseconds_bits
-            all_timestamp_bits.append(timestamp_bits)
-            c_time += 0.001
-
-        potential_video_bits = itertools.product(all_timestamp_bits, other_bit_sequences)
-        potential_video_bits = [''.join(bits) for bits in potential_video_bits]
-        potential_video_ids = [int(bits, 2) for bits in potential_video_bits]
-        num_workers = 64
-        reqs_per_ip = 100
-        # r = await async_map(test_real_video, potential_video_ids, num_workers=64)
-        results = dask_map(get_video, potential_video_ids, num_workers=num_workers, reqs_per_ip=reqs_per_ip)
-        num_hits = len([r for r in results if r.result and r.result['res'] is not None])
-        num_valid = len([r for r in results if r.completed])
-        print(f"Num hits: {num_hits}, Num valid: {num_valid}, Num potential video IDs: {len(potential_video_ids)}")
-        print(f"Fraction hits: {num_hits / num_valid}")
-        print(f"Fraction valid: {num_valid / len(potential_video_ids)}")
-        # convert to jsonable format
-        json_results = [
-            {
-                'args': r.args, 
-                'exceptions': [str(e) for e in r.exceptions], 
-                'result': r.result['res'] if r.result is not None else None,
+    potential_video_bits = itertools.product(all_timestamp_bits, other_bit_sequences)
+    potential_video_bits = [''.join(bits) for bits in potential_video_bits]
+    potential_video_ids = [int(bits, 2) for bits in potential_video_bits]
+    num_workers = 64
+    reqs_per_ip = 1000
+    task_batch_size = 100
+    task_nthreads = 8
+    worker_cpu = 256
+    worker_mem = 512
+    cluster_type = 'fargate'
+    # r = await async_map(test_real_video, potential_video_ids, num_workers=64)
+    results = dask_map(
+        get_video, 
+        potential_video_ids, 
+        num_workers=num_workers, 
+        reqs_per_ip=reqs_per_ip, 
+        task_batch_size=task_batch_size,
+        task_nthreads=task_nthreads, 
+        worker_cpu=worker_cpu, 
+        worker_mem=worker_mem,
+        cluster_type=cluster_type
+    )
+    num_hits = len([r for r in results if r.result and r.result['res'] is not None])
+    num_valid = len([r for r in results if r.completed])
+    print(f"Num hits: {num_hits}, Num valid: {num_valid}, Num potential video IDs: {len(potential_video_ids)}")
+    print(f"Fraction hits: {num_hits / num_valid}")
+    print(f"Fraction valid: {num_valid / len(potential_video_ids)}")
+    # convert to jsonable format
+    json_results = [
+        {
+            'args': r.args, 
+            'exceptions': [{
+                    'exception': str(e['exception']),
+                    'pre_time': e['pre_time'].isoformat(),
+                    'post_time': e['post_time'].isoformat()
+                }
+                for e in r.exceptions
+            ], 
+            'result': {
+                'return': r.result['res'] if r.result is not None else None,
                 'pre_time': r.result['pre_time'].isoformat() if r.result is not None else None,
-                'post_time': r.result['post_time'].isoformat() if r.result is not None else None, 
-                'completed': r.completed
-            }
-            for r in results
-        ]
+                'post_time': r.result['post_time'].isoformat() if r.result is not None else None
+            },
+            'completed': r.completed
+        }
+        for r in results
+    ]
 
-        results_dir_path = os.path.join(this_dir_path, '..', 'data', 'results')
-        results_dirs = [dir_name for dir_name in os.listdir(results_dir_path)]
+    results_dir_path = os.path.join(this_dir_path, '..', 'data', 'results')
+    results_dirs = [dir_name for dir_name in os.listdir(results_dir_path)]
+    new_result_dir = str(max([int(d) for d in results_dirs]) + 1) if results_dirs else '0'
+    os.mkdir(os.path.join(results_dir_path, new_result_dir))
 
-        with open(os.path.join(this_dir_path, '..', 'data', f'{num_time}{time_unit}_nw{num_workers}_rpip{reqs_per_ip}_potential_video_ids.json'), 'w') as f:
-            json.dump(json_results, f)
+    params = {
+        'start_time': start_time.isoformat(),
+        'end_time': end_time.isoformat(),
+        'num_time': num_time,
+        'time_unit': time_unit,
+        'num_workers': num_workers,
+        'reqs_per_ip': reqs_per_ip,
+        'task_batch_size': task_batch_size,
+        'worker_nthreads': worker_nasync,
+        'worker_cpu': worker_cpu,
+        'worker_mem': worker_mem,
+        'cluster_type': cluster_type,
+    }
+
+    with open(os.path.join(this_dir_path, '..', 'data', 'results', new_result_dir, 'parameters.json'), 'w') as f:
+        json.dump(params, f)
+
+    with open(os.path.join(this_dir_path, '..', 'data', 'results', new_result_dir, 'results.json'), 'w') as f:
+        json.dump(json_results, f)
 
 if __name__ == '__main__':
     main()
