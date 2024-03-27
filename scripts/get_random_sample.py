@@ -10,7 +10,9 @@ from typing import Coroutine, Iterable, List, Optional, Callable
 
 from dask.distributed import Client as DaskClient
 from dask.distributed import LocalCluster as DaskLocalCluster
+from dask.distributed import wait as dask_wait
 from distributed.scheduler import KilledWorker
+from distributed.utils import CancelledError
 from dask_cloudprovider.aws import FargateCluster as DaskFargateCluster
 import dotenv
 import httpx
@@ -154,27 +156,28 @@ class DaskCluster:
         if self.cluster is not None:
             self.cluster.close()
 
-def dask_map(function, args, num_workers=16, reqs_per_ip=1000, task_batch_size=1000, max_task_tries=3, task_nthreads=1, worker_cpu=256, worker_mem=512, cluster_type='local'):
+def dask_map(function, args, num_workers=16, reqs_per_ip=1000, batch_size=100000, task_batch_size=1000, max_task_tries=3, task_nthreads=1, task_timeout=10, worker_cpu=256, worker_mem=512, cluster_type='local'):
     function = DaskBatchFunc(DaskFunc(function), task_nthreads=task_nthreads)
     tasks = [DaskTask(arg) for arg in args]
     dotenv.load_dotenv()
-    batch_size = num_workers * reqs_per_ip
-    num_tries = 0
     tasks_progress_bar = tqdm(total=len(tasks), desc="All Tasks")
     batch_progress_bar = tqdm(total=min(batch_size, len(tasks)), desc="Batch Tasks", leave=False)
     while len([t for t in tasks if not t.completed]) > 0:
         try:
             with DaskCluster(cluster_type, worker_cpu=worker_cpu, worker_mem=worker_mem) as cluster:
                 with DaskClient(cluster) as client:
+                    if hasattr(cluster, 'adapt'):
+                        cluster.adapt(minimum=1, maximum=num_workers)
+                        # wait for workers to start
+                        client.wait_for_workers(1, timeout=120)
+                    num_reqs_for_current_ips = 0
                     while len([t for t in tasks if not t.completed]) > 0:
                         try:
-                            if hasattr(cluster, 'adapt'):
-                                cluster.adapt(minimum=1, maximum=num_workers)
-                                # wait for workers to start
-                                wait_until(lambda: len(client.scheduler_info()["workers"]) > 0, timeout=120)
                             current_batch_size = min(batch_size, len([t for t in tasks if not t.completed])) 
+                            # batching tasks as we want to avoid having dask tasks that are too small
                             batch_tasks = [t for t in tasks if not t.completed][:current_batch_size]
                             all_batch_args = [t.args for t in batch_tasks]
+                            num_reqs_for_current_ips += current_batch_size
                             batch_args = []
                             for i in range(0, len(all_batch_args), task_batch_size):
                                 batch_args.append(all_batch_args[i:i+task_batch_size])
@@ -183,7 +186,26 @@ def dask_map(function, args, num_workers=16, reqs_per_ip=1000, task_batch_size=1
                             for f in task_futures:
                                 # TODO update with specific task arg size, not larger batch size
                                 f.add_done_callback(lambda _: batch_progress_bar.update(task_batch_size))
-                            batch_result = client.gather(task_futures)
+                            # wait for the futures to complete, with a timeout
+                            try:
+                                total_time = len(batch_tasks) * task_timeout
+                                timeout = total_time / (num_workers * task_nthreads)
+                                dask_wait(task_futures, timeout=timeout, return_when="ALL_COMPLETED")
+                            except Exception:
+                                for f in task_futures:
+                                    if f.status != "finished":
+                                        f.cancel()
+                            # get all the results
+                            batch_result = []
+                            for f, args in zip(task_futures, batch_args):
+                                try:
+                                    batch_result.append(f.result())
+                                except CancelledError as e:
+                                    timeout_ex = TimeoutError(f"Task timed out after {timeout} seconds")
+                                    batch_result.append([{'res': None, 'exception': timeout_ex, 'pre_time': None, 'post_time': datetime.datetime.now()} for _ in args])
+                                except KilledWorker as e:
+                                    batch_result.append([{'res': None, 'exception': e, 'pre_time': None, 'post_time': datetime.datetime.now()} for _ in args])
+                            
                             batch_result = [r for batch in batch_result for r in batch]
                             # sort out task returns, either they complete, 
                             # or had exceptions (which we want to keep track of), and need to be tried, or we give up
@@ -197,23 +219,21 @@ def dask_map(function, args, num_workers=16, reqs_per_ip=1000, task_batch_size=1
                                     t.result = r
                                     t.completed = True
                                     tasks_progress_bar.update(1)
-                            if hasattr(cluster, 'scale'):
+                            if hasattr(cluster, 'scale') and num_reqs_for_current_ips >= reqs_per_ip * num_workers:
                                 # recreate workers to get new IPs
                                 cluster.scale(0)
-                                wait_until(lambda: len(client.scheduler_info()["workers"]) == 0, timeout=120)
+                                wait_until(lambda: len(client.scheduler_info()['workers']) == 0, timeout=120)
+                                num_reqs_for_current_ips = 0
+                                cluster.adapt(minimum=1, maximum=num_workers)
+                                client.wait_for_workers(1, timeout=120)
                         # catch exceptions that are recoverable without restarting the cluster
-                        except KilledWorker as e:
-                            continue
-                        except KeyError as e:
-                            # something is wrong with the cluster, restart the cluster
-                            if e.args[0] == 'workers':
-                                raise
-                            else:
+                        except Exception as e:
+                            if client.scheduler_info(): # client is still connected
                                 print(f"Batch Error: {e}, Stacktrace: {traceback.format_exc()}")
                                 continue
-                        except Exception as e:
-                            print(f"Batch Error: {e}, Stacktrace: {traceback.format_exc()}")
-                            continue
+                            else:
+                                raise
+                                
         except Exception as ex:
             print(f"Cluster Restart Error: {ex}, Stacktrace: {traceback.format_exc()}")
     tasks_progress_bar.close()
@@ -227,13 +247,16 @@ class InvalidResponseException(Exception):
 class NotFoundException(Exception):
     pass
 
+
 def get_headers():
     headers = {
-        'upgrade-insecure-requests': '1',
-        'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/121.0.0.0 Safari/537.36',
-        'sec-ch-ua': '"Chromium";v="121", "Not A(Brand";v="99"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Linux"'
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Accept-Language': 'en-CA',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15'
     }
     return headers
 
@@ -290,18 +313,55 @@ async def async_get_video(url):
     return process_response(r)
 
 def get_video(video_id):
-    url = f"https://www.tiktok.com/@therock/video/{video_id}"
+    url = f"https://www.tiktok.com/@/video/{video_id}"
     headers = get_headers()
-
+    
     try:
         with httpx.Client() as client:
-            r = client.get(url, headers=headers)
-    except Exception:
+            with client.stream("GET", url, headers=headers) as r:
+                if r.status_code != 200:
+                    raise InvalidResponseException(
+                        r.text, f"TikTok returned a {r.status_code} status code."
+                    )
+                text = ""
+                start = -1
+                json_start = '"webapp.video-detail":'
+                json_start_len = len(json_start)
+                end = -1
+                json_end = ',"webapp.a-b":'
+
+                for text_chunk in r.iter_text():
+                    text += text_chunk
+                    if len(text) < json_start_len:
+                        continue
+                    if start == -1:
+                        start = text.find(json_start)
+                        if start != -1:
+                            start = 0
+                            text = text[start + json_start_len:]
+                    if start != -1:
+                        end = text.find(json_end)
+                        if end != -1:
+                            text = text[:end]
+                            break
+
+                if start == -1 or end == -1:
+                    raise InvalidResponseException(
+                        text, "Could not find normal JSON section in returned HTML."
+                    )
+                video_detail = json.loads(text)
+                if video_detail.get("statusCode", 0) != 0: # assume 0 if not present
+                    return video_detail
+                video_info = video_detail.get("itemInfo", {}).get("itemStruct")
+                if video_info is None:
+                    raise InvalidResponseException(
+                        r.text, "TikTok JSON did not contain expected JSON."
+                    )
+                return video_info
+    except Exception as ex:
         raise InvalidResponseException(
             "TikTok returned an invalid response."
         )
-    
-    return process_response(r)
 
 class DaskFunc:
     def __init__(self, func):
@@ -332,6 +392,36 @@ class DaskBatchFunc:
 
     def __call__(self, batch_args):
         return thread_map(self.func, batch_args, num_workers=self.task_nthreads)
+    
+class AsyncDaskFunc:
+    def __init__(self, func):
+        self.func = func
+
+    async def __call__(self, arg):
+        
+        pre_time = datetime.datetime.now()
+        try:
+            res = await self.func(arg)
+            exception = None
+        except Exception as e:
+            res = None
+            exception = e
+        post_time = datetime.datetime.now()
+
+        return {
+            'res': res,
+            'exception': exception,
+            'pre_time': pre_time,
+            'post_time': post_time,
+        }
+    
+class AsyncDaskBatchFunc:
+    def __init__(self, func, task_nthreads=1):
+        self.func = func
+        self.task_nthreads = task_nthreads
+
+    async def __call__(self, batch_args):
+        return async_map(self.func, batch_args, num_workers=self.task_nthreads)
 
 class DaskTask:
     def __init__(self, args):
@@ -363,34 +453,35 @@ def main():
     other_bit_sequences = [''.join(bits) for bits in other_bit_sequences]
 
     # get all videos in 1 millisecond
-    num_time = 10
-    time_unit = 'ms'
+    num_time = 1
+    time_unit = 's'
     unit_map = {
         'ms': 'milliseconds',
         's': 'seconds',
+        'm': 'minutes',
     }
     time_delta = datetime.timedelta(**{unit_map[time_unit]: num_time})
-    start_time = datetime.datetime(2024, 3, 1, 20, 0, 0)
+    start_time = datetime.datetime(2024, 3, 1, 20, 0, 1)
     end_time = start_time + time_delta
-    start_timestamp = start_time.timestamp()
-    end_timestamp = end_time.timestamp()
-    c_time = start_timestamp
+    c_time = start_time
     all_timestamp_bits = []
-    while c_time < end_timestamp:
-        unix_timestamp_bits = format(int(c_time), '032b')
-        milliseconds = int(format(c_time, '.3f').split('.')[1])
+    while c_time < end_time:
+        unix_timestamp_bits = format(int(c_time.timestamp()), '032b')
+        milliseconds = int(format(c_time.timestamp(), '.3f').split('.')[1])
         milliseconds_bits = format(milliseconds, '010b')
         timestamp_bits = unix_timestamp_bits + milliseconds_bits
         all_timestamp_bits.append(timestamp_bits)
-        c_time += 0.001
+        c_time += datetime.timedelta(milliseconds=1)
 
     potential_video_bits = itertools.product(all_timestamp_bits, other_bit_sequences)
     potential_video_bits = [''.join(bits) for bits in potential_video_bits]
     potential_video_ids = [int(bits, 2) for bits in potential_video_bits]
     num_workers = 64
-    reqs_per_ip = 1000
-    task_batch_size = 100
-    task_nthreads = 8
+    reqs_per_ip = 5000
+    batch_size = 100000
+    task_batch_size = 200
+    task_nthreads = 12
+    task_timeout = 10
     worker_cpu = 256
     worker_mem = 512
     cluster_type = 'fargate'
@@ -400,13 +491,15 @@ def main():
         potential_video_ids, 
         num_workers=num_workers, 
         reqs_per_ip=reqs_per_ip, 
+        batch_size=batch_size,
         task_batch_size=task_batch_size,
+        task_timeout=task_timeout,
         task_nthreads=task_nthreads, 
         worker_cpu=worker_cpu, 
         worker_mem=worker_mem,
         cluster_type=cluster_type
     )
-    num_hits = len([r for r in results if r.result and r.result['res'] is not None])
+    num_hits = len([r for r in results if r.result and 'id' in r.result['res']])
     num_valid = len([r for r in results if r.completed])
     print(f"Num hits: {num_hits}, Num valid: {num_valid}, Num potential video IDs: {len(potential_video_ids)}")
     print(f"Fraction hits: {num_hits / num_valid}")
@@ -417,7 +510,7 @@ def main():
             'args': r.args, 
             'exceptions': [{
                     'exception': str(e['exception']),
-                    'pre_time': e['pre_time'].isoformat(),
+                    'pre_time': e['pre_time'].isoformat() if e['pre_time'] else None,
                     'post_time': e['post_time'].isoformat()
                 }
                 for e in r.exceptions
@@ -444,8 +537,10 @@ def main():
         'time_unit': time_unit,
         'num_workers': num_workers,
         'reqs_per_ip': reqs_per_ip,
+        'batch_size': batch_size,
         'task_batch_size': task_batch_size,
-        'worker_nthreads': worker_nasync,
+        'task_timeout': task_timeout,
+        'task_nthreads': task_nthreads,
         'worker_cpu': worker_cpu,
         'worker_mem': worker_mem,
         'cluster_type': cluster_type,
