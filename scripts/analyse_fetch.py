@@ -47,7 +47,13 @@ def main():
             axes[1].plot(exception_timeline_df.index, exception_timeline_df, label='Exceptions')
             axes[1].legend()
 
-        num_videos = len([r for r in results if ('result' in r and r['result'] and 'id' in r['result']) or ('result' in r and r['result'] and 'return' in r['result'] and r['result']['return'] and 'id' in r['result']['return'])])
+        videos = []
+        for r in results:
+            if 'result' in r and r['result'] and 'id' in r['result']:
+                videos.append(r['result'])
+            elif 'result' in r and r['result'] and 'return' in r['result'] and r['result']['return'] and 'id' in r['result']['return']:
+                videos.append(r['result']['return'])
+        num_videos = len(videos)
         fargate_spot_usd_per_vcpu_per_hour = 0.013368
         fargate_spot_usd_per_gb_per_hour = 0.0014595
         num_seconds = (result_df['post_time'].max() - result_df['pre_time'].min()).total_seconds()
@@ -59,6 +65,11 @@ def main():
         time_span = f"{params['num_time']}{params['time_unit']}"
         fig.suptitle(f"Time Interval: {time_span}, Number of fetches: {len(results)}, Number of videos: {num_videos}, Estimated Cost: ${cost:.2f}")
         fig.savefig(os.path.join(dir_path, 'plot.png'))
+
+        # get the number of unique bits in the ID
+        ids = [r['id'] for r in videos]
+        video_last_bits = [format(int(id), '064b')[41:] for id in ids]
+        print(f"Number of unique bits in the ID: {len(set(video_last_bits))}")
 
 
 if __name__ == '__main__':

@@ -117,8 +117,8 @@ def optimized_get_video(video_id):
                     if start == -1:
                         start = text.find(json_start)
                         if start != -1:
-                            start = 0
                             text = text[start + json_start_len:]
+                            start = 0
                     if start != -1:
                         end = text.find(json_end)
                         if end != -1:
@@ -143,7 +143,7 @@ def optimized_get_video(video_id):
                 return video_info
     except Exception as ex:
         raise InvalidResponseException(
-            "TikTok returned an invalid response."
+            f"TikTok returned an invalid response: {ex}"
         )
 
 class FuncWrapper:

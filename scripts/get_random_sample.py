@@ -10,6 +10,7 @@ from typing import Coroutine, Iterable, List, Optional, Callable
 
 from dask.distributed import Client as DaskClient
 from dask.distributed import LocalCluster as DaskLocalCluster
+from dask.distributed import SSHCluster as DaskSSHCluster
 from dask.distributed import wait as dask_wait
 from distributed.scheduler import KilledWorker
 from distributed.utils import CancelledError
@@ -148,6 +149,31 @@ class DaskCluster:
             )
         elif cluster_type == 'local':
             self.cluster = DaskLocalCluster()
+        elif cluster_type == 'raspi':
+            connect_options = [
+                { 'username': 'hoare', },
+                { 'username': 'tarjan', },
+                { 'username': 'miacli', },
+                { 'username': 'fred', },
+                { 'username': 'geoffrey', },
+                { 'username': 'rivest', },
+                { 'username': 'edmund', },
+            ]
+            connect_options = [dict(co, password='rp145', known_hosts=None) for co in connect_options]
+            self.cluster = DaskSSHCluster(
+                hosts=[
+                    '10.157.115.214',
+                    '10.157.115.244',
+                    '10.157.115.234',
+                    '10.157.115.143',
+                    '10.157.115.198',
+                    '10.157.115.24',
+                    '10.157.115.213'
+                ],
+                connect_options=connect_options,
+                worker_options={ 'nthreads': worker_nthreads },
+                remote_python='~/ben/tiktok/venv/bin/python'
+            )
 
     def __enter__(self):
         return self.cluster
@@ -166,7 +192,7 @@ def dask_map(function, args, num_workers=16, reqs_per_ip=1000, batch_size=100000
         try:
             with DaskCluster(cluster_type, worker_cpu=worker_cpu, worker_mem=worker_mem) as cluster:
                 with DaskClient(cluster) as client:
-                    if hasattr(cluster, 'adapt'):
+                    if isinstance(cluster, DaskFargateCluster):
                         cluster.adapt(minimum=1, maximum=num_workers)
                         # wait for workers to start
                         client.wait_for_workers(1, timeout=120)
@@ -219,7 +245,7 @@ def dask_map(function, args, num_workers=16, reqs_per_ip=1000, batch_size=100000
                                     t.result = r
                                     t.completed = True
                                     tasks_progress_bar.update(1)
-                            if hasattr(cluster, 'scale') and num_reqs_for_current_ips >= reqs_per_ip * num_workers:
+                            if isinstance(cluster, DaskFargateCluster) and num_reqs_for_current_ips >= reqs_per_ip * num_workers:
                                 # recreate workers to get new IPs
                                 cluster.scale(0)
                                 wait_until(lambda: len(client.scheduler_info()['workers']) == 0, timeout=120)
@@ -337,8 +363,8 @@ def get_video(video_id):
                     if start == -1:
                         start = text.find(json_start)
                         if start != -1:
-                            start = 0
                             text = text[start + json_start_len:]
+                            start = 0
                     if start != -1:
                         end = text.find(json_end)
                         if end != -1:
@@ -434,7 +460,8 @@ class DaskTask:
 def main():
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
     
-    with open(os.path.join(this_dir_path, '..', 'figs', 'all_videos', 'all_found_segments_combinations.json'), 'r') as file:
+    generation_strategy = 'all'
+    with open(os.path.join(this_dir_path, '..', 'figs', 'all_videos', f'{generation_strategy}_found_segments_combinations.json'), 'r') as file:
         data = json.load(file)
 
     # get bits of non timestamp sections of ID
@@ -444,6 +471,7 @@ def main():
     # get rid of millisecond bits
     data = [t for t in data if t[0] != (0,9)]
     interval_bits = []
+    intervals = [d[0] for d in data]
     for interval, vals in data:
         # format ints to binary
         num_bits = interval[1] - interval[0] + 1
@@ -453,15 +481,15 @@ def main():
     other_bit_sequences = [''.join(bits) for bits in other_bit_sequences]
 
     # get all videos in 1 millisecond
-    num_time = 1
-    time_unit = 's'
+    num_time = 10
+    time_unit = 'ms'
     unit_map = {
         'ms': 'milliseconds',
         's': 'seconds',
         'm': 'minutes',
     }
     time_delta = datetime.timedelta(**{unit_map[time_unit]: num_time})
-    start_time = datetime.datetime(2024, 3, 1, 20, 0, 1)
+    start_time = datetime.datetime(2024, 3, 1, 19, 0, 0)
     end_time = start_time + time_delta
     c_time = start_time
     all_timestamp_bits = []
@@ -476,31 +504,37 @@ def main():
     potential_video_bits = itertools.product(all_timestamp_bits, other_bit_sequences)
     potential_video_bits = [''.join(bits) for bits in potential_video_bits]
     potential_video_ids = [int(bits, 2) for bits in potential_video_bits]
-    num_workers = 64
-    reqs_per_ip = 5000
-    batch_size = 100000
-    task_batch_size = 200
-    task_nthreads = 12
-    task_timeout = 10
+    num_workers = 7
+    reqs_per_ip = 2000
+    batch_size = 80000
+    task_batch_size = 80
+    task_nthreads = 8
+    task_timeout = 20
     worker_cpu = 256
     worker_mem = 512
-    cluster_type = 'fargate'
-    # r = await async_map(test_real_video, potential_video_ids, num_workers=64)
-    results = dask_map(
-        get_video, 
-        potential_video_ids, 
-        num_workers=num_workers, 
-        reqs_per_ip=reqs_per_ip, 
-        batch_size=batch_size,
-        task_batch_size=task_batch_size,
-        task_timeout=task_timeout,
-        task_nthreads=task_nthreads, 
-        worker_cpu=worker_cpu, 
-        worker_mem=worker_mem,
-        cluster_type=cluster_type
-    )
+    cluster_type = 'raspi'
+    method = 'dask'
+    if method == 'async':
+        loop = asyncio.get_event_loop()
+        results = loop.run_until_complete(async_map(async_get_video, potential_video_ids, num_workers=num_workers))
+    elif method == 'dask':
+        results = dask_map(
+            get_video, 
+            potential_video_ids, 
+            num_workers=num_workers, 
+            reqs_per_ip=reqs_per_ip, 
+            batch_size=batch_size,
+            task_batch_size=task_batch_size,
+            task_timeout=task_timeout,
+            task_nthreads=task_nthreads, 
+            worker_cpu=worker_cpu, 
+            worker_mem=worker_mem,
+            cluster_type=cluster_type
+        )
+    else:
+        raise ValueError("Invalid method")
     num_hits = len([r for r in results if r.result and 'id' in r.result['res']])
-    num_valid = len([r for r in results if r.completed])
+    num_valid = len([r for r in results if len(r.exceptions) < 3])
     print(f"Num hits: {num_hits}, Num valid: {num_valid}, Num potential video IDs: {len(potential_video_ids)}")
     print(f"Fraction hits: {num_hits / num_valid}")
     print(f"Fraction valid: {num_valid / len(potential_video_ids)}")
@@ -544,6 +578,8 @@ def main():
         'worker_cpu': worker_cpu,
         'worker_mem': worker_mem,
         'cluster_type': cluster_type,
+        'generation_strategy': generation_strategy,
+        'intervals': intervals,
     }
 
     with open(os.path.join(this_dir_path, '..', 'data', 'results', new_result_dir, 'parameters.json'), 'w') as f:

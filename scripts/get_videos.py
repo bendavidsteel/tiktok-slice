@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import json
 import os
 
@@ -7,9 +8,10 @@ from tqdm import tqdm
 from tqdm.asyncio import tqdm as atqdm
 
 from pytok.tiktok import PyTok
+from pytok.exceptions import NotAvailableException
 
 async def main():
-    origin_region = "indonesia"
+    origin_region = "nigeria"
 
     headless = True
     request_delay = 1
@@ -21,6 +23,7 @@ async def main():
         os.makedirs(data_dir_path)
         os.makedirs(os.path.join(data_dir_path, "videos"))
 
+
     if os.path.exists(os.path.join(data_dir_path, "users.csv")):
         user_df = pd.read_csv(os.path.join(data_dir_path, "users.csv"))
 
@@ -28,11 +31,22 @@ async def main():
 
         already_fetched_users = set()
         for filename in os.listdir(os.path.join(data_dir_path, "videos")):
-            with open(os.path.join(data_dir_path, "videos", filename), "r") as f:
-                videos = json.load(f)
+            if filename.endswith(".json"):
+                with open(os.path.join(data_dir_path, "videos", filename), "r") as f:
+                    videos = json.load(f)
+                if 'author' in videos:
+                    # reload as df
+                    videos = pd.DataFrame(videos).to_dict(orient="records")
+            if filename.endswith(".parquet"):
+                videos = pd.read_parquet(os.path.join(data_dir_path, "videos", filename)).to_dict(orient="records")
             already_fetched_users.update([video['author']['uniqueId'] for video in videos])
         users = [user for user in users if user not in already_fetched_users]
 
+    if os.path.exists(os.path.join(data_dir_path, "videos", f"all_{origin_region}.parquet")):
+        video_df = pd.read_parquet(os.path.join(data_dir_path, "videos", f"all_{origin_region}.parquet"))
+        users = video_df['author'].apply(lambda x: x['uniqueId']).unique().tolist()
+
+    if len(users) > 0:
         videos = []
         for user in tqdm(users):
             try:
@@ -42,9 +56,14 @@ async def main():
                     async for video in user_obj.videos():
                         video_info = await video.info()
                         videos.append(video_info)
-            except Exception as e:
+            except NotAvailableException:
                 pass
+            except Exception as e:
+                print(f"Error fetching videos for user {user}: {e}")
 
+        video_df = pd.DataFrame(videos)
+        today = datetime.datetime.today()
+        video_df.to_parquet(os.path.join(data_dir_path, "videos", f"all_{today.strftime('%d%m%y')}.parquet"))
     else:
         hashtag_names = {
             'brazil': 'brasil',
@@ -59,8 +78,8 @@ async def main():
                 video_info = await video.info()
                 videos.append(video_info)
     
-    video_df = pd.DataFrame(videos)
-    video_df.to_parquet(os.path.join(data_dir_path, "videos", f"all_{origin_region}.parquet"))
+        video_df = pd.DataFrame(videos)
+        video_df.to_parquet(os.path.join(data_dir_path, "videos", f"all_{origin_region}.parquet"))
 
 if __name__ == "__main__":
     asyncio.run(main())
