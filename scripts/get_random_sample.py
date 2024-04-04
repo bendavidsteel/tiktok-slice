@@ -309,9 +309,10 @@ def get_headers():
 
 class ProcessVideo:
     def __init__(self, r):
+        self.r = r
         if r.status_code != 200:
             raise InvalidResponseException(
-                r.text, f"TikTok returned a {r.status_code} status code."
+                r, f"TikTok returned a {r.status_code} status code."
             )
         self.text = ""
         self.start = -1
@@ -339,7 +340,8 @@ class ProcessVideo:
     def process_response(self):
         if self.start == -1 or self.end == -1:
             raise InvalidResponseException(
-                self.text, "Could not find normal JSON section in returned HTML."
+                "Could not find normal JSON section in returned HTML.",
+                json.dumps({'text': self.text, 'encoding': self.r.encoding, 'headers': self.r.headers}),
             )
         video_detail = json.loads(self.text)
         if video_detail.get("statusCode", 0) != 0: # assume 0 if not present
@@ -355,46 +357,36 @@ async def async_get_video(video_id):
     url = f"https://www.tiktok.com/@/video/{video_id}"
     headers = get_headers()
 
-    try:
-        async with httpx.AsyncClient() as client:
-            async with client.stream("GET", url, headers=headers) as r:
-                video_processor = ProcessVideo(r)
+    async with httpx.AsyncClient() as client:
+        async with client.stream("GET", url, headers=headers) as r:
+            video_processor = ProcessVideo(r)
 
-                async for text_chunk in r.aiter_text():
-                    do = video_processor.process_chunk(text_chunk)
-                    if do == 'break':
-                        break
-                    elif do == 'continue':
-                        continue
+            async for text_chunk in r.aiter_text():
+                do = video_processor.process_chunk(text_chunk)
+                if do == 'break':
+                    break
+                elif do == 'continue':
+                    continue
 
-                return video_processor.process_response()
-    except Exception as ex:
-        raise InvalidResponseException(
-            ex, "TikTok returned an invalid response."
-        )
+            return video_processor.process_response()
 
 def get_video(video_id):
     url = f"https://www.tiktok.com/@/video/{video_id}"
     headers = get_headers()
     
-    try:
-        with httpx.Client() as client:
-            with client.stream("GET", url, headers=headers) as r:
-                video_processor = ProcessVideo(r)
+    with httpx.Client() as client:
+        with client.stream("GET", url, headers=headers) as r:
+            video_processor = ProcessVideo(r)
 
-                for text_chunk in r.iter_text():
-                    do = video_processor.process_chunk(text_chunk)
-                    if do == 'break':
-                        break
-                    elif do == 'continue':
-                        continue
+            for text_chunk in r.iter_text():
+                do = video_processor.process_chunk(text_chunk)
+                if do == 'break':
+                    break
+                elif do == 'continue':
+                    continue
 
-                return video_processor.process_response()
+            return video_processor.process_response()
 
-    except Exception as ex:
-        raise InvalidResponseException(
-            "TikTok returned an invalid response."
-        )
 
 class DaskFunc:
     def __init__(self, func):
@@ -602,18 +594,18 @@ def get_random_sample(
 def main():
     generation_strategy = 'all'
     start_time = datetime.datetime(2024, 3, 1, 19, 0, 0)
-    num_time = 10
-    time_unit = 'ms'
-    num_workers = 7
+    num_time = 1
+    time_unit = 'm'
+    num_workers = 512
     reqs_per_ip = 2000
-    batch_size = 80000
-    task_batch_size = 120
-    task_nthreads = 12
+    batch_size = 200000
+    task_batch_size = 100
+    task_nthreads = 8
     task_timeout = 20
     worker_cpu = 256
     worker_mem = 512
-    cluster_type = 'raspi'
-    method = 'async'
+    cluster_type = 'fargate'
+    method = 'dask'
     get_random_sample(
         generation_strategy,
         start_time,

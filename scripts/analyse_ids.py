@@ -112,15 +112,16 @@ def get_most_probable_bits_for_intervals(video_other_bits, fig_dir_path, found_i
 def do_analysis(video_ids, fig_dir_path):
     video_bits = [format(int(id), '064b') for id in video_ids]
 
-    if False:
+    if True:
         timestamps = [int(b[:32], 2) for b in video_bits]
         time_in_day = [timestamp % (60 * 60 * 24) for timestamp in timestamps]
         hour_in_day = [time // (60 * 60) for time in time_in_day]
         time_in_hour = [timestamp % (60 * 60) for timestamp in timestamps]
         minute_in_hour = [time // 60 for time in time_in_hour]
         second_in_minute = [timestamp % 60 for timestamp in timestamps]
+        milliseconds = [int(b[32:41], 2) for b in video_bits]
 
-        fig, ax = plt.subplots(ncols=3)
+        fig, ax = plt.subplots(ncols=4)
         ax[0].hist(hour_in_day, bins=24)
         ax[0].set_title('Hour in day')
         ax[0].set_xlabel('Hour')
@@ -133,6 +134,10 @@ def do_analysis(video_ids, fig_dir_path):
         ax[2].set_title('Second in minute')
         ax[2].set_xlabel('Second')
         ax[2].set_ylabel('Count')
+        ax[3].hist(milliseconds, bins=1000)
+        ax[3].set_title('Milliseconds')
+        ax[3].set_xlabel('Millisecond')
+        ax[3].set_ylabel('Count')
         fig.savefig(os.path.join(fig_dir_path, 'time_distribution.png'))
 
     video_other_bits = [b[32:] for b in video_bits]
