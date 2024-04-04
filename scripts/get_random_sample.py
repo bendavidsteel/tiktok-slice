@@ -169,28 +169,29 @@ class DaskCluster:
         elif cluster_type == 'local':
             self.cluster = DaskLocalCluster()
         elif cluster_type == 'raspi':
+            hosts = [
+                '10.157.115.214', # for scheduler
+                '10.157.115.214', # also for worker
+                '10.157.115.244',
+                # '10.157.115.234',
+                # '10.157.115.143',
+                '10.157.115.198',
+                '10.157.115.24',
+                '10.157.115.213'
+            ]
             connect_options = [
                 { 'username': 'hoare', }, # for scheduler
                 { 'username': 'hoare', }, # also for worker
                 { 'username': 'tarjan', },
-                { 'username': 'miacli', },
-                { 'username': 'fred', },
+                # { 'username': 'miacli', },
+                # { 'username': 'fred', },
                 { 'username': 'geoffrey', },
                 { 'username': 'rivest', },
                 { 'username': 'edmund', },
             ]
             connect_options = [dict(co, password='rp145', known_hosts=None) for co in connect_options]
             self.cluster = DaskSSHCluster(
-                hosts=[
-                    '10.157.115.214', # for scheduler
-                    '10.157.115.214', # also for worker
-                    '10.157.115.244',
-                    '10.157.115.234',
-                    '10.157.115.143',
-                    '10.157.115.198',
-                    '10.157.115.24',
-                    '10.157.115.213'
-                ],
+                hosts=hosts,
                 connect_options=connect_options,
                 worker_options={ 'nthreads': worker_nthreads },
                 remote_python='~/ben/tiktok/venv/bin/python'
@@ -341,7 +342,7 @@ class ProcessVideo:
         if self.start == -1 or self.end == -1:
             raise InvalidResponseException(
                 "Could not find normal JSON section in returned HTML.",
-                json.dumps({'text': self.text, 'encoding': self.r.encoding, 'headers': self.r.headers}),
+                json.dumps({'text': self.text, 'encoding': self.r.encoding}),
             )
         video_detail = json.loads(self.text)
         if video_detail.get("statusCode", 0) != 0: # assume 0 if not present
@@ -562,10 +563,11 @@ def get_random_sample(
         for r in results
     ]
 
-    results_dir_path = os.path.join(this_dir_path, '..', 'data', 'results', 'hours', start_time.hour, start_time.minute, start_time.second)
+    results_dir_path = os.path.join(this_dir_path, '..', 'data', 'results', 'hours', str(start_time.hour), str(start_time.minute), str(start_time.second))
+    os.makedirs(results_dir_path, exist_ok=True)
     results_dirs = [dir_name for dir_name in os.listdir(results_dir_path)]
     new_result_dir = str(max([int(d) for d in results_dirs]) + 1) if results_dirs else '0'
-    os.mkdir(os.path.join(results_dir_path, new_result_dir))
+    os.makedirs(os.path.join(results_dir_path, new_result_dir), exist_ok=True)
 
     params = {
         'start_time': start_time.isoformat(),
@@ -585,18 +587,18 @@ def get_random_sample(
         'intervals': intervals,
     }
 
-    with open(os.path.join(this_dir_path, '..', 'data', 'results', new_result_dir, 'parameters.json'), 'w') as f:
+    with open(os.path.join(results_dir_path, new_result_dir, 'parameters.json'), 'w') as f:
         json.dump(params, f)
 
-    with open(os.path.join(this_dir_path, '..', 'data', 'results', new_result_dir, 'results.json'), 'w') as f:
+    with open(os.path.join(results_dir_path, new_result_dir, 'results.json'), 'w') as f:
         json.dump(json_results, f)
 
 def main():
     generation_strategy = 'all'
     start_time = datetime.datetime(2024, 3, 1, 19, 0, 0)
-    num_time = 1
-    time_unit = 'm'
-    num_workers = 512
+    num_time = 10
+    time_unit = 'ms'
+    num_workers = 5
     reqs_per_ip = 2000
     batch_size = 200000
     task_batch_size = 100
@@ -604,7 +606,7 @@ def main():
     task_timeout = 20
     worker_cpu = 256
     worker_mem = 512
-    cluster_type = 'fargate'
+    cluster_type = 'raspi'
     method = 'dask'
     get_random_sample(
         generation_strategy,
