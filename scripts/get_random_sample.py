@@ -18,6 +18,7 @@ from dask_cloudprovider.aws import FargateCluster as DaskFargateCluster
 import dotenv
 import httpx
 from tqdm import tqdm
+from tqdm.asyncio import tqdm as atqdm
 
 async def aworker(
     coroutine: Coroutine,
@@ -118,10 +119,28 @@ async def amap(
         results.append(res)
     return results
 
-async def async_map(coroutine, data, num_workers=10):
-
-    res = await amap(coroutine, data, num_workers)
-    return res
+async def async_map(func, args, num_workers=10):
+    all_pbar = tqdm(total=len(args))
+    func = AsyncDaskFunc(func)
+    tasks = [DaskTask(arg) for arg in args]
+    while len([t for t in tasks if not t.completed]) > 0:
+        batch_tasks = [t for t in tasks if not t.completed]
+        batch_pbar = atqdm(total=len(args))
+        def callback(*_):
+            batch_pbar.update(1)
+        res = await amap(func, batch_tasks, max_concurrent_tasks=num_workers, callback=callback)
+        batch_pbar.close()
+        for t, r in zip(batch_tasks, res):
+            if r['exception'] is not None:
+                t.exceptions.append(r)
+                if len(t.exceptions) >= 3:
+                    t.completed = True
+                    all_pbar.update(1)
+            else:
+                t.result = r
+                t.completed = True
+                all_pbar.update(1)
+    return tasks
 
 def thread_map(function, args, num_workers=10):
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
@@ -151,7 +170,8 @@ class DaskCluster:
             self.cluster = DaskLocalCluster()
         elif cluster_type == 'raspi':
             connect_options = [
-                { 'username': 'hoare', },
+                { 'username': 'hoare', }, # for scheduler
+                { 'username': 'hoare', }, # also for worker
                 { 'username': 'tarjan', },
                 { 'username': 'miacli', },
                 { 'username': 'fred', },
@@ -162,7 +182,8 @@ class DaskCluster:
             connect_options = [dict(co, password='rp145', known_hosts=None) for co in connect_options]
             self.cluster = DaskSSHCluster(
                 hosts=[
-                    '10.157.115.214',
+                    '10.157.115.214', # for scheduler
+                    '10.157.115.214', # also for worker
                     '10.157.115.244',
                     '10.157.115.234',
                     '10.157.115.143',
@@ -286,57 +307,71 @@ def get_headers():
     }
     return headers
 
-def process_response(r):
-    if r.status_code != 200:
-        raise InvalidResponseException(
-            r.text, f"TikTok returned a {r.status_code} status code."
-        )
-
-    start = r.text.find('<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">')
-    if start == -1:
-        raise InvalidResponseException(
-            r.text, "Could not find normal JSON section in returned HTML."
-        )
-
-    start += len('<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">')
-    end = r.text.find("</script>", start)
-
-    if end == -1:
-        raise InvalidResponseException(
-            r.text, "Could not find normal JSON section in returned HTML."
-        )
-
-    data = json.loads(r.text[start:end])
-    default_scope = data.get("__DEFAULT_SCOPE__", {})
-    video_detail = default_scope.get("webapp.video-detail", {})
-    if video_detail.get("statusCode", 0) != 0: # assume 0 if not present
-        # TODO move this further up to optimize for fast fail
-        if video_detail.get("statusCode", 0) == 10204:
-            return None
-        else:
+class ProcessVideo:
+    def __init__(self, r):
+        if r.status_code != 200:
             raise InvalidResponseException(
-                r.text, "TikTok JSON had an unrecognised status code."
+                r.text, f"TikTok returned a {r.status_code} status code."
             )
-    video_info = video_detail.get("itemInfo", {}).get("itemStruct")
-    if video_info is None:
-        raise InvalidResponseException(
-            r.text, "TikTok JSON did not contain expected JSON."
-        )
-        
-    return video_info
+        self.text = ""
+        self.start = -1
+        self.json_start = '"webapp.video-detail":'
+        self.json_start_len = len(self.json_start)
+        self.end = -1
+        self.json_end = ',"webapp.a-b":'
+    
+    def process_chunk(self, text_chunk):
+        self.text += text_chunk
+        if len(self.text) < self.json_start_len:
+            return 'continue'
+        if self.start == -1:
+            self.start = self.text.find(self.json_start)
+            if self.start != -1:
+                self.text = self.text[self.start + self.json_start_len:]
+                self.start = 0
+        if self.start != -1:
+            self.end = self.text.find(self.json_end)
+            if self.end != -1:
+                self.text = self.text[:self.end]
+                return 'break'
+        return 'continue'
+            
+    def process_response(self):
+        if self.start == -1 or self.end == -1:
+            raise InvalidResponseException(
+                self.text, "Could not find normal JSON section in returned HTML."
+            )
+        video_detail = json.loads(self.text)
+        if video_detail.get("statusCode", 0) != 0: # assume 0 if not present
+            return video_detail
+        video_info = video_detail.get("itemInfo", {}).get("itemStruct")
+        if video_info is None:
+            raise InvalidResponseException(
+                video_detail, "TikTok JSON did not contain expected JSON."
+            )
+        return video_info
 
-async def async_get_video(url):
+async def async_get_video(video_id):
+    url = f"https://www.tiktok.com/@/video/{video_id}"
     headers = get_headers()
 
     try:
         async with httpx.AsyncClient() as client:
-            r = await client.get(url, headers=headers)
-    except Exception:
+            async with client.stream("GET", url, headers=headers) as r:
+                video_processor = ProcessVideo(r)
+
+                async for text_chunk in r.aiter_text():
+                    do = video_processor.process_chunk(text_chunk)
+                    if do == 'break':
+                        break
+                    elif do == 'continue':
+                        continue
+
+                return video_processor.process_response()
+    except Exception as ex:
         raise InvalidResponseException(
-            "TikTok returned an invalid response."
+            ex, "TikTok returned an invalid response."
         )
-    
-    return process_response(r)
 
 def get_video(video_id):
     url = f"https://www.tiktok.com/@/video/{video_id}"
@@ -345,45 +380,17 @@ def get_video(video_id):
     try:
         with httpx.Client() as client:
             with client.stream("GET", url, headers=headers) as r:
-                if r.status_code != 200:
-                    raise InvalidResponseException(
-                        r.text, f"TikTok returned a {r.status_code} status code."
-                    )
-                text = ""
-                start = -1
-                json_start = '"webapp.video-detail":'
-                json_start_len = len(json_start)
-                end = -1
-                json_end = ',"webapp.a-b":'
+                video_processor = ProcessVideo(r)
 
                 for text_chunk in r.iter_text():
-                    text += text_chunk
-                    if len(text) < json_start_len:
+                    do = video_processor.process_chunk(text_chunk)
+                    if do == 'break':
+                        break
+                    elif do == 'continue':
                         continue
-                    if start == -1:
-                        start = text.find(json_start)
-                        if start != -1:
-                            text = text[start + json_start_len:]
-                            start = 0
-                    if start != -1:
-                        end = text.find(json_end)
-                        if end != -1:
-                            text = text[:end]
-                            break
 
-                if start == -1 or end == -1:
-                    raise InvalidResponseException(
-                        text, "Could not find normal JSON section in returned HTML."
-                    )
-                video_detail = json.loads(text)
-                if video_detail.get("statusCode", 0) != 0: # assume 0 if not present
-                    return video_detail
-                video_info = video_detail.get("itemInfo", {}).get("itemStruct")
-                if video_info is None:
-                    raise InvalidResponseException(
-                        r.text, "TikTok JSON did not contain expected JSON."
-                    )
-                return video_info
+                return video_processor.process_response()
+
     except Exception as ex:
         raise InvalidResponseException(
             "TikTok returned an invalid response."
@@ -457,11 +464,25 @@ class DaskTask:
         self.completed = False
     
 
-def main():
+def get_random_sample(
+        generation_strategy,
+        start_time,
+        num_time,
+        time_unit,
+        num_workers,
+        reqs_per_ip,
+        batch_size,
+        task_batch_size,
+        task_nthreads,
+        task_timeout,
+        worker_cpu,
+        worker_mem,
+        cluster_type,
+        method
+    ):
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
     
-    generation_strategy = 'all'
-    with open(os.path.join(this_dir_path, '..', 'figs', 'all_videos', f'{generation_strategy}_found_segments_combinations.json'), 'r') as file:
+    with open(os.path.join(this_dir_path, '..', 'figs', 'all_videos', f'{generation_strategy}_two_segments_combinations.json'), 'r') as file:
         data = json.load(file)
 
     # get bits of non timestamp sections of ID
@@ -481,15 +502,14 @@ def main():
     other_bit_sequences = [''.join(bits) for bits in other_bit_sequences]
 
     # get all videos in 1 millisecond
-    num_time = 10
-    time_unit = 'ms'
+    
     unit_map = {
         'ms': 'milliseconds',
         's': 'seconds',
         'm': 'minutes',
     }
     time_delta = datetime.timedelta(**{unit_map[time_unit]: num_time})
-    start_time = datetime.datetime(2024, 3, 1, 19, 0, 0)
+    
     end_time = start_time + time_delta
     c_time = start_time
     all_timestamp_bits = []
@@ -504,16 +524,7 @@ def main():
     potential_video_bits = itertools.product(all_timestamp_bits, other_bit_sequences)
     potential_video_bits = [''.join(bits) for bits in potential_video_bits]
     potential_video_ids = [int(bits, 2) for bits in potential_video_bits]
-    num_workers = 7
-    reqs_per_ip = 2000
-    batch_size = 80000
-    task_batch_size = 80
-    task_nthreads = 8
-    task_timeout = 20
-    worker_cpu = 256
-    worker_mem = 512
-    cluster_type = 'raspi'
-    method = 'dask'
+    
     if method == 'async':
         loop = asyncio.get_event_loop()
         results = loop.run_until_complete(async_map(async_get_video, potential_video_ids, num_workers=num_workers))
@@ -559,7 +570,7 @@ def main():
         for r in results
     ]
 
-    results_dir_path = os.path.join(this_dir_path, '..', 'data', 'results')
+    results_dir_path = os.path.join(this_dir_path, '..', 'data', 'results', 'hours', start_time.hour, start_time.minute, start_time.second)
     results_dirs = [dir_name for dir_name in os.listdir(results_dir_path)]
     new_result_dir = str(max([int(d) for d in results_dirs]) + 1) if results_dirs else '0'
     os.mkdir(os.path.join(results_dir_path, new_result_dir))
@@ -587,6 +598,38 @@ def main():
 
     with open(os.path.join(this_dir_path, '..', 'data', 'results', new_result_dir, 'results.json'), 'w') as f:
         json.dump(json_results, f)
+
+def main():
+    generation_strategy = 'all'
+    start_time = datetime.datetime(2024, 3, 1, 19, 0, 0)
+    num_time = 10
+    time_unit = 'ms'
+    num_workers = 7
+    reqs_per_ip = 2000
+    batch_size = 80000
+    task_batch_size = 120
+    task_nthreads = 12
+    task_timeout = 20
+    worker_cpu = 256
+    worker_mem = 512
+    cluster_type = 'raspi'
+    method = 'async'
+    get_random_sample(
+        generation_strategy,
+        start_time,
+        num_time,
+        time_unit,
+        num_workers,
+        reqs_per_ip,
+        batch_size,
+        task_batch_size,
+        task_nthreads,
+        task_timeout,
+        worker_cpu,
+        worker_mem,
+        cluster_type,
+        method
+    )
 
 if __name__ == '__main__':
     main()

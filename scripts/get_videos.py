@@ -11,7 +11,7 @@ from pytok.tiktok import PyTok
 from pytok.exceptions import NotAvailableException
 
 async def main():
-    origin_region = "nigeria"
+    origin_region = "indonesia"
 
     headless = True
     request_delay = 1

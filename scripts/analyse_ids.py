@@ -43,7 +43,7 @@ def plot_found_segments_for_intervals(video_other_bits, fig_dir_path, found_inte
         else:
             ax.plot(bins, counts)
             ax.set_ylim([0, max(counts) * 1.1])
-        ax.set_title(f'Section {interval[0]}-{interval[1]}, {num_unique} unique values, entropy: {entropy:.2f}, CI: {bootstrap.confidence_interval.high}')
+        ax.set_title(f'{interval[0]}-{interval[1]}, {num_unique} unique, entropy: {entropy:.2f}, CI: {bootstrap.confidence_interval.high}')
         ax.set_xlabel('Value')
         ax.set_ylabel('Count')
     fig.savefig(os.path.join(fig_dir_path, f'{segment_name}_distribution.png'))
@@ -187,7 +187,7 @@ def do_analysis(video_ids, fig_dir_path):
             ax.set_ylabel('Count')
             fig.savefig(os.path.join(fig_dir_path, f'low_std_segment_{i}_{j}_distribution.png'))
 
-    if False:
+    if True:
         # use logistic regression to see which bits are important to each other
         bit_coefs = []
         for i in range(32):
