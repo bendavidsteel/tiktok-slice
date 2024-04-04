@@ -159,7 +159,7 @@ class DaskCluster:
             self.cluster = DaskFargateCluster(
                 fargate_spot=True,
                 image="daskdev/dask:latest-py3.10", 
-                environment={'EXTRA_PIP_PACKAGES': 'httpx==0.27.0 tqdm==4.66.2 lz4==4.3.3 msgpack==1.0.8 toolz==0.12.1'},
+                environment={'EXTRA_PIP_PACKAGES': 'httpx==0.27.0 brotlipy==0.7.0 tqdm==4.66.2 lz4==4.3.3 msgpack==1.0.8 toolz==0.12.1'},
                 worker_cpu=worker_cpu,
                 worker_nthreads=worker_nthreads,
                 worker_mem=worker_mem,
@@ -596,34 +596,61 @@ def get_random_sample(
 def main():
     generation_strategy = 'all'
     start_time = datetime.datetime(2024, 3, 1, 19, 0, 0)
-    num_time = 10
-    time_unit = 'ms'
+    num_time = 1
+    time_unit = 'm'
     num_workers = 5
     reqs_per_ip = 2000
     batch_size = 200000
     task_batch_size = 100
-    task_nthreads = 8
+    task_nthreads = 16
     task_timeout = 20
     worker_cpu = 256
     worker_mem = 512
     cluster_type = 'raspi'
     method = 'dask'
-    get_random_sample(
-        generation_strategy,
-        start_time,
-        num_time,
-        time_unit,
-        num_workers,
-        reqs_per_ip,
-        batch_size,
-        task_batch_size,
-        task_nthreads,
-        task_timeout,
-        worker_cpu,
-        worker_mem,
-        cluster_type,
-        method
-    )
+    if (num_time > 1 and time_unit == 's') or (time_unit == 'm') or (time_unit == 'h'):
+        if time_unit == 's':
+            num_seconds = num_time
+        elif time_unit == 'm':
+            num_seconds = num_time * 60
+        elif time_unit == 'h':
+            num_seconds = num_time * 3600
+        else:
+            raise ValueError("Invalid time unit")
+        for i in range(num_seconds):
+            get_random_sample(
+                generation_strategy,
+                start_time + datetime.timedelta(seconds=i),
+                1,
+                's',
+                num_workers,
+                reqs_per_ip,
+                batch_size,
+                task_batch_size,
+                task_nthreads,
+                task_timeout,
+                worker_cpu,
+                worker_mem,
+                cluster_type,
+                method
+            )
+    else:
+        get_random_sample(
+            generation_strategy,
+            start_time,
+            num_time,
+            time_unit,
+            num_workers,
+            reqs_per_ip,
+            batch_size,
+            task_batch_size,
+            task_nthreads,
+            task_timeout,
+            worker_cpu,
+            worker_mem,
+            cluster_type,
+            method
+        )
 
 if __name__ == '__main__':
     main()
