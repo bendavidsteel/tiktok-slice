@@ -10,8 +10,11 @@ from scipy import stats as sps
 from sklearn.linear_model import LogisticRegression
 import tqdm
 
+from copia.plot import accumulation_curve
+from copia.stats import species_accumulation
+
 def plot_found_segments(video_other_bits, fig_dir_path):
-    plot_found_segments_for_intervals(video_other_bits, fig_dir_path, [(0,9), (10,13), (14,17), (18,29), (30,31)], 'found_segments')
+    plot_found_segments_for_intervals(video_other_bits, fig_dir_path, [(0,9), (10,13), (14,17), (18,25), (26,31)], 'found_segments')
     plot_found_segments_for_intervals(video_other_bits, fig_dir_path, [(10,31)], 'two_segments')
 
 def plot_found_segments_for_intervals(video_other_bits, fig_dir_path, found_intervals, segment_name):
@@ -109,6 +112,15 @@ def get_most_probable_bits_for_intervals(video_other_bits, fig_dir_path, found_i
     with open(os.path.join(fig_dir_path, f'all_{segment_name}_combinations.json'), 'w') as file:
         json.dump(combos, file, indent=4)
 
+def get_rarefaction_extrapolation(video_other_bits, fig_dir_path):
+    interval = (10,31)
+    section = [int(b[interval[0]:interval[1]+1], 2) for b in video_other_bits]
+    counts = np.bincount(section)
+    accumulation = species_accumulation(counts, max_steps=len(section) * 2)
+    fig, ax = plt.subplots()
+    accumulation_curve(counts, accumulation, ax=ax, xlabel='Number of IDs', ylabel='Number of unique Bit Patterns')
+    fig.savefig(os.path.join(fig_dir_path, 'rarefaction_extrapolation.png'))
+
 def do_analysis(video_ids, fig_dir_path):
     video_bits = [format(int(id), '064b') for id in video_ids]
 
@@ -167,6 +179,7 @@ def do_analysis(video_ids, fig_dir_path):
             fig.savefig(os.path.join(fig_dir_path, f'section_{section_size}_distribution.png'))
 
     if False:
+        # TODO change to low entropy segments
         low_std_segments = []
         min_segment_length = 3
         max_segment_length = 12
@@ -221,6 +234,9 @@ def do_analysis(video_ids, fig_dir_path):
 
     if True:
         get_most_probable_bits(video_other_bits, fig_dir_path)
+
+    if True:
+        get_rarefaction_extrapolation(video_other_bits, fig_dir_path)
 
 
 def main():

@@ -164,7 +164,14 @@ class DaskCluster:
                 worker_nthreads=worker_nthreads,
                 worker_mem=worker_mem,
                 aws_access_key_id=os.environ['AWS_ACCESS_KEY'],
-                aws_secret_access_key=os.environ['AWS_SECRET_KEY']
+                aws_secret_access_key=os.environ['AWS_SECRET_KEY'],
+                cluster_arn=os.environ['ECS_CLUSTER_ARN'],
+                scheduler_task_definition_arn=os.environ['SCHEDULER_TASK_DEFINITION_ARN'],
+                worker_task_definition_arn=os.environ['WORKER_TASK_DEFINITION_ARN'],
+                execution_role_arn=os.environ['EXECUTION_ROLE_ARN'],
+                task_role_arn=os.environ['TASK_ROLE_ARN'],
+                security_groups=[os.environ['SECURITY_GROUP_ID']],
+                skip_cleanup=True
             )
         elif cluster_type == 'local':
             self.cluster = DaskLocalCluster()
@@ -597,7 +604,7 @@ def main():
     generation_strategy = 'all'
     start_time = datetime.datetime(2024, 3, 1, 19, 0, 0)
     num_time = 1
-    time_unit = 'm'
+    time_unit = 'ms'
     num_workers = 5
     reqs_per_ip = 2000
     batch_size = 200000
@@ -606,7 +613,7 @@ def main():
     task_timeout = 20
     worker_cpu = 256
     worker_mem = 512
-    cluster_type = 'raspi'
+    cluster_type = 'fargate'
     method = 'dask'
     if (num_time > 1 and time_unit == 's') or (time_unit == 'm') or (time_unit == 'h'):
         if time_unit == 's':

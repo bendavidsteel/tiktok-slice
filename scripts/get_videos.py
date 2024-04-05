@@ -11,9 +11,9 @@ from pytok.tiktok import PyTok
 from pytok.exceptions import NotAvailableException
 
 async def main():
-    origin_region = "indonesia"
+    origin_region = "brazil"
 
-    headless = True
+    headless = False
     request_delay = 1
 
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
@@ -29,8 +29,13 @@ async def main():
 
         users = user_df[user_df['profile'].notna()]['profile'].str.extract('@(.+)$')[0].to_list()
 
-        already_fetched_users = set()
-        for filename in os.listdir(os.path.join(data_dir_path, "videos")):
+    if os.path.exists(os.path.join(data_dir_path, "videos", f"search_{origin_region}.parquet")):
+        video_df = pd.read_parquet(os.path.join(data_dir_path, "videos", f"search_{origin_region}.parquet"))
+        users = video_df['author'].apply(lambda x: x['uniqueId']).unique().tolist()
+
+    already_fetched_users = set()
+    for filename in os.listdir(os.path.join(data_dir_path, "videos")):
+        if filename.startswith("all"):
             if filename.endswith(".json"):
                 with open(os.path.join(data_dir_path, "videos", filename), "r") as f:
                     videos = json.load(f)
@@ -40,15 +45,11 @@ async def main():
             if filename.endswith(".parquet"):
                 videos = pd.read_parquet(os.path.join(data_dir_path, "videos", filename)).to_dict(orient="records")
             already_fetched_users.update([video['author']['uniqueId'] for video in videos])
-        users = [user for user in users if user not in already_fetched_users]
-
-    if os.path.exists(os.path.join(data_dir_path, "videos", f"all_{origin_region}.parquet")):
-        video_df = pd.read_parquet(os.path.join(data_dir_path, "videos", f"all_{origin_region}.parquet"))
-        users = video_df['author'].apply(lambda x: x['uniqueId']).unique().tolist()
+    users = [user for user in users if user not in already_fetched_users]
 
     if len(users) > 0:
         videos = []
-        for user in tqdm(users):
+        for user in tqdm(users[:10]):
             try:
                 async with PyTok(headless=headless, request_delay=request_delay) as api:
                     user_obj = api.user(username=user)
@@ -59,6 +60,7 @@ async def main():
             except NotAvailableException:
                 pass
             except Exception as e:
+                raise
                 print(f"Error fetching videos for user {user}: {e}")
 
         video_df = pd.DataFrame(videos)

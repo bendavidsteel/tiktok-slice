@@ -44,7 +44,7 @@ async def main():
         reqs = f.readlines()
     reqs = ' '.join([req.strip() for req in reqs])
 
-    todo = 'setup'
+    todo = 'stop'
 
     for host, connect_option in zip(hosts, connect_options):
         print(f'Connecting to {host}...')
