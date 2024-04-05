@@ -171,7 +171,8 @@ class DaskCluster:
                 execution_role_arn=os.environ['EXECUTION_ROLE_ARN'],
                 task_role_arn=os.environ['TASK_ROLE_ARN'],
                 security_groups=[os.environ['SECURITY_GROUP_ID']],
-                skip_cleanup=True
+                skip_cleanup=True,
+                region_name='us-east-1'
             )
         elif cluster_type == 'local':
             self.cluster = DaskLocalCluster()
@@ -602,14 +603,14 @@ def get_random_sample(
 
 def main():
     generation_strategy = 'all'
-    start_time = datetime.datetime(2024, 3, 1, 19, 0, 0)
+    start_time = datetime.datetime(2024, 3, 1, 17, 0, 0)
     num_time = 1
-    time_unit = 'ms'
-    num_workers = 5
+    time_unit = 'm'
+    num_workers = 512
     reqs_per_ip = 2000
-    batch_size = 200000
+    batch_size = 400000
     task_batch_size = 100
-    task_nthreads = 16
+    task_nthreads = 8
     task_timeout = 20
     worker_cpu = 256
     worker_mem = 512

@@ -4,7 +4,7 @@ import get_random_sample
 
 def main():
     generation_strategy = 'all'
-    start_time = datetime.datetime(2024, 3, 1, 17, 0, 0)
+    start_time = datetime.datetime(2024, 3, 1, 16, 0, 0)
     num_time = 1
     time_unit = 's'
     num_workers = 32

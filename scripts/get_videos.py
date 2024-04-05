@@ -58,7 +58,7 @@ async def main():
                         video_info = await video.info()
                         videos.append(video_info)
             except NotAvailableException:
-                pass
+                raise
             except Exception as e:
                 raise
                 print(f"Error fetching videos for user {user}: {e}")
