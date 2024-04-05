@@ -11,7 +11,7 @@ from pytok.tiktok import PyTok
 from pytok.exceptions import NotAvailableException
 
 async def main():
-    origin_region = "brazil"
+    origin_region = "indonesia"
 
     headless = False
     request_delay = 1
@@ -60,7 +60,6 @@ async def main():
             except NotAvailableException:
                 pass
             except Exception as e:
-                raise
                 print(f"Error fetching videos for user {user}: {e}")
 
         video_df = pd.DataFrame(videos)
