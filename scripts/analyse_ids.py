@@ -1,6 +1,7 @@
 import collections
 import datetime
 import json
+import multiprocessing
 import os
 
 import matplotlib.pyplot as plt
@@ -116,7 +117,8 @@ def get_rarefaction_extrapolation(video_other_bits, fig_dir_path):
     interval = (10,31)
     section = [int(b[interval[0]:interval[1]+1], 2) for b in video_other_bits]
     counts = np.bincount(section)
-    accumulation = species_accumulation(counts, max_steps=len(section) * 2, n_jobs=4)
+    n_jobs = multiprocessing.cpu_count() - 1
+    accumulation = species_accumulation(counts, max_steps=len(section) * 2, n_jobs=n_jobs)
     fig, ax = plt.subplots()
     accumulation_curve(counts, accumulation, ax=ax, xlabel='Number of IDs', ylabel='Number of unique Bit Patterns')
     fig.savefig(os.path.join(fig_dir_path, 'rarefaction_extrapolation.png'))

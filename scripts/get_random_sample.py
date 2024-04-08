@@ -172,7 +172,7 @@ class DaskCluster:
                 task_role_arn=os.environ['TASK_ROLE_ARN'],
                 security_groups=[os.environ['SECURITY_GROUP_ID']],
                 skip_cleanup=True,
-                region_name='us-east-1'
+                region_name='ca-central-1'
             )
         elif cluster_type == 'local':
             self.cluster = DaskLocalCluster()
