@@ -35,7 +35,7 @@ def plot_results(dir_path):
 
     exception_lists = [r['exceptions'] for r in results]
     exceptions = [e for l in exception_lists for e in l]
-    if isinstance(exceptions[0], dict):
+    if len(exceptions) > 0 and isinstance(exceptions[0], dict):
         exception_df = pd.DataFrame(exceptions)
         exception_df['pre_time'] = pd.to_datetime(exception_df['pre_time'], format='mixed')
         exception_df['post_time'] = pd.to_datetime(exception_df['post_time'], format='mixed')
@@ -60,7 +60,6 @@ def plot_results(dir_path):
     cost = num_workers * num_hours * (num_vcpus * fargate_spot_usd_per_vcpu_per_hour + num_gb * fargate_spot_usd_per_gb_per_hour)
     time_span = f"{params['num_time']}{params['time_unit']}"
     fig.suptitle(f"Time Interval: {time_span}, Number of fetches: {len(results)}, Number of videos: {num_videos}, Estimated Cost: ${cost:.2f}")
-    fig.savefig(os.path.join(dir_path, 'plot.png'))
 
     def get_type(ex):
         ex_txt = ex['exception']
@@ -74,6 +73,9 @@ def plot_results(dir_path):
 
     top_exceptions = [[e, count] for e, count in sorted(collections.Counter(exception_types).items(), key=lambda x: x[1], reverse=True)[:5]]
     axes[2].table(cellText=[ex for ex in top_exceptions], colLabels=['Exception', 'Number'])
+
+    fig.savefig(os.path.join(dir_path, 'plot.png'))
+    plt.close(fig)
 
     # get the number of unique bits in the ID
     ids = [r['id'] for r in videos]

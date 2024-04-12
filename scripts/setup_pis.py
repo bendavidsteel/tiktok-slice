@@ -29,10 +29,9 @@ async def check_connection(hosts, usernames):
         await asyncio.wait_for(asyncssh.connect(host, username=username, password='rp145', known_hosts=None), timeout=10)
 
 async def scan_for_pis(possible_usernames):
-    passwd = os.environ['PASSWORD']
     pi_password = 'rp145'
 
-    r = subprocess.run(f'echo {passwd} | sudo -S nmap 10.157.115.0/24', shell=True, capture_output=True)
+    r = subprocess.run('nmap 10.157.115.0/24', shell=True, capture_output=True)
     stdout = r.stdout.decode()
     lines = stdout.split('\n')
     result_lines = lines[1:-2]
