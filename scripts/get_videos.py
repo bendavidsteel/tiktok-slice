@@ -11,9 +11,9 @@ from pytok.tiktok import PyTok
 from pytok.exceptions import NotAvailableException
 
 async def main():
-    origin_region = "indonesia"
+    origin_region = "fyp"
 
-    headless = False
+    headless = True
     request_delay = 1
 
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
@@ -29,9 +29,12 @@ async def main():
 
         users = user_df[user_df['profile'].notna()]['profile'].str.extract('@(.+)$')[0].to_list()
 
-    if os.path.exists(os.path.join(data_dir_path, "videos", f"search_{origin_region}.parquet")):
+    elif os.path.exists(os.path.join(data_dir_path, "videos", f"search_{origin_region}.parquet")):
         video_df = pd.read_parquet(os.path.join(data_dir_path, "videos", f"search_{origin_region}.parquet"))
         users = video_df['author'].apply(lambda x: x['uniqueId']).unique().tolist()
+
+    else:
+        users = []
 
     already_fetched_users = set()
     for filename in os.listdir(os.path.join(data_dir_path, "videos")):
@@ -58,7 +61,7 @@ async def main():
                         video_info = await video.info()
                         videos.append(video_info)
             except NotAvailableException:
-                raise
+                pass
             except Exception as e:
                 print(f"Error fetching videos for user {user}: {e}")
 
@@ -71,7 +74,7 @@ async def main():
             'nigeria': 'nigeria',
             'indonesia': 'indonesia',
         }
-        hashtag_name = hashtag_names[origin_region]
+        hashtag_name = hashtag_names[origin_region] if origin_region in hashtag_names else origin_region
         videos = []
         async with PyTok(headless=headless, request_delay=request_delay) as api:
             hashtag_obj = api.hashtag(name=hashtag_name)
@@ -80,7 +83,7 @@ async def main():
                 videos.append(video_info)
     
         video_df = pd.DataFrame(videos)
-        video_df.to_parquet(os.path.join(data_dir_path, "videos", f"all_{origin_region}.parquet"))
+        video_df.to_parquet(os.path.join(data_dir_path, "videos", f"search_{origin_region}.parquet"))
 
 if __name__ == "__main__":
     asyncio.run(main())

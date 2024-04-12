@@ -10,15 +10,17 @@ from typing import Coroutine, Iterable, List, Optional, Callable
 
 from dask.distributed import Client as DaskClient
 from dask.distributed import LocalCluster as DaskLocalCluster
-from dask.distributed import SSHCluster as DaskSSHCluster
-from dask.distributed import wait as dask_wait
-from distributed.scheduler import KilledWorker
-from distributed.utils import CancelledError
+from dask.distributed import SpecCluster as DaskSpecCluster
+from dask.distributed import as_completed as dask_as_completed
+from distributed.scheduler import Scheduler as DaskScheduler
+from distributed.deploy.ssh import Worker as DaskSSHWorker
 from dask_cloudprovider.aws import FargateCluster as DaskFargateCluster
 import dotenv
 import httpx
 from tqdm import tqdm
 from tqdm.asyncio import tqdm as atqdm
+
+from setup_pis import change_mac_addresses, get_hosts_with_retries, kill_workers
 
 async def aworker(
     coroutine: Coroutine,
@@ -153,16 +155,25 @@ def wait_until(condition, interval=0.1, timeout=1, *args):
     if time.time() - start >= timeout:
         raise TimeoutError("Timed out waiting for condition")
 
+
+
+
 class DaskCluster:
     def __init__(self, cluster_type, worker_nthreads=1, worker_cpu=256, worker_mem=512):
-        if cluster_type == 'fargate':
+        self.cluster_type = cluster_type
+        self.worker_nthreads = worker_nthreads
+        self.worker_cpu = worker_cpu
+        self.worker_mem = worker_mem
+
+    async def __aenter__(self):
+        if self.cluster_type == 'fargate':
             self.cluster = DaskFargateCluster(
                 fargate_spot=True,
                 image="daskdev/dask:latest-py3.10", 
                 environment={'EXTRA_PIP_PACKAGES': 'httpx==0.27.0 brotlipy==0.7.0 tqdm==4.66.2 lz4==4.3.3 msgpack==1.0.8 toolz==0.12.1'},
-                worker_cpu=worker_cpu,
-                worker_nthreads=worker_nthreads,
-                worker_mem=worker_mem,
+                worker_cpu=self.worker_cpu,
+                worker_nthreads=self.worker_nthreads,
+                worker_mem=self.worker_mem,
                 aws_access_key_id=os.environ['AWS_ACCESS_KEY'],
                 aws_secret_access_key=os.environ['AWS_SECRET_KEY'],
                 cluster_arn=os.environ['ECS_CLUSTER_ARN'],
@@ -174,45 +185,92 @@ class DaskCluster:
                 skip_cleanup=True,
                 region_name='ca-central-1'
             )
-        elif cluster_type == 'local':
+        elif self.cluster_type == 'local':
             self.cluster = DaskLocalCluster()
-        elif cluster_type == 'raspi':
-            hosts = [
-                '10.157.115.214', # for scheduler
-                '10.157.115.214', # also for worker
-                '10.157.115.244',
-                # '10.157.115.234',
-                # '10.157.115.143',
-                '10.157.115.198',
-                '10.157.115.24',
-                '10.157.115.213'
+        elif self.cluster_type == 'raspi':
+            potential_usernames = [
+                'hoare',
+                'tarjan',
+                'miacli',
+                'fred',
+                'geoffrey',
+                'rivest',
+                'edmund',
+                'ivan',
+                'cook',
+                'barbara',
+                'goldwasser',
+                'milner',
+                'hemming',
+                'frances',
+                'lee'
             ]
-            connect_options = [
-                { 'username': 'hoare', }, # for scheduler
-                { 'username': 'hoare', }, # also for worker
-                { 'username': 'tarjan', },
-                # { 'username': 'miacli', },
-                # { 'username': 'fred', },
-                { 'username': 'geoffrey', },
-                { 'username': 'rivest', },
-                { 'username': 'edmund', },
-            ]
+            hosts, usernames = await get_hosts_with_retries(potential_usernames, max_tries=10)
+            connect_options = [dict(username=un, password='rp145', known_hosts=None) for un in usernames]
             connect_options = [dict(co, password='rp145', known_hosts=None) for co in connect_options]
-            self.cluster = DaskSSHCluster(
-                hosts=hosts,
-                connect_options=connect_options,
-                worker_options={ 'nthreads': worker_nthreads },
-                remote_python='~/ben/tiktok/venv/bin/python'
+            remote_python='~/ben/tiktok/venv/bin/python'
+            worker_options={ 'nthreads': self.worker_nthreads }
+            
+            workers = {
+                i: {
+                    "cls": DaskSSHWorker,
+                    "options": {
+                        "address": host,
+                        "connect_options": connect_options[i],
+                        "kwargs": worker_options,
+                        "worker_class": "distributed.Nanny",
+                        "remote_python": remote_python,
+                    },
+                }
+                for i, host in enumerate(hosts)
+            }
+            self.cluster = DaskSpecCluster(
+                workers,
+                scheduler=None,
+                name="raspi-cluster",
             )
-
-    def __enter__(self):
         return self.cluster
     
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self.cluster is not None:
             self.cluster.close()
 
-def dask_map(function, args, num_workers=16, reqs_per_ip=1000, batch_size=100000, task_batch_size=1000, max_task_tries=3, task_nthreads=1, task_timeout=10, worker_cpu=256, worker_mem=512, cluster_type='local'):
+def process_future(f, batch_tasks_lookup, timeout, max_task_tries, tasks_progress_bar, exception_counter, cancel_if_unfinished=False):
+    batch_tasks, processed = batch_tasks_lookup[f.key]
+    if processed:
+        return
+    try:
+        if cancel_if_unfinished and f.status != "finished":
+            f.cancel()
+            batch_results = [{'res': None, 'exception': TimeoutError(f"Task timed out after {timeout} seconds"), 'pre_time': None, 'post_time': datetime.datetime.now()} for _ in batch_tasks]
+        else:
+            batch_results = f.result()
+    except Exception as e:
+        batch_results = [{'res': None, 'exception': e, 'pre_time': None, 'post_time': datetime.datetime.now()} for _ in batch_tasks]
+    for t, r in zip(batch_tasks, batch_results):
+        if r['exception'] is not None:
+            t.exceptions.append(r)
+            exception_counter.add(1)
+            if len(t.exceptions) >= max_task_tries:
+                t.completed = True
+                tasks_progress_bar.update(1)
+        else:
+            t.result = r
+            t.completed = True
+            tasks_progress_bar.update(1)
+    batch_tasks_lookup[f.key] = (batch_tasks, True)
+
+async def get_results(task_futures, batch_tasks_lookup, timeout, max_task_tries, tasks_progress_bar, exception_counter):
+    for f in dask_as_completed(task_futures, raise_errors=False):
+        process_future(f, batch_tasks_lookup, timeout, max_task_tries, tasks_progress_bar, exception_counter)
+
+class Counter:
+    def __init__(self):
+        self.count = 0
+    def add(self, n):
+        self.count += n
+
+async def dask_map(function, args, num_workers=16, reqs_per_ip=1000, batch_size=100000, task_batch_size=1000, max_task_tries=3, task_nthreads=1, task_timeout=10, worker_cpu=256, worker_mem=512, cluster_type='local'):
     function = DaskBatchFunc(DaskFunc(function), task_nthreads=task_nthreads)
     tasks = [DaskTask(arg) for arg in args]
     dotenv.load_dotenv()
@@ -220,69 +278,78 @@ def dask_map(function, args, num_workers=16, reqs_per_ip=1000, batch_size=100000
     batch_progress_bar = tqdm(total=min(batch_size, len(tasks)), desc="Batch Tasks", leave=False)
     while len([t for t in tasks if not t.completed]) > 0:
         try:
-            with DaskCluster(cluster_type, worker_cpu=worker_cpu, worker_mem=worker_mem) as cluster:
+            async with DaskCluster(cluster_type, worker_cpu=worker_cpu, worker_mem=worker_mem) as cluster:
                 with DaskClient(cluster) as client:
                     if isinstance(cluster, DaskFargateCluster):
                         cluster.adapt(minimum=1, maximum=num_workers)
                         # wait for workers to start
                         client.wait_for_workers(1, timeout=120)
                     num_reqs_for_current_ips = 0
+                    num_exceptions_for_current_ips = 0
                     while len([t for t in tasks if not t.completed]) > 0:
                         try:
-                            current_batch_size = min(batch_size, len([t for t in tasks if not t.completed])) 
+                            current_batch_size = min(batch_size, len([t for t in tasks if not t.completed]))
+
+                            # prepping args for mapping 
                             # batching tasks as we want to avoid having dask tasks that are too small
-                            batch_tasks = [t for t in tasks if not t.completed][:current_batch_size]
-                            all_batch_args = [t.args for t in batch_tasks]
+                            all_batch_tasks = [t for t in tasks if not t.completed][:current_batch_size]
+                            batch_tasks = []
+                            for i in range(0, len(all_batch_tasks), batch_size):
+                                batch_tasks.append(all_batch_tasks[i:i+batch_size])
+                            batch_args = [[t.args for t in batch] for batch in batch_tasks]
+
                             num_reqs_for_current_ips += current_batch_size
-                            batch_args = []
-                            for i in range(0, len(all_batch_args), task_batch_size):
-                                batch_args.append(all_batch_args[i:i+task_batch_size])
+
+                            # reset the progress bar
                             batch_progress_bar.reset(total=current_batch_size)
+
+                            # start the timeout timer
+                            total_time = len(batch_tasks) * task_timeout
+                            num_actual_workers = len(client.scheduler_info()['workers'])
+                            timeout = total_time / (num_actual_workers * task_nthreads)
+
+                            # send out the tasks
                             task_futures = client.map(function, batch_args)
+                            batch_tasks_lookup = {f.key: (mini_batch_tasks, False) for mini_batch_tasks, f in zip(batch_tasks, task_futures)}
                             for f in task_futures:
                                 # TODO update with specific task arg size, not larger batch size
                                 f.add_done_callback(lambda _: batch_progress_bar.update(task_batch_size))
+
                             # wait for the futures to complete, with a timeout
-                            try:
-                                total_time = len(batch_tasks) * task_timeout
-                                timeout = total_time / (num_workers * task_nthreads)
-                                dask_wait(task_futures, timeout=timeout, return_when="ALL_COMPLETED")
-                            except Exception:
-                                for f in task_futures:
-                                    if f.status != "finished":
-                                        f.cancel()
                             # get all the results
-                            batch_result = []
-                            for f, args in zip(task_futures, batch_args):
-                                try:
-                                    batch_result.append(f.result())
-                                except CancelledError as e:
-                                    timeout_ex = TimeoutError(f"Task timed out after {timeout} seconds")
-                                    batch_result.append([{'res': None, 'exception': timeout_ex, 'pre_time': None, 'post_time': datetime.datetime.now()} for _ in args])
-                                except KilledWorker as e:
-                                    batch_result.append([{'res': None, 'exception': e, 'pre_time': None, 'post_time': datetime.datetime.now()} for _ in args])
-                            
-                            batch_result = [r for batch in batch_result for r in batch]
-                            # sort out task returns, either they complete, 
-                            # or had exceptions (which we want to keep track of), and need to be tried, or we give up
-                            for t, r in zip(batch_tasks, batch_result):
-                                if r['exception'] is not None:
-                                    t.exceptions.append(r)
-                                    if len(t.exceptions) >= max_task_tries:
-                                        t.completed = True
-                                        tasks_progress_bar.update(1)
-                                else:
-                                    t.result = r
-                                    t.completed = True
-                                    tasks_progress_bar.update(1)
-                            if isinstance(cluster, DaskFargateCluster) and num_reqs_for_current_ips >= reqs_per_ip * num_workers:
+                            exception_counter = Counter()
+                            try:
+                                await asyncio.wait_for(get_results(task_futures, batch_tasks_lookup, timeout, max_task_tries, tasks_progress_bar, exception_counter), timeout=timeout)
+                            except Exception:
+                                # cancel all the unfinished tasks, and add the exceptions to the task
+                                for f in task_futures:
+                                    process_future(f, batch_tasks_lookup, timeout, max_task_tries, tasks_progress_bar, exception_counter, cancel_if_unfinished=True)
+                            num_exceptions_for_current_ips += exception_counter.count
+
+                            # check if we need to recreate workers
+                            if num_reqs_for_current_ips >= reqs_per_ip * num_actual_workers or num_exceptions_for_current_ips / num_reqs_for_current_ips >= 0.1:
                                 # recreate workers to get new IPs
-                                cluster.scale(0)
-                                wait_until(lambda: len(client.scheduler_info()['workers']) == 0, timeout=120)
-                                num_reqs_for_current_ips = 0
-                                cluster.adapt(minimum=1, maximum=num_workers)
-                                client.wait_for_workers(1, timeout=120)
+                                if isinstance(cluster, DaskFargateCluster):
+                                    cluster.scale(0)
+                                    wait_until(lambda: len(client.scheduler_info()['workers']) == 0, timeout=120)
+                                    num_reqs_for_current_ips = 0
+                                    cluster.adapt(minimum=1, maximum=num_workers)
+                                    client.wait_for_workers(1, timeout=120)
+                                elif isinstance(cluster, DaskSpecCluster):
+                                    # TODO reset worker internet connection
+                                    # reset mac address of raspberry pis and rescan for the new assigned IPs
+                                    workers = list(cluster.workers.values())
+                                    hosts = [w.address for w in workers]
+                                    connect_options = [w.connect_options for w in workers]
+                                    # worker processes don't seem to reliably close, so we need to kill them:(
+                                    await kill_workers(hosts, connect_options) 
+                                    await change_mac_addresses(hosts, connect_options)
+                                    num_reqs_for_current_ips = 0
+                                    num_exceptions_for_current_ips = 0
+                                    raise RestartClusterException()
                         # catch exceptions that are recoverable without restarting the cluster
+                        except RestartClusterException:
+                            raise
                         except Exception as e:
                             if client.scheduler_info(): # client is still connected
                                 print(f"Batch Error: {e}, Stacktrace: {traceback.format_exc()}")
@@ -301,6 +368,9 @@ class InvalidResponseException(Exception):
     pass
 
 class NotFoundException(Exception):
+    pass
+
+class RestartClusterException(Exception):
     pass
 
 
@@ -465,7 +535,7 @@ class DaskTask:
         self.completed = False
     
 
-def get_random_sample(
+async def get_random_sample(
         generation_strategy,
         start_time,
         num_time,
@@ -527,10 +597,9 @@ def get_random_sample(
     potential_video_ids = [int(bits, 2) for bits in potential_video_bits]
     
     if method == 'async':
-        loop = asyncio.get_event_loop()
-        results = loop.run_until_complete(async_map(async_get_video, potential_video_ids, num_workers=num_workers))
+        results = await async_map(async_get_video, potential_video_ids, num_workers=num_workers)
     elif method == 'dask':
-        results = dask_map(
+        results = await dask_map(
             get_video, 
             potential_video_ids, 
             num_workers=num_workers, 
@@ -601,20 +670,20 @@ def get_random_sample(
     with open(os.path.join(results_dir_path, new_result_dir, 'results.json'), 'w') as f:
         json.dump(json_results, f)
 
-def main():
+async def main():
     generation_strategy = 'all'
     start_time = datetime.datetime(2024, 3, 1, 17, 0, 0)
     num_time = 1
-    time_unit = 'm'
+    time_unit = 'ms'
     num_workers = 512
-    reqs_per_ip = 2000
-    batch_size = 400000
-    task_batch_size = 100
+    reqs_per_ip = 2
+    batch_size = 100
+    task_batch_size = 10
     task_nthreads = 8
     task_timeout = 20
     worker_cpu = 256
     worker_mem = 512
-    cluster_type = 'fargate'
+    cluster_type = 'raspi'
     method = 'dask'
     if (num_time > 1 and time_unit == 's') or (time_unit == 'm') or (time_unit == 'h'):
         if time_unit == 's':
@@ -625,8 +694,10 @@ def main():
             num_seconds = num_time * 3600
         else:
             raise ValueError("Invalid time unit")
+        if num_seconds > 60 and cluster_type == 'fargate':
+            raise ValueError("Too expensive to run for more than 60 seconds on Fargate")
         for i in range(num_seconds):
-            get_random_sample(
+            await get_random_sample(
                 generation_strategy,
                 start_time + datetime.timedelta(seconds=i),
                 1,
@@ -643,7 +714,7 @@ def main():
                 method
             )
     else:
-        get_random_sample(
+        await get_random_sample(
             generation_strategy,
             start_time,
             num_time,
@@ -661,4 +732,4 @@ def main():
         )
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())
