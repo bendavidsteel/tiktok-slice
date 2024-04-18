@@ -4,10 +4,9 @@ import os
 from setup_pis import scan_for_pis
 
 async def main():
-    passwd = os.environ['PASSWORD']
     possible_usernames = [
-        'hoare', 'tarjan', 'miacli', 'fred', 'geoffrey', 'rivest', 'edmund', 'pi',
-        'frances', 'ivan', 'milner', 'cook', 'lee', 'barbara', 'goldwasser', 'gold', 'hemming'
+        'hoare', 'tarjan', 'miacli', 'fred', 'geoffrey', 'rivest', 'edmund', 'juris'
+        'frances', 'ivan', 'milner', 'cook', 'lee', 'barbara', 'goldwasser', 'hemming'
     ]
     
     hosts, usernames = await scan_for_pis(possible_usernames)

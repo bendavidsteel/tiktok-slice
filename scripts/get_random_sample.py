@@ -336,7 +336,6 @@ async def dask_map(function, args, num_workers=16, reqs_per_ip=1000, batch_size=
                                     cluster.adapt(minimum=1, maximum=num_workers)
                                     client.wait_for_workers(1, timeout=120)
                                 elif isinstance(cluster, DaskSpecCluster):
-                                    # TODO reset worker internet connection
                                     # reset mac address of raspberry pis and rescan for the new assigned IPs
                                     workers = list(cluster.workers.values())
                                     hosts = [w.address for w in workers]
@@ -672,6 +671,7 @@ async def get_random_sample(
 
 async def main():
     generation_strategy = 'all'
+    # TODO run at persistent time after collection, i.e. if collection takes an hour, run after 24s after post time
     start_time = datetime.datetime(2024, 3, 1, 17, 0, 0)
     num_time = 1
     time_unit = 'ms'
