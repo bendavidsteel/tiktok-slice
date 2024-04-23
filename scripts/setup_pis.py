@@ -6,6 +6,7 @@ import random
 import subprocess
 
 import asyncssh
+import tqdm
 
 async def setup_pi(conn, reqs=''):
     # install python
@@ -21,10 +22,14 @@ async def setup_pi(conn, reqs=''):
         assert r.stdout.strip() == 'Python 3.10.12'
 
     # setup virtual environment
-    r = await conn.run('~/ben/tiktok/venv/bin/python --version', check=True)
-    if r.stdout.strip() != 'Python 3.10.12':
-        r = await conn.run('rm -rf ~/ben/tiktok/venv', check=True)
+    r = await conn.run('ls ~/ben/tiktok/venv', check=False)
+    if r.returncode != 0:
         r = await conn.run('python3 -m venv ~/ben/tiktok/venv', check=True)
+    else:
+        r = await conn.run('~/ben/tiktok/venv/bin/python --version', check=False)
+        if r.stdout.strip() != 'Python 3.10.12':
+            r = await conn.run('rm -rf ~/ben/tiktok/venv', check=True)
+            r = await conn.run('python3 -m venv ~/ben/tiktok/venv', check=True)
 
     # install requirements
     r = await conn.run('~/ben/tiktok/venv/bin/pip list', check=True)
@@ -160,6 +165,14 @@ async def start_wifi_connection(conn):
             break
     else:
         raise Exception("Failed to create wifi connection")
+    
+async def start_wifi_connections(hosts, connect_options, progress_bar=True):
+    iterable = zip(hosts, connect_options)
+    if progress_bar:
+        iterable = tqdm.tqdm(iterable, total=len(hosts), desc="Starting wifi connections")
+    for host, co in iterable:
+        conn = await asyncio.wait_for(asyncssh.connect(host, **co), timeout=10)
+        await asyncio.wait_for(start_wifi_connection(conn), timeout=120)
 
 async def check_connection(hosts, usernames):
     for host, username in zip(hosts, usernames):
@@ -216,6 +229,21 @@ async def scan_for_pis(possible_usernames):
 
     return hosts, usernames
 
+def get_local_ip(interface):
+    if interface == 'wlan0':
+        command = f"ip -6 addr show {interface} | grep -oP '(?<=inet6\s)\w+(\:\w+){{7}}'"
+    elif interface == 'eth0':
+        command = f"ip -4 addr show {interface} | grep -oP '(?<=inet\s)\d+(\.\d+){{3}}'"
+    else:
+        raise ValueError()
+    
+    completed_process = subprocess.run(command, shell=True, check=False, capture_output=True)
+
+    if completed_process.returncode != 0:
+        raise subprocess.CalledProcessError(completed_process.returncode, command, completed_process.stderr)
+
+    return completed_process.stdout.decode().strip()
+
 def generate_random_mac():
     # Create a list of 6 hex values, each 00 to FF
     mac = [random.randint(0, 255) for _ in range(6)]
@@ -256,10 +284,18 @@ async def kill_workers(hosts, connect_options):
         conn = await asyncio.wait_for(asyncssh.connect(host, **co), timeout=10)
         await killall_python(conn)
 
-async def change_mac_addresses(hosts, connect_options):
+async def stop_stale_workers(hosts, connect_options):
     for host, co in zip(hosts, connect_options):
         conn = await asyncio.wait_for(asyncssh.connect(host, **co), timeout=10)
-        await change_mac_address(conn)
+        await killall_python(conn)
+
+async def change_mac_addresses(hosts, connect_options, **kwargs):
+    for host, co in zip(hosts, connect_options):
+        conn = await asyncio.wait_for(asyncssh.connect(host, **co), timeout=10)
+        try:
+            await change_mac_address(conn, **kwargs)
+        except asyncssh.process.ProcessError as e:
+            raise asyncssh.misc.Error(e.code, e.stderr)
 
 async def run_on_pis(hosts, connect_options, func, **kwargs):
     results = []
@@ -334,22 +370,22 @@ async def main():
         'geoffrey',
         'rivest',
         'edmund',
-        # 'ivan',
-        # 'cook',
-        # 'barbara',
-        # 'goldwasser',
-        # 'milner',
-        # 'hemming',
-        # 'frances',
-        # 'lee',
-        # 'juris'
+        'ivan',
+        'cook',
+        'barbara',
+        'goldwasser',
+        'milner',
+        'hemming',
+        'frances',
+        'lee',
+        'juris'
     ]
     hosts, usernames = await get_hosts(potential_usernames)
     connect_options = [{'username': username, 'password': 'rp145'} for username in usernames]
 
     # TODO look into connecting pis to tum vpn for larger network range
     # TODO add more pis to network
-    todo = 'change_ip'
+    todo = 'stop'
 
     if todo == 'setup':
         with open('worker_requirements.txt', 'r') as f:
@@ -400,7 +436,7 @@ async def main():
         new_ips = await run_on_pis(hosts, connect_options, get_ip, interface='wlan0')
         print(f"New IPs: {new_ips}")
     elif todo == 'stop':
-        run_on_pis(hosts, connect_options, killall_python)
+        await run_on_pis(hosts, connect_options, killall_python)
 
         
             

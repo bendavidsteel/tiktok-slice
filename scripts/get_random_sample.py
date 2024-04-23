@@ -1,4 +1,5 @@
 import asyncio
+import collections
 from concurrent.futures import ThreadPoolExecutor
 import datetime
 import itertools
@@ -11,6 +12,7 @@ from typing import Coroutine, Iterable, List, Optional, Callable
 from dask.distributed import Client as DaskClient
 from dask.distributed import LocalCluster as DaskLocalCluster
 from dask.distributed import SpecCluster as DaskSpecCluster
+from dask.distributed import SSHCluster as DaskSSHCluster
 from dask.distributed import as_completed as dask_as_completed
 from distributed.scheduler import Scheduler as DaskScheduler
 from distributed.deploy.ssh import Worker as DaskSSHWorker
@@ -20,7 +22,7 @@ import httpx
 from tqdm import tqdm
 from tqdm.asyncio import tqdm as atqdm
 
-from setup_pis import change_mac_addresses, get_hosts_with_retries, kill_workers
+from setup_pis import change_mac_addresses, get_hosts_with_retries, get_local_ip, start_wifi_connections, stop_stale_workers
 
 async def aworker(
     coroutine: Coroutine,
@@ -144,9 +146,11 @@ async def async_map(func, args, num_workers=10):
                 all_pbar.update(1)
     return tasks
 
-def thread_map(function, args, num_workers=10):
+def thread_map(*args, function=None, num_workers=10):
+    assert function is not None, "function must be provided"
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        return list(executor.map(function, args))
+        return list(executor.map(function, *args))
+
 
 def wait_until(condition, interval=0.1, timeout=1, *args):
     start = time.time()
@@ -205,30 +209,41 @@ class DaskCluster:
                 'frances',
                 'lee'
             ]
+            print("Finding hosts...")
             hosts, usernames = await get_hosts_with_retries(potential_usernames, max_tries=10)
             connect_options = [dict(username=un, password='rp145', known_hosts=None) for un in usernames]
             connect_options = [dict(co, password='rp145', known_hosts=None) for co in connect_options]
+            # await stop_stale_workers(hosts, connect_options)
+            print("Starting wifi connections...")
+            await start_wifi_connections(hosts, connect_options, progress_bar=True)
             remote_python='~/ben/tiktok/venv/bin/python'
-            worker_options={ 'nthreads': self.worker_nthreads }
-            
-            workers = {
-                i: {
-                    "cls": DaskSSHWorker,
-                    "options": {
-                        "address": host,
-                        "connect_options": connect_options[i],
-                        "kwargs": worker_options,
-                        "worker_class": "distributed.Nanny",
-                        "remote_python": remote_python,
-                    },
-                }
-                for i, host in enumerate(hosts)
-            }
-            self.cluster = DaskSpecCluster(
-                workers,
-                scheduler=None,
-                name="raspi-cluster",
+            self.cluster = DaskSSHCluster(
+                hosts,
+                connect_options=connect_options,
+                worker_options={ 'nthreads': self.worker_nthreads },
+                remote_python=remote_python,
             )
+            # worker_options={ 'nthreads': self.worker_nthreads }
+            
+            # print("Creating cluster...")
+            # workers = {
+            #     i: {
+            #         "cls": DaskSSHWorker,
+            #         "options": {
+            #             "address": host,
+            #             "connect_options": connect_options[i],
+            #             "kwargs": worker_options,
+            #             "worker_class": "distributed.Nanny",
+            #             "remote_python": remote_python,
+            #         },
+            #     }
+            #     for i, host in enumerate(hosts)
+            # }
+            # self.cluster = DaskSpecCluster(
+            #     workers,
+            #     scheduler=None,
+            #     name="raspi-cluster",
+            # )
         return self.cluster
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -271,7 +286,8 @@ class Counter:
         self.count += n
 
 async def dask_map(function, args, num_workers=16, reqs_per_ip=1000, batch_size=100000, task_batch_size=1000, max_task_tries=3, task_nthreads=1, task_timeout=10, worker_cpu=256, worker_mem=512, cluster_type='local'):
-    function = DaskBatchFunc(DaskFunc(function), task_nthreads=task_nthreads)
+    network_interface = 'wlan0' if cluster_type == 'raspi' else None
+    function = DaskBatchFunc(DaskFunc(function), network_interface=network_interface, task_nthreads=task_nthreads)
     tasks = [DaskTask(arg) for arg in args]
     dotenv.load_dotenv()
     tasks_progress_bar = tqdm(total=len(tasks), desc="All Tasks")
@@ -329,23 +345,20 @@ async def dask_map(function, args, num_workers=16, reqs_per_ip=1000, batch_size=
                             # check if we need to recreate workers
                             if num_reqs_for_current_ips >= reqs_per_ip * num_actual_workers or num_exceptions_for_current_ips / num_reqs_for_current_ips >= 0.1:
                                 # recreate workers to get new IPs
-                                if isinstance(cluster, DaskFargateCluster):
+                                if cluster_type == 'fargate':
                                     cluster.scale(0)
                                     wait_until(lambda: len(client.scheduler_info()['workers']) == 0, timeout=120)
                                     num_reqs_for_current_ips = 0
                                     cluster.adapt(minimum=1, maximum=num_workers)
                                     client.wait_for_workers(1, timeout=120)
-                                elif isinstance(cluster, DaskSpecCluster):
+                                elif cluster_type == 'raspi':
                                     # reset mac address of raspberry pis and rescan for the new assigned IPs
                                     workers = list(cluster.workers.values())
                                     hosts = [w.address for w in workers]
                                     connect_options = [w.connect_options for w in workers]
-                                    # worker processes don't seem to reliably close, so we need to kill them:(
-                                    await kill_workers(hosts, connect_options) 
-                                    await change_mac_addresses(hosts, connect_options)
+                                    await change_mac_addresses(hosts, connect_options, interface='wlan0')
                                     num_reqs_for_current_ips = 0
                                     num_exceptions_for_current_ips = 0
-                                    raise RestartClusterException()
                         # catch exceptions that are recoverable without restarting the cluster
                         except RestartClusterException:
                             raise
@@ -448,33 +461,31 @@ async def async_get_video(video_id):
 
             return video_processor.process_response()
 
-def get_video(video_id):
+def get_video(video_id, client):
     url = f"https://www.tiktok.com/@/video/{video_id}"
     headers = get_headers()
     
-    with httpx.Client() as client:
-        with client.stream("GET", url, headers=headers) as r:
-            video_processor = ProcessVideo(r)
+    with client.stream("GET", url, headers=headers) as r:
+        video_processor = ProcessVideo(r)
 
-            for text_chunk in r.iter_text():
-                do = video_processor.process_chunk(text_chunk)
-                if do == 'break':
-                    break
-                elif do == 'continue':
-                    continue
+        for text_chunk in r.iter_text():
+            do = video_processor.process_chunk(text_chunk)
+            if do == 'break':
+                break
+            elif do == 'continue':
+                continue
 
-            return video_processor.process_response()
-
+        return video_processor.process_response()
 
 class DaskFunc:
     def __init__(self, func):
         self.func = func
 
-    def __call__(self, arg):
+    def __call__(self, *args):
         
         pre_time = datetime.datetime.now()
         try:
-            res = self.func(arg)
+            res = self.func(*args)
             exception = None
         except Exception as e:
             res = None
@@ -489,12 +500,17 @@ class DaskFunc:
         }
     
 class DaskBatchFunc:
-    def __init__(self, func, task_nthreads=1):
+    def __init__(self, func, network_interface=None, task_nthreads=1):
         self.func = func
+        self.network_interface = network_interface
         self.task_nthreads = task_nthreads
 
     def __call__(self, batch_args):
-        return thread_map(self.func, batch_args, num_workers=self.task_nthreads)
+        # interface_ip = get_local_ip(self.network_interface) if self.network_interface else None
+        # transport = httpx.HTTPTransport(local_address=interface_ip)
+        # with httpx.Client(transport=transport) as http_client:
+        http_client = None
+        return thread_map(batch_args, itertools.repeat(http_client), function=self.func, num_workers=self.task_nthreads)
     
 class AsyncDaskFunc:
     def __init__(self, func):
@@ -669,7 +685,7 @@ async def get_random_sample(
     with open(os.path.join(results_dir_path, new_result_dir, 'results.json'), 'w') as f:
         json.dump(json_results, f)
 
-async def main():
+async def run_random_sample():
     generation_strategy = 'all'
     # TODO run at persistent time after collection, i.e. if collection takes an hour, run after 24s after post time
     start_time = datetime.datetime(2024, 3, 1, 17, 0, 0)
@@ -696,29 +712,23 @@ async def main():
             raise ValueError("Invalid time unit")
         if num_seconds > 60 and cluster_type == 'fargate':
             raise ValueError("Too expensive to run for more than 60 seconds on Fargate")
+        actual_num_time = 1
+        actual_time_unit = 's'
+        actual_start_times = []
         for i in range(num_seconds):
-            await get_random_sample(
-                generation_strategy,
-                start_time + datetime.timedelta(seconds=i),
-                1,
-                's',
-                num_workers,
-                reqs_per_ip,
-                batch_size,
-                task_batch_size,
-                task_nthreads,
-                task_timeout,
-                worker_cpu,
-                worker_mem,
-                cluster_type,
-                method
-            )
+            actual_start_time = start_time + datetime.timedelta(seconds=i)
+            actual_start_times.append(actual_start_time)
     else:
+        actual_num_time = num_time
+        actual_time_unit = time_unit
+        actual_start_times = [start_time]
+
+    for actual_start_time in actual_start_times:
         await get_random_sample(
             generation_strategy,
-            start_time,
-            num_time,
-            time_unit,
+            actual_start_time,
+            actual_num_time,
+            actual_time_unit,
             num_workers,
             reqs_per_ip,
             batch_size,
@@ -730,6 +740,26 @@ async def main():
             cluster_type,
             method
         )
+
+def get_ip(_, client: httpx.Client):
+    return httpx.get('https://ifconfig.me/ip').content.decode('utf-8')
+
+async def run_get_ips():
+    results = await dask_map(
+        get_ip, 
+        range(10), 
+        reqs_per_ip=1000, 
+        batch_size=1000,
+        task_batch_size=10,
+        task_timeout=10,
+        task_nthreads=1,
+        cluster_type='raspi'
+    )
+    print(collections.Counter([r.result['res'] for r in results if r.result is not None]))
+    
+async def main():
+    # await run_random_sample()
+    await run_get_ips()
 
 if __name__ == '__main__':
     asyncio.run(main())
