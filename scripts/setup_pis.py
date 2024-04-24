@@ -4,8 +4,11 @@ import json
 import os
 import random
 import subprocess
+import traceback
 
 import asyncssh
+import dotenv
+import randmac
 import tqdm
 
 async def setup_pi(conn, reqs=''):
@@ -122,45 +125,60 @@ async def start_vpn(conn):
 
     await vpn_via_command(conn)
 
-async def start_wifi_connection(conn):
+async def ensure_wifi_connection(conn, connect_options, force_start=False):
     num_tries = 0
     max_tries = 3
+
+    # test if we need password for sudo
+    r = await conn.run("sudo -n true", check=False)
+    if r.returncode == 1:
+        password = connect_options['password']
+        prepend = f"echo '{password}' | sudo -S"
+    else:
+        prepend = "sudo"
+
     while num_tries < max_tries:
         num_tries += 1
         try:
             # check if wifi connection exists
             r = await conn.run("nmcli con", check=True)
             connections = r.stdout.split('\n')
+            
             if not any(c.startswith('eduroam') for c in connections):
                 # create wifi connection
                 username = os.environ['EDUROAM_USERNAME']
                 password = os.environ['EDUROAM_PASSWORD']
-                command = f'sudo nmcli con add type wifi con-name "eduroam" ifname "wlan0" ssid "eduroam" wifi-sec.key-mgmt "wpa-eap" 802-1x.identity "{username}" 802-1x.password "{password}" 802-1x.system-ca-certs "yes" 802-1x.eap "peap" 802-1x.phase2-auth "mschapv2"'
+                command = f'{prepend} nmcli con add type wifi con-name "eduroam" ifname "wlan0" ssid "eduroam" wifi-sec.key-mgmt "wpa-eap" 802-1x.identity "{username}" 802-1x.password "{password}" 802-1x.system-ca-certs "yes" 802-1x.eap "peap" 802-1x.phase2-auth "mschapv2"'
                 r = await conn.run(command, check=True)
                 await asyncio.sleep(3)
                 r = await conn.run("nmcli con", check=True)
+                connections = r.stdout.split('\n')
             else:
                 eduroam_line = [c for c in connections if c.startswith('eduroam')][0]
                 reqs = [' wifi ', ' wlan0 ']
                 if not all(req in eduroam_line for req in reqs):
                     # delete existing connection
-                    r = await conn.run("sudo nmcli con delete eduroam", check=True)
+                    r = await conn.run(f"{prepend} nmcli con delete eduroam", check=True)
                     # create wifi connection
                     username = os.environ['EDUROAM_USERNAME']
                     password = os.environ['EDUROAM_PASSWORD']
-                    command = f'sudo nmcli con add type wifi con-name "eduroam" ifname "wlan0" ssid "eduroam" wifi-sec.key-mgmt "wpa-eap" 802-1x.identity "{username}" 802-1x.password "{password}" 802-1x.system-ca-certs "yes" 802-1x.eap "peap" 802-1x.phase2-auth "mschapv2"'
+                    command = f'{prepend} nmcli con add type wifi con-name "eduroam" ifname "wlan0" ssid "eduroam" wifi-sec.key-mgmt "wpa-eap" 802-1x.identity "{username}" 802-1x.password "{password}" 802-1x.system-ca-certs "yes" 802-1x.eap "peap" 802-1x.phase2-auth "mschapv2"'
                     r = await conn.run(command, check=True)
-            r = await conn.run("nmcli con", check=True)
-            connections = r.stdout.split('\n')
+                    r = await conn.run("nmcli con", check=True)
+                    connections = r.stdout.split('\n')
             assert any(c.startswith('eduroam') for c in connections), "Failed to create wifi connection"
             eduroam_line = [c for c in connections if c.startswith('eduroam')][0]
             assert 'wifi' in eduroam_line and 'wlan0' in eduroam_line, "Failed to create wifi connection"
-            # start wifi connection
-        
-            r = await conn.run("sudo nmcli connection up eduroam", check=True)
+            # check if connection is up
+            r = await conn.run("nmcli -f GENERAL.STATE con show eduroam", check=True)
+            if 'activated' not in r.stdout or force_start:
+                # start wifi connection
+                r = await conn.run(f"{prepend} nmcli connection up eduroam", check=True)
+        except asyncssh.misc.ChannelOpenError:
+            raise
         except Exception as e:
             # delete connection and try again
-            r = await conn.run("sudo nmcli con delete eduroam", check=True)
+            r = await conn.run(f"{prepend} nmcli con delete eduroam", check=True)
         else:
             break
     else:
@@ -170,18 +188,41 @@ async def start_wifi_connections(hosts, connect_options, progress_bar=True):
     iterable = zip(hosts, connect_options)
     if progress_bar:
         iterable = tqdm.tqdm(iterable, total=len(hosts), desc="Starting wifi connections")
+    working_hosts = []
+    working_connect_options = []
     for host, co in iterable:
         conn = await asyncio.wait_for(asyncssh.connect(host, **co), timeout=10)
-        await asyncio.wait_for(start_wifi_connection(conn), timeout=120)
+        try:
+            await asyncio.wait_for(ensure_wifi_connection(conn, co), timeout=120)
+        except asyncssh.process.ProcessError as e:
+            ex = asyncssh.misc.Error(e.code, e.stderr)
+            print(f"Failed to start wifi connection on {host} (username: {co['username']}): {ex}")
+        except asyncio.exceptions.TimeoutError:
+            ex = asyncio.exceptions.TimeoutError(f"Timed out starting wifi connection")
+            print(f"Failed to start wifi connection on {host} (username: {co['username']}): {ex}")
+        except Exception as e:
+            print(f"Failed to start wifi connection on {host} (username: {co['username']}): {e}")
+        else:
+            working_hosts.append(host)
+            working_connect_options.append(co)
 
-async def check_connection(hosts, usernames):
-    for host, username in zip(hosts, usernames):
+    return working_hosts, working_connect_options
+
+async def check_connection(hosts, usernames, progress_bar=True):
+    iterable = zip(hosts, usernames)
+    if progress_bar:
+        iterable = tqdm.tqdm(iterable, total=len(hosts), desc="Checking connections")
+    for host, username in iterable:
         await asyncio.wait_for(asyncssh.connect(host, username=username, password='rp145', known_hosts=None), timeout=10)
 
-async def scan_for_pis(possible_usernames):
+async def scan_for_pis(possible_usernames, progress_bar=False):
     pi_password = 'rp145'
 
     r = subprocess.run('nmap 10.157.115.0/24', shell=True, capture_output=True)
+
+    if r.returncode != 0:
+        raise subprocess.CalledProcessError(r.returncode, 'nmap', r.stderr)
+
     stdout = r.stdout.decode()
     lines = stdout.split('\n')
     result_lines = lines[1:-2]
@@ -199,6 +240,10 @@ async def scan_for_pis(possible_usernames):
     hosts = []
     usernames = []
     remaining_usernames = possible_usernames.copy()
+
+    if progress_bar:
+        all_reports = tqdm.tqdm(all_reports, desc="Scanning for Pis")
+
     for report in all_reports:
         ip = report[0].split(' ')[4]
         table_headers = [i for i, l in enumerate(report) if 'PORT' in l]
@@ -229,29 +274,10 @@ async def scan_for_pis(possible_usernames):
 
     return hosts, usernames
 
-def get_local_ip(interface):
-    if interface == 'wlan0':
-        command = f"ip -6 addr show {interface} | grep -oP '(?<=inet6\s)\w+(\:\w+){{7}}'"
-    elif interface == 'eth0':
-        command = f"ip -4 addr show {interface} | grep -oP '(?<=inet\s)\d+(\.\d+){{3}}'"
-    else:
-        raise ValueError()
-    
-    completed_process = subprocess.run(command, shell=True, check=False, capture_output=True)
-
-    if completed_process.returncode != 0:
-        raise subprocess.CalledProcessError(completed_process.returncode, command, completed_process.stderr)
-
-    return completed_process.stdout.decode().strip()
-
 def generate_random_mac():
-    # Create a list of 6 hex values, each 00 to FF
-    mac = [random.randint(0, 255) for _ in range(6)]
-    # Format the MAC address in the standard format with colon separation
-    mac_address = ':'.join(f'{value:02X}' for value in mac)
-    return mac_address
+    return randmac.RandMac()
 
-async def change_mac_address(conn, interface='eth0'):
+async def change_mac_address(conn, connect_options, interface='eth0'):
     # write bash script to change mac address on eth0 network interface
     random_mac = generate_random_mac()
     if interface == 'eth0':
@@ -266,9 +292,13 @@ async def change_mac_address(conn, interface='eth0'):
         r = await conn.run('chmod +x ~/change_mac.sh', check=True)
         await conn.create_process('nohup ~/change_mac.sh &') # no need to check since it will disconnect the ssh connection
     elif interface == 'wlan0':
-        await conn.run(f"sudo nmcli con modify --temporary eduroam 802-11-wireless.cloned-mac-address {random_mac}", check=True)
-        await asyncio.sleep(5)
-        await start_wifi_connection(conn)
+        # ensure eduroam connection exists
+        await ensure_wifi_connection(conn, connect_options)
+        r = await conn.run(f"sudo nmcli con modify --temporary eduroam 802-11-wireless.cloned-mac-address {random_mac}", check=True)
+        if r.returncode != 0 or r.stdout or r.stderr:
+            raise Exception(f"Failed to change MAC address: {r.stdout}, {r.stderr}")
+        await ensure_wifi_connection(conn, connect_options)
+        r = await conn.run(f"sudo nmcli connection up eduroam", check=True)
 
 async def killall_python(conn):
     try:
@@ -289,27 +319,55 @@ async def stop_stale_workers(hosts, connect_options):
         conn = await asyncio.wait_for(asyncssh.connect(host, **co), timeout=10)
         await killall_python(conn)
 
-async def change_mac_addresses(hosts, connect_options, **kwargs):
-    for host, co in zip(hosts, connect_options):
-        conn = await asyncio.wait_for(asyncssh.connect(host, **co), timeout=10)
-        try:
-            await change_mac_address(conn, **kwargs)
-        except asyncssh.process.ProcessError as e:
-            raise asyncssh.misc.Error(e.code, e.stderr)
+async def change_mac_addresses(hosts, connect_options, progress_bar=False, **kwargs):
+    iterable = zip(hosts, connect_options)
+    if progress_bar:
+        iterable = tqdm.tqdm(iterable, total=len(hosts), desc="Changing MAC addresses")
+    for host, co in iterable:
+        tries = 0
+        max_tries = 3
+        exceptions = []
+        while tries < max_tries:
+            tries += 1
+            conn = await asyncio.wait_for(asyncssh.connect(host, **co), timeout=10)
+            try:
+                await asyncio.wait_for(change_mac_address(conn, co, **kwargs), timeout=120)
+            except asyncssh.process.ProcessError as e:
+                ex = asyncssh.misc.Error(e.code, e.stderr)
+                exceptions.append(ex)
+            except asyncio.exceptions.TimeoutError as ex:
+                exceptions.append(ex)
+            else:
+                break
 
 async def run_on_pis(hosts, connect_options, func, **kwargs):
     results = []
     for host, connect_option in zip(hosts, connect_options):
-        print(f'Connecting to {host}...')
-        try:
-            conn = await asyncio.wait_for(asyncssh.connect(host, **connect_option, known_hosts=None), timeout=10)
-        except Exception as e:
-            print(f'Failed to connect to {host}: {e}')
-            continue
+        tries = 0
+        max_tries = 3
+        exceptions = []
+        while tries < max_tries:
+            tries += 1
+            print(f'Connecting to {host}...')
+            try:
+                conn = await asyncio.wait_for(asyncssh.connect(host, **connect_option, known_hosts=None), timeout=10)
+            except Exception as e:
+                print(f'Failed to connect to {host}: {e}')
+                continue
+            else:
+                async with conn:
+                    try:
+                        r = await func(conn, connect_option, **kwargs)
+                    except asyncssh.process.ProcessError as e:
+                        e.args = (e.args[0], e.stderr, traceback.format_exc())
+                        exceptions.append(e)
+                    except Exception as e:
+                        exceptions.append(e)
+                    else:
+                        results.append(r)
+                        break
         else:
-            async with conn:
-                r = await func(conn, **kwargs)
-                results.append(r)
+            print(f"Failed to run on {host} (username: {connect_option['username']}) after {max_tries} tries: {exceptions}")
     return results
 
 async def get_hosts(usernames):
@@ -333,7 +391,7 @@ async def get_hosts(usernames):
 
     return hosts, found_usernames
 
-async def get_hosts_with_retries(usernames, max_tries=10):
+async def get_hosts_with_retries(usernames, max_tries=3, progress_bar=False):
     try:
         # load cached hosts and usernames
         with open('hosts.json', 'r') as file:
@@ -342,26 +400,32 @@ async def get_hosts_with_retries(usernames, max_tries=10):
         hosts, found_usernames = zip(*hosts_users)
         hosts, found_usernames = list(hosts), list(found_usernames)
         assert len(found_usernames) == len(usernames), "Cached usernames do not match expected usernames"
-        await check_connection(hosts, found_usernames)
+        print("Attempting to load cached connection data")
+        await check_connection(hosts, found_usernames, progress_bar=progress_bar)
     except Exception as ex:
         num_tries = 0
         while num_tries < max_tries:
-            hosts, found_usernames = await scan_for_pis(usernames)
+            num_tries += 1
+            print(f"Attempt {num_tries} to find all hosts...")
+            hosts, found_usernames = await scan_for_pis(usernames, progress_bar=progress_bar)
             if len(found_usernames) == len(usernames):
                 break
+            else:
+                print(f"Found {len(found_usernames)} out of {len(usernames)} hosts, unable to find: {', '.join(set(usernames) - set(found_usernames))}, trying again...")
         else:
-            raise Exception(f"Failed to find all hosts after {max_tries} tries")
+            print("Unable to find all hosts after multiple tries, returning found hosts")
         user_hosts = {un: host for un, host in zip(found_usernames, hosts)}
         with open('hosts.json', 'w') as file:
             json.dump(user_hosts, file)
 
     return hosts, found_usernames
 
-async def get_ip(conn, interface='eth0'):
+async def get_ip(conn, co, interface='eth0'):
     r = await conn.run(f'curl --interface {interface} ifconfig.me', check=True)
     return r.stdout.strip()
 
 async def main():
+    dotenv.load_dotenv()
     potential_usernames = [
         'hoare',
         'tarjan',
@@ -378,14 +442,13 @@ async def main():
         'hemming',
         'frances',
         'lee',
-        'juris'
+        # 'juris'
     ]
-    hosts, usernames = await get_hosts(potential_usernames)
+    hosts, usernames = await get_hosts_with_retries(potential_usernames, progress_bar=True)
     connect_options = [{'username': username, 'password': 'rp145'} for username in usernames]
 
-    # TODO look into connecting pis to tum vpn for larger network range
     # TODO add more pis to network
-    todo = 'stop'
+    todo = 'change_ip'
 
     if todo == 'setup':
         with open('worker_requirements.txt', 'r') as f:
@@ -405,7 +468,7 @@ async def main():
         interface = 'wlan0'
         initial_ips = await run_on_pis(hosts, connect_options, get_ip)
         print(f"Initial IPs: {initial_ips}")
-        await run_on_pis(hosts, connect_options, start_wifi_connection)
+        await run_on_pis(hosts, connect_options, ensure_wifi_connection)
         vpn_ips = await run_on_pis(hosts, connect_options, get_ip, interface=interface)
         print(f"WIFI IPs: {vpn_ips}")
         start_time = datetime.datetime.now()
@@ -437,6 +500,8 @@ async def main():
         print(f"New IPs: {new_ips}")
     elif todo == 'stop':
         await run_on_pis(hosts, connect_options, killall_python)
+    else:
+        raise ValueError(f"Unknown todo: {todo}")
 
         
             
