@@ -8,6 +8,8 @@ import subprocess
 import asyncssh
 import tqdm
 
+from map_funcs import amap
+
 async def setup_pi(conn, reqs=''):
     # install python
     r = await conn.run('python3 --version', check=True)
@@ -168,15 +170,18 @@ async def start_wifi_connection(conn):
     
 async def start_wifi_connections(hosts, connect_options, progress_bar=True):
     iterable = zip(hosts, connect_options)
-    if progress_bar:
-        iterable = tqdm.tqdm(iterable, total=len(hosts), desc="Starting wifi connections")
-    for host, co in iterable:
+    async def run_start_wifi(args):
+        host, co = args
         conn = await asyncio.wait_for(asyncssh.connect(host, **co), timeout=10)
         await asyncio.wait_for(start_wifi_connection(conn), timeout=120)
+    await amap(run_start_wifi, iterable, num_workers=len(hosts), pbar_desc="Starting wifi connections")
 
 async def check_connection(hosts, usernames):
-    for host, username in zip(hosts, usernames):
+    iterable = zip(hosts, usernames)
+    async def run_connect(args):
+        host, username = args
         await asyncio.wait_for(asyncssh.connect(host, username=username, password='rp145', known_hosts=None), timeout=10)
+    await amap(run_connect, iterable, num_workers=len(hosts))
 
 async def scan_for_pis(possible_usernames):
     pi_password = 'rp145'
@@ -196,36 +201,67 @@ async def scan_for_pis(possible_usernames):
             report.append(result_lines[i])
         i += 1
 
-    hosts = []
-    usernames = []
-    remaining_usernames = possible_usernames.copy()
-    for report in all_reports:
-        ip = report[0].split(' ')[4]
-        table_headers = [i for i, l in enumerate(report) if 'PORT' in l]
-        if not table_headers:
-            continue
-        table_header_line = table_headers[0]
-        open_ports = []
-        for row_idx in range(table_header_line + 1, len(report)):
-            if 'open' in report[row_idx]:
-                open_ports.append(report[row_idx].split(' ')[0])
-            else:
-                break
+    concurrent = True
 
-        working_username = None
-        if '22/tcp' in open_ports:
-            for username in remaining_usernames:
-                try:
-                    conn = await asyncio.wait_for(asyncssh.connect(ip, username=username, password=pi_password, known_hosts=None), timeout=10)
-                    working_username = username
+    if concurrent:
+        async def run_test_connect():
+            ip = report[0].split(' ')[4]
+            table_headers = [i for i, l in enumerate(report) if 'PORT' in l]
+            if not table_headers:
+                return None, None
+            table_header_line = table_headers[0]
+            open_ports = []
+            for row_idx in range(table_header_line + 1, len(report)):
+                if 'open' in report[row_idx]:
+                    open_ports.append(report[row_idx].split(' ')[0])
+                else:
                     break
-                except Exception as e:
-                    continue
 
-        if working_username:
-            hosts.append(ip)
-            usernames.append(working_username)
-            remaining_usernames.remove(working_username)
+            if '22/tcp' in open_ports:
+                for username in remaining_usernames:
+                    try:
+                        await asyncio.wait_for(asyncssh.connect(ip, username=username, password=pi_password, known_hosts=None), timeout=10)
+                    except Exception as e:
+                        continue
+                    else:
+                        return ip, username
+            else:
+                return None, None
+            
+        results = await amap(run_test_connect, all_reports, num_workers=len(all_reports))
+        return [(host, username) for host, username in results if host]
+
+    else:
+        hosts = []
+        usernames = []
+        remaining_usernames = possible_usernames.copy()
+        for report in all_reports:
+            ip = report[0].split(' ')[4]
+            table_headers = [i for i, l in enumerate(report) if 'PORT' in l]
+            if not table_headers:
+                continue
+            table_header_line = table_headers[0]
+            open_ports = []
+            for row_idx in range(table_header_line + 1, len(report)):
+                if 'open' in report[row_idx]:
+                    open_ports.append(report[row_idx].split(' ')[0])
+                else:
+                    break
+
+            working_username = None
+            if '22/tcp' in open_ports:
+                for username in remaining_usernames:
+                    try:
+                        conn = await asyncio.wait_for(asyncssh.connect(ip, username=username, password=pi_password, known_hosts=None), timeout=10)
+                        working_username = username
+                        break
+                    except Exception as e:
+                        continue
+
+            if working_username:
+                hosts.append(ip)
+                usernames.append(working_username)
+                remaining_usernames.remove(working_username)
 
     return hosts, usernames
 
@@ -280,22 +316,32 @@ async def killall_python(conn):
             print(f'Failed to stop: {e}')
 
 async def kill_workers(hosts, connect_options):
-    for host, co in zip(hosts, connect_options):
+    async def run_killall(args):
+        host, co = args
         conn = await asyncio.wait_for(asyncssh.connect(host, **co), timeout=10)
         await killall_python(conn)
+
+    args = zip(hosts, connect_options)
+    await amap(run_killall, args, num_workers=len(hosts))
 
 async def stop_stale_workers(hosts, connect_options):
-    for host, co in zip(hosts, connect_options):
+    async def run_killall(args):
+        host, co = args
         conn = await asyncio.wait_for(asyncssh.connect(host, **co), timeout=10)
         await killall_python(conn)
+    args = zip(hosts, connect_options)
+    await amap(run_killall, args, num_workers=len(hosts))
 
 async def change_mac_addresses(hosts, connect_options, **kwargs):
-    for host, co in zip(hosts, connect_options):
+    async def run_change_mac_address(args):
+        host, co = args
         conn = await asyncio.wait_for(asyncssh.connect(host, **co), timeout=10)
         try:
             await change_mac_address(conn, **kwargs)
         except asyncssh.process.ProcessError as e:
             raise asyncssh.misc.Error(e.code, e.stderr)
+    args = zip(hosts, connect_options)
+    await amap(run_change_mac_address, args, num_workers=len(hosts), pbar_desc="Changing MAC addresses...")
 
 async def run_on_pis(hosts, connect_options, func, **kwargs):
     results = []
