@@ -204,7 +204,7 @@ async def scan_for_pis(possible_usernames):
     concurrent = True
 
     if concurrent:
-        async def run_test_connect():
+        async def run_test_connect(report):
             ip = report[0].split(' ')[4]
             table_headers = [i for i, l in enumerate(report) if 'PORT' in l]
             if not table_headers:
@@ -218,7 +218,7 @@ async def scan_for_pis(possible_usernames):
                     break
 
             if '22/tcp' in open_ports:
-                for username in remaining_usernames:
+                for username in possible_usernames:
                     try:
                         await asyncio.wait_for(asyncssh.connect(ip, username=username, password=pi_password, known_hosts=None), timeout=10)
                     except Exception as e:
