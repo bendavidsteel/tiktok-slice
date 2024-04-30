@@ -352,7 +352,7 @@ async def dask_map(function, args, num_workers=16, reqs_per_ip=1000, batch_size=
                             num_exceptions_for_current_ips += exception_counter.count
 
                             # check if we need to recreate workers
-                            if num_reqs_for_current_ips >= reqs_per_ip * num_actual_workers:
+                            if len([t for t in tasks if not t.completed]) > 0 and num_reqs_for_current_ips >= reqs_per_ip * num_actual_workers:
                                 # recreate workers to get new IPs
                                 if cluster_type == 'fargate':
                                     cluster.scale(0)
@@ -510,12 +510,11 @@ class DaskFunc:
         }
     
 def get_local_ip(interface):
+    ip_command = f"ip -4 addr show {interface}"
     if interface == 'wlan0':
-        ip_command = f"ip -6 addr show {interface}"
-        regex_command = " | grep -oP '(?<=inet6\s)([^\/]+)'"
+        regex_command = " | grep -oP '(?<=brd\s)\d+(\.\d+){3}'"
     elif interface == 'eth0':
-        ip_command = f"ip -4 addr show {interface}"
-        regex_command = " | grep -oP '(?<=inet\s)([^\/]+)'"
+        regex_command = " | grep -oP '(?<=inet\s)\d+(\.\d+){3}'"
     else:
         raise ValueError()
     
@@ -726,9 +725,9 @@ async def get_random_sample(
 async def run_random_sample():
     generation_strategy = 'all'
     # TODO run at persistent time after collection, i.e. if collection takes an hour, run after 24s after post time
-    start_time = datetime.datetime(2024, 3, 1, 17, 0, 0)
+    start_time = datetime.datetime(2024, 3, 1, 19, 0, 0)
     num_time = 1
-    time_unit = 'ms'
+    time_unit = 'h'
     num_workers = 15
     reqs_per_ip = 400
     batch_size = 10000
@@ -761,7 +760,12 @@ async def run_random_sample():
         actual_time_unit = time_unit
         actual_start_times = [start_time]
 
+    this_dir_path = os.path.dirname(os.path.realpath(__file__))
     for actual_start_time in actual_start_times:
+        results_dir_path = os.path.join(this_dir_path, '..', 'data', 'results', 'hours', str(actual_start_time.hour), str(actual_start_time.minute), str(actual_start_time.second))
+        if os.path.exists(results_dir_path):
+            print(f"Skipping as {results_dir_path} exists")
+            continue
         await get_random_sample(
             generation_strategy,
             actual_start_time,

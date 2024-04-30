@@ -13,6 +13,7 @@ import tqdm
 
 async def setup_pi(conn, reqs=''):
     # install python
+    # TODO use more lightweight raspberry pi image
     r = await conn.run('python3 --version', check=True)
     if r.stdout.strip() != 'Python 3.10.12':
         await conn.run('sudo apt update', check=True)
@@ -128,7 +129,7 @@ async def start_vpn(conn):
 async def ensure_wifi_connection(conn, connect_options, force_start=False):
     num_tries = 0
     max_tries = 3
-
+    # TODO use google dns64 server to allow ipv6 connections
     # test if we need password for sudo
     r = await conn.run("sudo -n true", check=False)
     if r.returncode == 1:
