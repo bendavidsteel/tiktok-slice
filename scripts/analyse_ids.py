@@ -14,8 +14,10 @@ import tqdm
 from copia.plot import accumulation_curve
 from copia.stats import species_accumulation
 
+from map_funcs import process_amap
+
 def plot_found_segments(video_other_bits, fig_dir_path):
-    plot_found_segments_for_intervals(video_other_bits, fig_dir_path, [(0,9), (10,13), (14,17), (18,24), (25,31)], 'found_segments')
+    plot_found_segments_for_intervals(video_other_bits, fig_dir_path, [(0,9), (10,13), (14,17), (18,25), (26,31)], 'found_segments')
     plot_found_segments_for_intervals(video_other_bits, fig_dir_path, [(10,31)], 'two_segments')
 
 def plot_found_segments_for_intervals(video_other_bits, fig_dir_path, found_intervals, segment_name):
@@ -55,7 +57,7 @@ def plot_found_segments_for_intervals(video_other_bits, fig_dir_path, found_inte
 
 def get_most_probable_bits(video_other_bits, fig_dir_path):
     get_most_probable_bits_for_intervals(video_other_bits, fig_dir_path, [(10,31)], 'two_segments')
-    get_most_probable_bits_for_intervals(video_other_bits, fig_dir_path, [(0,9), (10,13), (14,17), (18,29), (30,31)], 'found_segments')
+    get_most_probable_bits_for_intervals(video_other_bits, fig_dir_path, [(0,9), (10,13), (14,17), (18,25), (26,31)], 'found_segments')
 
 def get_most_probable_bits_for_intervals(video_other_bits, fig_dir_path, found_intervals, segment_name):
     bit_sections = []
@@ -122,6 +124,39 @@ def get_rarefaction_extrapolation(video_other_bits, fig_dir_path):
     fig, ax = plt.subplots()
     accumulation_curve(counts, accumulation, ax=ax, xlabel='Number of IDs', ylabel='Number of unique Bit Patterns')
     fig.savefig(os.path.join(fig_dir_path, 'rarefaction_extrapolation.png'))
+
+def counter_investigation(video_bits, fig_dir_path):
+    # get distribution of number of videos per millisecond
+    bit_sections = [{'time_bits': int(b[:32], 2) + int(b[32:42], 2) / 1000, 'counter_bits': b[32+10:32+18], 'geo_bits': b[32+18:]} for b in video_bits]
+    df = pd.DataFrame(bit_sections)
+    fig, ax = plt.subplots(nrows=1, ncols=1)
+    time_groups_df = df.groupby(['time_bits', 'geo_bits'])
+    num_per_time_df = time_groups_df.count().rename(columns={'counter_bits': 'num'}).reset_index()
+    num_per_time_df['num'].value_counts().sort_index().plot(ax=ax)
+    fig.savefig(os.path.join(fig_dir_path, 'num_per_millisecond.png'))
+
+    time_groups = {}
+    for time in time_groups_df.groups:
+        time_groups[time] = time_groups_df.get_group(time)['counter_bits'].values
+
+    milli_dir_path = os.path.join(fig_dir_path, 'num_per_milli')
+    if not os.path.exists(milli_dir_path):
+        os.mkdir(milli_dir_path)
+
+    # plot distribution of bits for each group
+    counts_per_milli = num_per_time_df['num'].unique()
+    df = df.merge(num_per_time_df, how='left', on='time_bits')
+    num_group_df = df.groupby('num')
+    for count_per_milli in counts_per_milli:
+        bits_df = num_group_df.get_group(count_per_milli)
+        other_bits = [int(b, 2) for b in bits_df['counter_bits'].values]
+        interval = (42, 50)
+        bins = np.arange(2 ** (interval[1] + 1 - interval[0]))
+        counts = np.bincount(other_bits, minlength=2 ** (interval[1] + 1 - interval[0]))
+        fig, ax = plt.subplots(nrows=1, ncols=1)
+        ax.plot(bins, counts)
+        fig.savefig(os.path.join(milli_dir_path, f"{count_per_milli}.png"))
+        plt.close(fig)
 
 def do_analysis(video_ids, fig_dir_path):
     video_bits = [format(int(id), '064b') for id in video_ids]
@@ -210,7 +245,7 @@ def do_analysis(video_ids, fig_dir_path):
     if False:
         # use logistic regression to see which bits are important to each other
         bit_coefs = []
-        for i in range(32):
+        for i in tqdm.tqdm(range(32), total=32, desc="Doing logistic regressions"):
             X = np.array([[int(bits[j], 2) for j in range(len(bits)) if j != i] for bits in video_other_bits])
             y = np.array([int(b[i], 2) for b in video_other_bits])
             if len(np.unique(y)) == 1:
@@ -231,53 +266,104 @@ def do_analysis(video_ids, fig_dir_path):
         fig.savefig(os.path.join(fig_dir_path, 'bit_attention_map.png'))
 
     if True:
-        plot_found_segments(video_other_bits, fig_dir_path)
-        
-
-    if False:
-        get_most_probable_bits(video_other_bits, fig_dir_path)
+        counter_investigation(video_bits, fig_dir_path)
 
     if True:
+        plot_found_segments(video_other_bits, fig_dir_path)
+        
+    if True:
+        get_most_probable_bits(video_other_bits, fig_dir_path)
+
+    if False:
         get_rarefaction_extrapolation(video_other_bits, fig_dir_path)
 
+def do_country_analysis(country):
+    this_dir_path = os.path.dirname(os.path.abspath(__file__))
+    data_dir_path = os.path.join(this_dir_path, 'data')
+    country_videos = []
+    for filename in os.listdir(os.path.join(data_dir_path, country, 'videos')):
+        if filename.endswith(".json"):
+            with open(os.path.join(data_dir_path, country, 'videos', filename), 'r') as file:
+                videos = json.load(file)
+            if 'author' in videos:
+                videos = pd.DataFrame(videos).to_dict('records')
+            country_videos.extend([{'id': v['id'], 'createtime': datetime.datetime.fromtimestamp(v['createTime'])} for v in videos])
+        elif 'parquet' in filename:
+            video_df = pd.read_parquet(os.path.join(data_dir_path, country, 'videos', filename))
+            if 'id' in video_df.columns:
+                video_df = video_df.rename(columns={'createTime': 'createtime'})
+                file_videos = video_df[['id', 'createtime']].to_dict('records')
+                file_videos = [{'id': v['id'], 'createtime': datetime.datetime.fromtimestamp(v['createtime'])} for v in file_videos]
+            elif 'video_id' in video_df.columns:
+                video_df = video_df.rename(columns={'video_id': 'id'})
+                file_videos = video_df[['id', 'createtime']].to_dict('records')
+                file_videos = [{'id': v['id'], 'createtime': v['createtime'].to_pydatetime()} for v in file_videos]
+            
+            country_videos.extend(file_videos)
+    country_video_df = pd.DataFrame(country_videos)
+    country_video_df = country_video_df.drop_duplicates(subset=['id'])
+    country_video_ids = country_video_df['id'].to_list()
+    country_fig_dir_path = os.path.join(this_dir_path, "..", "figs", country)
+    if not os.path.exists(country_fig_dir_path):
+        os.makedirs(country_fig_dir_path)
+    do_analysis(country_video_ids, country_fig_dir_path)
+    country_videos = country_video_df.to_dict('records')
+    return country_videos
+
+def parse_result(result):
+    ret = result['result']['return']
+    if not ret:
+        return False
+    if 'statusCode' in ret:
+        if ret['statusCode'] == 10204:
+            if ret['statusMsg'] == "item doesn't exist":
+                return False
+            elif ret['statusMsg'] == "status_deleted":
+                return True
+            elif ret['statusMsg'] == "status_self_see":
+                return True
+            else:
+                return True
+        elif ret['statusCode'] == 10222:
+            return True
+        elif ret['statusCode'] == 10235:
+            return True
+        else:
+            return False
+    return True
+
+def read_result_path(result_path):
+    with open(result_path, 'r') as f:
+        try:
+            results = json.load(f)
+        except:
+            return []
+    return [r['args'] for r in results if parse_result(r)]
 
 def main():
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
     data_dir_path = os.path.join(this_dir_path, "..", "data")
 
+    all_videos = []
+    fetched_videos = []
+    result_paths = []
+    for dir_path, dir_names, filenames in os.walk(os.path.join(data_dir_path, 'results')):
+        for filename in filenames:
+            if filename == 'results.json':
+                result_paths.append(os.path.join(dir_path, filename))
+    # for result_path in tqdm.tqdm(result_paths, desc="Reading result files"):
+    
+    all_results = process_amap(read_result_path, result_paths, num_workers=multiprocessing.cpu_count() - 1, pbar_desc="Reading result files")
+    fetched_video_ids = [v for res in all_results for v in res]
+    fetched_fig_path = os.path.join(this_dir_path, '..', 'figs', 'fetched')
+    do_analysis(fetched_video_ids, fetched_fig_path)
+
     countries = ['brazil', 'canada', 'germany', 'indonesia', 'nigeria']
 
     print("All countries")
-    all_videos = []
-    for country in tqdm.tqdm(countries):
-        country_videos = []
-        for filename in os.listdir(os.path.join(data_dir_path, country, 'videos')):
-            if filename.endswith(".json"):
-                with open(os.path.join(data_dir_path, country, 'videos', filename), 'r') as file:
-                    videos = json.load(file)
-                if 'author' in videos:
-                    videos = pd.DataFrame(videos).to_dict('records')
-                country_videos.extend([{'id': v['id'], 'createtime': datetime.datetime.fromtimestamp(v['createTime'])} for v in videos])
-            elif 'parquet' in filename:
-                video_df = pd.read_parquet(os.path.join(data_dir_path, country, 'videos', filename))
-                if 'id' in video_df.columns:
-                    video_df = video_df.rename(columns={'createTime': 'createtime'})
-                    file_videos = video_df[['id', 'createtime']].to_dict('records')
-                    file_videos = [{'id': v['id'], 'createtime': datetime.datetime.fromtimestamp(v['createtime'])} for v in file_videos]
-                elif 'video_id' in video_df.columns:
-                    video_df = video_df.rename(columns={'video_id': 'id'})
-                    file_videos = video_df[['id', 'createtime']].to_dict('records')
-                    file_videos = [{'id': v['id'], 'createtime': v['createtime'].to_pydatetime()} for v in file_videos]
-                
-                country_videos.extend(file_videos)
-        country_video_df = pd.DataFrame(country_videos)
-        country_video_df = country_video_df.drop_duplicates(subset=['id'])
-        country_video_ids = country_video_df['id'].to_list()
-        country_fig_dir_path = os.path.join(this_dir_path, "..", "figs", country)
-        if not os.path.exists(country_fig_dir_path):
-            os.makedirs(country_fig_dir_path)
-        do_analysis(country_video_ids, country_fig_dir_path)
-        country_videos = country_video_df.to_dict('records')
+    with multiprocessing.Pool(processes=len(countries)) as pool:
+        all_country_videos = pool.map(do_country_analysis, countries)
+    for country_videos in all_country_videos:
         all_videos.extend(country_videos)
 
     all_videos_df = pd.DataFrame(all_videos)
@@ -285,14 +371,16 @@ def main():
     all_videos_df = all_videos_df.drop_duplicates(subset=['id'])
     years = all_videos_df['createtime'].dt.year.unique()
     print("All years")
-    for year in tqdm.tqdm(years):
+    def do_year_analysis(year):
         year_ids = all_videos_df[all_videos_df['createtime'].dt.year == year]['id'].to_list()
         if len(year_ids) < 2:
-            continue
+            return
         year_fig_dir_path = os.path.join(this_dir_path, '..', 'figs', str(year))
         if not os.path.exists(year_fig_dir_path):
             os.makedirs(year_fig_dir_path)
         do_analysis(year_ids, year_fig_dir_path)
+
+    process_amap(do_year_analysis, years, pbar_desc="Do year analysis")
 
     # canadian_comment_ids = []
     # for filename in os.listdir(os.path.join(data_dir_path, 'canada', 'comments')):

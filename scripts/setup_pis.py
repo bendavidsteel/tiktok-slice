@@ -8,7 +8,7 @@ import subprocess
 import asyncssh
 import tqdm
 
-from map_funcs import amap
+from map_funcs import async_amap
 
 async def setup_pi(conn, reqs=''):
     # install python
@@ -174,14 +174,14 @@ async def start_wifi_connections(hosts, connect_options, progress_bar=True):
         host, co = args
         conn = await asyncio.wait_for(asyncssh.connect(host, **co), timeout=10)
         await asyncio.wait_for(start_wifi_connection(conn), timeout=120)
-    await amap(run_start_wifi, iterable, num_workers=len(hosts), pbar_desc="Starting wifi connections")
+    await async_amap(run_start_wifi, iterable, num_workers=len(hosts), pbar_desc="Starting wifi connections")
 
 async def check_connection(hosts, usernames):
     iterable = zip(hosts, usernames)
     async def run_connect(args):
         host, username = args
         await asyncio.wait_for(asyncssh.connect(host, username=username, password='rp145', known_hosts=None), timeout=10)
-    await amap(run_connect, iterable, num_workers=len(hosts))
+    await async_amap(run_connect, iterable, num_workers=len(hosts))
 
 async def scan_for_pis(possible_usernames):
     pi_password = 'rp145'
@@ -228,7 +228,7 @@ async def scan_for_pis(possible_usernames):
             else:
                 return None, None
             
-        results = await amap(run_test_connect, all_reports, num_workers=len(all_reports))
+        results = await async_amap(run_test_connect, all_reports, num_workers=len(all_reports))
         return [(host, username) for host, username in results if host]
 
     else:
@@ -322,7 +322,7 @@ async def kill_workers(hosts, connect_options):
         await killall_python(conn)
 
     args = zip(hosts, connect_options)
-    await amap(run_killall, args, num_workers=len(hosts))
+    await async_amap(run_killall, args, num_workers=len(hosts))
 
 async def stop_stale_workers(hosts, connect_options):
     async def run_killall(args):
@@ -330,7 +330,7 @@ async def stop_stale_workers(hosts, connect_options):
         conn = await asyncio.wait_for(asyncssh.connect(host, **co), timeout=10)
         await killall_python(conn)
     args = zip(hosts, connect_options)
-    await amap(run_killall, args, num_workers=len(hosts))
+    await async_amap(run_killall, args, num_workers=len(hosts))
 
 async def change_mac_addresses(hosts, connect_options, **kwargs):
     async def run_change_mac_address(args):
@@ -341,7 +341,7 @@ async def change_mac_addresses(hosts, connect_options, **kwargs):
         except asyncssh.process.ProcessError as e:
             raise asyncssh.misc.Error(e.code, e.stderr)
     args = zip(hosts, connect_options)
-    await amap(run_change_mac_address, args, num_workers=len(hosts), pbar_desc="Changing MAC addresses...")
+    await async_amap(run_change_mac_address, args, num_workers=len(hosts), pbar_desc="Changing MAC addresses...")
 
 async def run_on_pis(hosts, connect_options, func, **kwargs):
     results = []

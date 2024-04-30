@@ -1,4 +1,5 @@
 import asyncio
+import multiprocessing
 from typing import Coroutine, Iterable, List, Optional, Callable
 
 from tqdm.asyncio import tqdm as atqdm
@@ -102,12 +103,24 @@ async def _amap(
         results.append(res)
     return results
 
-async def amap(coroutine, data, num_workers=8, pbar_desc=None):
+async def async_amap(coroutine, data, num_workers=8, pbar_desc=None):
     pbar = atqdm(total=len(data), desc=pbar_desc)  # track progress tqdm
 
     def callback(*_):
         pbar.update()
 
     res = await _amap(coroutine, data, num_workers, callback=callback)
+    pbar.close()
+    return res
+
+def process_amap(function, data, num_workers=8, pbar_desc=None):
+    pbar = atqdm(total=len(data), desc=pbar_desc) # track progress tqdm
+
+    def callback(*_):
+        pbar.update()
+
+    with multiprocessing.Pool(processes=num_workers) as pool:
+        res = pool.map_async(function, data, callback=callback).get()
+
     pbar.close()
     return res
