@@ -8,7 +8,6 @@ import os
 import subprocess
 import time
 import traceback
-from typing import Coroutine, Iterable, List, Optional, Callable
 
 from dask.distributed import Client as DaskClient
 from dask.distributed import LocalCluster as DaskLocalCluster
@@ -23,106 +22,8 @@ import httpx
 from tqdm import tqdm
 from tqdm.asyncio import tqdm as atqdm
 
+from map_funcs import _amap
 from setup_pis import change_mac_addresses, get_hosts_with_retries, start_wifi_connections, stop_stale_workers
-
-async def aworker(
-    coroutine: Coroutine,
-    tasks_queue: asyncio.Queue,
-    result_queue: asyncio.Queue,
-    stop_event: asyncio.Event,
-    timeout: float = 1,
-    callback: Optional[Callable] = None
-) -> None:
-    """
-    A worker coroutine to process tasks from a queue.
-
-    Args:
-        coroutine: The coroutine to be applied to each task.
-        tasks_queue: The queue containing the tasks to be processed.
-        result_queue: The queue to put the results of each processed task.
-        stop_event: An event to signal when all tasks have been added to the tasks queue.
-        timeout: The timeout value for getting a task from the tasks queue.
-        callback: A function that can be called at the end of each coroutine.
-    """
-    # Continue looping until stop_event is set and the tasks queue is empty
-    while not stop_event.is_set() or not tasks_queue.empty():
-        try:
-            # Try to get a task from the tasks queue with a timeout
-            idx, arg = await asyncio.wait_for(tasks_queue.get(), timeout)
-        except asyncio.TimeoutError:
-            # If no task is available, continue the loop
-            continue
-        try:
-            # Try to execute the coroutine with the argument from the task
-            result = await coroutine(arg)
-            # If successful, add the result to the result queue
-            result_queue.put_nowait((idx, result))
-
-        finally:
-            # Mark the task as done in the tasks queue
-            tasks_queue.task_done()
-            # callback for progress update
-            if callback is not None:
-                callback(idx, arg)
-
-
-async def amap(
-    coroutine: Coroutine,
-    data: Iterable,
-    max_concurrent_tasks: int = 10,
-    max_queue_size: int = -1,  # infinite
-    callback: Optional[Callable] = None,
-) -> List:
-    """
-    An async function to map a coroutine over a list of arguments.
-
-    Args:
-        coroutine: The coroutine to be applied to each argument.
-        data: The list of arguments to be passed to the coroutine.
-        max_concurrent_tasks: The maximum number of concurrent tasks.
-        max_queue_size: The maximum number of tasks in the workers queue.
-        callback: A function to be called at the end of each coroutine.
-    """
-    # Initialize the tasks queue and results queue
-    # The queue size is infinite if max_queue_size is 0 or less.
-    # Setting it to finite number will save some resources,
-    # but will risk that an exception will be thrown too late.
-    # Should be higher than the max_concurrent_tasks.
-    tasks_queue = asyncio.Queue(max_queue_size)
-    result_queue = asyncio.PriorityQueue()
-
-    # Create an event to signal when all tasks have been added to the tasks queue
-    stop_event = asyncio.Event()
-    # Create workers
-    workers = [
-        asyncio.create_task(aworker(
-            coroutine, tasks_queue, result_queue, stop_event, callback=callback
-        ))
-        for _ in range(max_concurrent_tasks)
-    ]
-
-    # Add inputs to the tasks queue
-    for arg in enumerate(data):
-        await tasks_queue.put(arg)
-    # Set the stop_event to signal that all tasks have been added to the tasks queue
-    stop_event.set()
-
-    # Wait for all workers to complete
-    # raise the earliest exception raised by a coroutine (if any)
-    await asyncio.gather(*workers)
-    # Ensure all tasks have been processed
-    await tasks_queue.join()
-
-    # Gather all results
-    results = []
-    while not result_queue.empty():
-        # Get the result from the results queue and discard the index
-        # Given that the results queue is a PriorityQueue, the index
-        # plays a role to ensure that the results are in the same order
-        # like the original list.
-        _, res = result_queue.get_nowait()
-        results.append(res)
-    return results
 
 async def async_map(func, args, num_workers=10):
     all_pbar = tqdm(total=len(args))
@@ -133,7 +34,7 @@ async def async_map(func, args, num_workers=10):
         batch_pbar = atqdm(total=len(args))
         def callback(*_):
             batch_pbar.update(1)
-        res = await amap(func, batch_tasks, max_concurrent_tasks=num_workers, callback=callback)
+        res = await _amap(func, batch_tasks, max_concurrent_tasks=num_workers, callback=callback)
         batch_pbar.close()
         for t, r in zip(batch_tasks, res):
             if r['exception'] is not None:
@@ -545,7 +446,6 @@ class DaskBatchFunc:
         transport = httpx.HTTPTransport(local_address=interface_ip)
         with httpx.Client(transport=transport) as http_client:
             return thread_map(batch_args, itertools.repeat(http_client), function=self.func, num_workers=self.task_nthreads)
-        # return thread_map(batch_args, function=self.func, num_workers=self.task_nthreads)
     
 class AsyncDaskFunc:
     def __init__(self, func):
