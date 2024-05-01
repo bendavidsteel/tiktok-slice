@@ -213,7 +213,7 @@ async def start_wifi_connections(hosts, connect_options, progress_bar=True):
     working_connect_options = [co for host, co in res if host]
     return working_hosts, working_connect_options
 
-async def check_connection(hosts, usernames):
+async def check_connection(hosts, usernames, progress_bar=False):
     iterable = zip(hosts, usernames)
     async def run_connect(args):
         host, username = args
@@ -360,7 +360,7 @@ async def stop_stale_workers(hosts, connect_options):
     args = zip(hosts, connect_options)
     await async_amap(run_killall, args, num_workers=len(hosts))
 
-async def change_mac_addresses(hosts, connect_options, **kwargs):
+async def change_mac_addresses(hosts, connect_options, progress_bar=False, **kwargs):
     async def run_change_mac_address(args):
         host, co = args
         tries = 0
@@ -381,7 +381,7 @@ async def change_mac_addresses(hosts, connect_options, **kwargs):
         else:
             raise Exception(f"Failed to change MAC address on {host} (username: {co['username']}) after {max_tries} tries: {exceptions}")
     args = zip(hosts, connect_options)
-    await async_amap(run_change_mac_address, args, num_workers=len(hosts), pbar_desc="Changing MAC addresses...")
+    await async_amap(run_change_mac_address, args, num_workers=len(hosts), progress_bar=progress_bar, pbar_desc="Changing MAC addresses...")
 
 async def run_on_pis(hosts, connect_options, func, **kwargs):
     results = []
