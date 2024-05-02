@@ -380,7 +380,7 @@ async def change_mac_addresses(hosts, connect_options, progress_bar=False, **kwa
                 return
         else:
             raise Exception(f"Failed to change MAC address on {host} (username: {co['username']}) after {max_tries} tries: {exceptions}")
-    args = zip(hosts, connect_options)
+    args = list(zip(hosts, connect_options))
     await async_amap(run_change_mac_address, args, num_workers=len(hosts), progress_bar=progress_bar, pbar_desc="Changing MAC addresses...")
 
 async def run_on_pis(hosts, connect_options, func, **kwargs):
