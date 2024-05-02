@@ -188,7 +188,7 @@ async def ensure_wifi_connection(conn, connect_options, force_start=False):
         raise Exception("Failed to create wifi connection")
     
 async def start_wifi_connections(hosts, connect_options, progress_bar=True):
-    iterable = zip(hosts, connect_options)
+    iterable = list(zip(hosts, connect_options))
     async def run_start_wifi(args):
         host, co  = args
         conn = await asyncio.wait_for(asyncssh.connect(host, **co), timeout=10)
@@ -208,7 +208,7 @@ async def start_wifi_connections(hosts, connect_options, progress_bar=True):
         else:
             return host, co
 
-    res = await async_amap(run_start_wifi, iterable, num_workers=len(hosts), pbar_desc="Starting wifi connections")
+    res = await async_amap(run_start_wifi, iterable, num_workers=len(hosts), progress_bar=progress_bar, pbar_desc="Starting wifi connections")
     working_hosts = [host for host, co in res if host]
     working_connect_options = [co for host, co in res if host]
     return working_hosts, working_connect_options
@@ -271,9 +271,9 @@ async def scan_for_pis(possible_usernames, progress_bar=False):
             else:
                 return None, None
             
-        results = await async_amap(run_test_connect, all_reports, num_workers=len(all_reports))
-        return [host for host, username in results if host], [username for host, username in results if host]
-
+        results = await async_amap(run_test_connect, all_reports, num_workers=len(all_reports), progress_bar=progress_bar, pbar_desc="Scanning for Pis")
+        hosts, usernames = [host for host, username in results if host], [username for host, username in results if host]
+        
     else:
         hosts = []
         usernames = []
@@ -308,7 +308,14 @@ async def scan_for_pis(possible_usernames, progress_bar=False):
                 usernames.append(working_username)
                 remaining_usernames.remove(working_username)
 
-        return hosts, usernames
+    # if username shows up for multiple hosts, remove the duplicates
+    unique_usernames = []
+    unique_hosts = []
+    for host, username in zip(hosts, usernames):
+        if username not in unique_usernames:
+            unique_usernames.append(username)
+            unique_hosts.append(host)
+    return unique_hosts, unique_usernames
 
 def generate_random_mac():
     return randmac.RandMac()

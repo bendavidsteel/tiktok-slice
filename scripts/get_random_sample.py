@@ -22,7 +22,6 @@ import httpx
 from tqdm import tqdm
 from tqdm.asyncio import tqdm as atqdm
 
-from analyse_ids import possible_created_video
 from map_funcs import _amap
 from setup_pis import change_mac_addresses, get_hosts_with_retries, start_wifi_connections, stop_stale_workers
 
@@ -115,6 +114,7 @@ class DaskCluster:
                 'floyd',
                 'marvin',
                 'juris',
+                'edsger',
             ]
             print("Finding hosts...")
             raspi_password = os.environ['RASPI_PASSWORD']
@@ -180,76 +180,10 @@ class Counter:
         self.count += n
 
 class IDDataset:
-    def __init__(self, start_time, num_time, time_unit):
-        self.start_time = start_time
-        self.num_time = num_time
-        self.time_unit = time_unit
-        with open(os.path.join(this_dir_path, '..', 'figs', 'all_videos', f'all_three_segments_combinations.json'), 'r') as file:
-            interval_values = json.load(file)
-
-        # get bits of non timestamp sections of ID
-        # order dict according to interval
-        # interval_values = [(tuple(map(int, interval.strip('()').split(', '))), vals) for interval, vals in data.items()]
-        # interval_values = sorted(interval_values, key=lambda x: x[0][0])
-        # get rid of millisecond bits
-        # data = [t for t in data if t[0] != (0,9)]
-        id_bits = []
-        self.id_interval = (54, 63)
-        assert self.id_interval in interval_values, f"ID interval {self.id_interval} not in interval values"
-        num_bits = self.id_interval[1] - self.id_interval[0] + 1
-        id_bits = [format(i, f'0{num_bits}b') for i in interval_values[self.id_interval]]
-
-        counter_interval = (10, 23)
-        assert counter_interval in interval_values, f"Counter interval {counter_interval} not in interval values"
-        num_bits = counter_interval[1] - counter_interval[0] + 1
-        counter_bits = [format(i, f'0{num_bits}b') for i in interval_values[counter_interval]]
-        counter_bits = sorted(counter_bits)
-        min_counter = int(counter_bits[0], 2)
-        max_counter = int(counter_bits[-1], 2)
-
-        # other_bit_sequences = itertools.product(*interval_bits)
-        # other_bit_sequences = [''.join(bits) for bits in other_bit_sequences]
-
-        # get all videos in 1 millisecond
-        
-        unit_map = {
-            'ms': 'milliseconds',
-            's': 'seconds',
-            'm': 'minutes',
-        }
-        time_delta = datetime.timedelta(**{unit_map[time_unit]: num_time})
-        
-        end_time = start_time + time_delta
-        c_time = start_time
-        all_timestamp_bits = []
-        while c_time < end_time:
-            unix_timestamp_bits = format(int(c_time.timestamp()), '032b')
-            milliseconds = int(format(c_time.timestamp(), '.3f').split('.')[1])
-            milliseconds_bits = format(milliseconds, '010b')
-            timestamp_bits = unix_timestamp_bits + milliseconds_bits
-            all_timestamp_bits.append(timestamp_bits)
-            c_time += datetime.timedelta(milliseconds=1)
-
-        potential_video_bits = itertools.product(all_timestamp_bits, [min_counter], id_bits)
-        potential_video_bits = [''.join(bits) for bits in potential_video_bits]
-        potential_video_ids = [int(bits, 2) for bits in potential_video_bits]
-
+    def __init__(self, potential_video_ids):
         self.tasks = [DaskTask(id) for id in potential_video_ids]
 
     def get_batch(self, batch_size):
-        for t in self.tasks:
-            if t.completed:
-                # check if result indicates that it was a hit (could be valid video, or private, or deleted etc.)
-                if is_created_video(t.result):
-                    # check next values on the counter
-                    task_video_id = t.args[0]
-                    this_counter = int(task_video_id[self.counter_interval], 2)
-                    next_counter = this_counter + 1
-                    if next_counter <= self.max_counter:
-                        next_counter_bits = format(next_counter, f'0{self.counter_bits}b')
-                        next_potential_video_bits = task_video_id[self.timestamp_interval] + task_video_id[self.milliseconds_interval] + next_counter_bits + task_video_id[self.id_interval]
-                        next_potential_video_id = int(next_potential_video_bits, 2)
-                        self.tasks.append(DaskTask(next_potential_video_id))
         return [t for t in self.tasks if not t.completed][:batch_size]
     
     def num_left(self):
@@ -315,7 +249,7 @@ async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_si
                             num_exceptions_for_current_ips += exception_counter.count
 
                             # check if we need to recreate workers
-                            if len([t for t in tasks if not t.completed]) > 0 and num_reqs_for_current_ips >= reqs_per_ip * num_actual_workers:
+                            if dataset.num_left() > 0 and num_reqs_for_current_ips >= reqs_per_ip * num_actual_workers:
                                 # recreate workers to get new IPs
                                 if cluster_type == 'fargate':
                                     cluster.scale(0)
@@ -608,13 +542,14 @@ async def get_random_sample(
     potential_video_bits = itertools.product(all_timestamp_bits, other_bit_sequences)
     potential_video_bits = [''.join(bits) for bits in potential_video_bits]
     potential_video_ids = [int(bits, 2) for bits in potential_video_bits]
-    
+    dataset = IDDataset(potential_video_ids)
+
     if method == 'async':
-        results = await async_map(async_get_video, potential_video_ids, num_workers=num_workers)
+        results = await async_map(async_get_video, dataset, num_workers=num_workers)
     elif method == 'dask':
         results = await dask_map(
             get_video, 
-            potential_video_ids, 
+            dataset, 
             num_workers=num_workers, 
             reqs_per_ip=reqs_per_ip, 
             batch_size=batch_size,
@@ -691,7 +626,7 @@ async def run_random_sample():
     start_time = datetime.datetime(2024, 3, 1, 19, 0, 0)
     num_time = 1
     time_unit = 'h'
-    num_workers = 15
+    num_workers = 20
     reqs_per_ip = 400
     batch_size = 10000
     task_batch_size = 40
