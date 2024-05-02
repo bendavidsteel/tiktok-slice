@@ -266,11 +266,13 @@ async def scan_for_pis(possible_usernames, progress_bar=False):
                         continue
                     else:
                         return ip, username
+                else:
+                    return None, None
             else:
                 return None, None
             
         results = await async_amap(run_test_connect, all_reports, num_workers=len(all_reports))
-        return [(host, username) for host, username in results if host]
+        return [host for host, username in results if host], [username for host, username in results if host]
 
     else:
         hosts = []
@@ -306,7 +308,7 @@ async def scan_for_pis(possible_usernames, progress_bar=False):
                 usernames.append(working_username)
                 remaining_usernames.remove(working_username)
 
-    return hosts, usernames
+        return hosts, usernames
 
 def generate_random_mac():
     return randmac.RandMac()
@@ -384,14 +386,14 @@ async def change_mac_addresses(hosts, connect_options, progress_bar=False, **kwa
     await async_amap(run_change_mac_address, args, num_workers=len(hosts), progress_bar=progress_bar, pbar_desc="Changing MAC addresses...")
 
 async def run_on_pis(hosts, connect_options, func, **kwargs):
-    results = []
-    for host, connect_option in zip(hosts, connect_options):
+    async def run_func(args):
+        host, connect_option, func, kwargs = args
+        print(f"Connecting to {host}, {connect_option['username']}...")
         tries = 0
         max_tries = 3
         exceptions = []
         while tries < max_tries:
             tries += 1
-            print(f'Connecting to {host}...')
             try:
                 conn = await asyncio.wait_for(asyncssh.connect(host, **connect_option, known_hosts=None), timeout=10)
             except Exception as e:
@@ -407,10 +409,13 @@ async def run_on_pis(hosts, connect_options, func, **kwargs):
                     except Exception as e:
                         exceptions.append(e)
                     else:
-                        results.append(r)
-                        break
+                        return r
         else:
             print(f"Failed to run on {host} (username: {connect_option['username']}) after {max_tries} tries: {exceptions}")
+            return None
+
+    args = list(zip(hosts, connect_options, [func] * len(hosts), [kwargs] * len(hosts)))
+    results = await async_amap(run_func, args, num_workers=len(hosts))
     return results
 
 async def get_hosts(usernames):
@@ -485,13 +490,17 @@ async def main():
         'hemming',
         'frances',
         'lee',
-        # 'juris'
+        'turing',
+        'floyd',
+        'juris',
+        'marvin',
+        'edsger'
     ]
     hosts, usernames = await get_hosts_with_retries(potential_usernames, progress_bar=True)
     connect_options = [{'username': username, 'password': 'rp145'} for username in usernames]
 
     # TODO add more pis to network
-    todo = 'change_ip'
+    todo = 'setup'
 
     if todo == 'setup':
         with open('worker_requirements.txt', 'r') as f:
