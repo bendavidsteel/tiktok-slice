@@ -5,6 +5,7 @@ import datetime
 import itertools
 import json
 import os
+import subprocess
 import time
 import traceback
 
@@ -23,7 +24,7 @@ from tqdm.asyncio import tqdm as atqdm
 
 from analyse_ids import possible_created_video
 from map_funcs import _amap
-from setup_pis import change_mac_addresses, get_hosts_with_retries, get_local_ip, start_wifi_connections, stop_stale_workers
+from setup_pis import change_mac_addresses, get_hosts_with_retries, start_wifi_connections, stop_stale_workers
 
 async def async_map(func, args, num_workers=10):
     all_pbar = tqdm(total=len(args))
@@ -116,13 +117,21 @@ class DaskCluster:
                 'juris',
             ]
             print("Finding hosts...")
-            hosts, usernames = await get_hosts_with_retries(potential_usernames, max_tries=10)
-            connect_options = [dict(username=un, password='rp145', known_hosts=None) for un in usernames]
-            connect_options = [dict(co, password='rp145', known_hosts=None) for co in connect_options]
+            raspi_password = os.environ['RASPI_PASSWORD']
+            scheduler_password = os.environ['SCHEDULER_PASSWORD']
+
+            hosts, usernames = await get_hosts_with_retries(potential_usernames, max_tries=3, progress_bar=True)
+            connect_options = [dict(username=un, password=raspi_password, known_hosts=None) for un in usernames]
+
             await stop_stale_workers(hosts, connect_options)
             print("Starting wifi connections...")
-            await start_wifi_connections(hosts, connect_options, progress_bar=True)
+            hosts, connect_options = await start_wifi_connections(hosts, connect_options, progress_bar=True)
+
             remote_python='~/ben/tiktok/venv/bin/python'
+
+            # append client/scheduler
+            hosts = ['localhost'] + hosts
+            connect_options = [dict(username='bsteel', password=scheduler_password)] + connect_options
             self.cluster = DaskSSHCluster(
                 hosts,
                 connect_options=connect_options,
@@ -273,8 +282,8 @@ async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_si
                             # batching tasks as we want to avoid having dask tasks that are too small
                             all_batch_tasks = dataset.get_batch(current_batch_size)
                             batch_tasks = []
-                            for i in range(0, len(all_batch_tasks), batch_size):
-                                batch_tasks.append(all_batch_tasks[i:i+batch_size])
+                            for i in range(0, len(all_batch_tasks), task_batch_size):
+                                batch_tasks.append(all_batch_tasks[i:i+task_batch_size])
                             batch_args = [[t.args for t in batch] for batch in batch_tasks]
 
                             num_reqs_for_current_ips += current_batch_size
@@ -306,7 +315,7 @@ async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_si
                             num_exceptions_for_current_ips += exception_counter.count
 
                             # check if we need to recreate workers
-                            if num_reqs_for_current_ips >= reqs_per_ip * num_actual_workers or num_exceptions_for_current_ips / num_reqs_for_current_ips >= 0.1:
+                            if len([t for t in tasks if not t.completed]) > 0 and num_reqs_for_current_ips >= reqs_per_ip * num_actual_workers:
                                 # recreate workers to get new IPs
                                 if cluster_type == 'fargate':
                                     cluster.scale(0)
@@ -319,7 +328,8 @@ async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_si
                                     workers = list(cluster.workers.values())
                                     hosts = [w.address for w in workers]
                                     connect_options = [w.connect_options for w in workers]
-                                    await change_mac_addresses(hosts, connect_options, interface='wlan0')
+                                    print("Changing worker IPs...")
+                                    await change_mac_addresses(hosts, connect_options, interface='wlan0', progress_bar=True)
                                     num_reqs_for_current_ips = 0
                                     num_exceptions_for_current_ips = 0
                         # catch exceptions that are recoverable without restarting the cluster
@@ -453,7 +463,7 @@ class DaskFunc:
             exception = None
         except Exception as e:
             res = None
-            exception = e
+            exception = {'ex': e, 'tb': traceback.format_exc()}
         post_time = datetime.datetime.now()
 
         return {
@@ -463,6 +473,31 @@ class DaskFunc:
             'post_time': post_time,
         }
     
+def get_local_ip(interface):
+    ip_command = f"ip -4 addr show {interface}"
+    if interface == 'wlan0':
+        regex_command = " | grep -oP '(?<=brd\s)\d+(\.\d+){3}'"
+    elif interface == 'eth0':
+        regex_command = " | grep -oP '(?<=inet\s)\d+(\.\d+){3}'"
+    else:
+        raise ValueError()
+    
+    completed_process = subprocess.run(ip_command + regex_command, shell=True, check=False, capture_output=True)
+
+    if completed_process.returncode != 0:
+        if len(completed_process.stderr) == 0:
+            ip_process = subprocess.run(ip_command, shell=True, check=False, capture_output=True)
+            raise ValueError(f"Could not find IP address for interface {interface}. {ip_process.stdout.decode()}")
+        else:
+            raise subprocess.CalledProcessError(completed_process.returncode, ip_command + regex_command, completed_process.stderr)
+
+    outputs = completed_process.stdout.decode().strip().split('\n')
+    ip_address = outputs[0]
+
+    assert len(ip_address) > 0, f"Could not find IP address for interface {interface}"
+
+    return ip_address
+
 class DaskBatchFunc:
     def __init__(self, func, network_interface=None, task_nthreads=1):
         self.func = func
@@ -595,6 +630,8 @@ async def get_random_sample(
     num_hits = len([r for r in results if r.result and 'id' in r.result['res']])
     num_valid = len([r for r in results if len(r.exceptions) < 3])
     print(f"Num hits: {num_hits}, Num valid: {num_valid}, Num potential video IDs: {len(potential_video_ids)}")
+    if num_valid == 0:
+        raise ValueError("No valid results")
     print(f"Fraction hits: {num_hits / num_valid}")
     print(f"Fraction valid: {num_valid / len(potential_video_ids)}")
     # convert to jsonable format
@@ -651,13 +688,13 @@ async def get_random_sample(
 async def run_random_sample():
     generation_strategy = 'all'
     # TODO run at persistent time after collection, i.e. if collection takes an hour, run after 24s after post time
-    start_time = datetime.datetime(2024, 3, 1, 17, 0, 0)
+    start_time = datetime.datetime(2024, 3, 1, 19, 0, 0)
     num_time = 1
-    time_unit = 'ms'
-    num_workers = 512
-    reqs_per_ip = 2
-    batch_size = 100
-    task_batch_size = 10
+    time_unit = 'h'
+    num_workers = 15
+    reqs_per_ip = 400
+    batch_size = 10000
+    task_batch_size = 40
     task_nthreads = 8
     task_timeout = 20
     worker_cpu = 256
@@ -686,7 +723,12 @@ async def run_random_sample():
         actual_time_unit = time_unit
         actual_start_times = [start_time]
 
+    this_dir_path = os.path.dirname(os.path.realpath(__file__))
     for actual_start_time in actual_start_times:
+        results_dir_path = os.path.join(this_dir_path, '..', 'data', 'results', 'hours', str(actual_start_time.hour), str(actual_start_time.minute), str(actual_start_time.second))
+        if os.path.exists(results_dir_path):
+            print(f"Skipping as {results_dir_path} exists")
+            continue
         await get_random_sample(
             generation_strategy,
             actual_start_time,
@@ -705,24 +747,27 @@ async def run_random_sample():
         )
 
 def get_ip(_, client: httpx.Client):
-    return httpx.get('https://ifconfig.me/ip').content.decode('utf-8')
+    return client.get('https://ifconfig.me/ip').content.decode('utf-8')
 
 async def run_get_ips():
     results = await dask_map(
         get_ip, 
-        range(10), 
-        reqs_per_ip=1000, 
-        batch_size=1000,
-        task_batch_size=10,
+        range(100), 
+        reqs_per_ip=2, 
+        batch_size=25,
+        task_batch_size=1,
         task_timeout=10,
         task_nthreads=1,
         cluster_type='raspi'
     )
-    print(collections.Counter([r.result['res'] for r in results if r.result is not None]))
+    ips = [r.result['res'] for r in results if r.result is not None]
+    print(collections.Counter(ips))
+    print(f"Num unique IPs: {len(set(ips))}")
     
 async def main():
-    # await run_random_sample()
-    await run_get_ips()
+    dotenv.load_dotenv()
+    await run_random_sample()
+    # await run_get_ips()
 
 if __name__ == '__main__':
     asyncio.run(main())

@@ -2,6 +2,7 @@ dask==2024.3.1
 distributed==2024.3.1
 dask-cloudprovider[aws]
 httpx
+brotlipy==0.7.0
 tqdm
 python-dotenv
 msgpack==1.0.8
@@ -10,3 +11,4 @@ lz4==4.3.3
 toolz==0.12.1
 tornado==6.4
 asyncssh
+randmac

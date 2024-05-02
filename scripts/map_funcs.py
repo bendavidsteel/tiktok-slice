@@ -104,14 +104,19 @@ async def _amap(
         results.append(res)
     return results
 
-async def async_amap(coroutine, data, num_workers=8, pbar_desc=None):
-    pbar = atqdm(total=len(data), desc=pbar_desc)  # track progress tqdm
+async def async_amap(coroutine, data, num_workers=8, progress_bar=False, pbar_desc=None):
+    if progress_bar:
+        pbar = atqdm(total=len(data), desc=pbar_desc)  # track progress tqdm
 
-    def callback(*_):
-        pbar.update()
+        def callback(*_):
+            pbar.update()
+    else:
+        callback = None
 
     res = await _amap(coroutine, data, num_workers, callback=callback)
-    pbar.close()
+
+    if progress_bar:
+        pbar.close()
     return res
 
 def process_amap(function, data, num_workers=8, pbar_desc=None):
