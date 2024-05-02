@@ -17,8 +17,9 @@ from copia.stats import species_accumulation
 from map_funcs import process_amap
 
 def plot_found_segments(video_other_bits, fig_dir_path):
-    plot_found_segments_for_intervals(video_other_bits, fig_dir_path, [(0,9), (10,13), (14,17), (18,25), (26,31)], 'found_segments')
-    plot_found_segments_for_intervals(video_other_bits, fig_dir_path, [(10,31)], 'two_segments')
+    # plot_found_segments_for_intervals(video_other_bits, fig_dir_path, [(0,9), (10,13), (14,17), (18,25), (26,31)], 'found_segments')
+    plot_found_segments_for_intervals(video_other_bits, fig_dir_path, [(0,9), (10, 17), (17, 31)], 'three_segments')
+    # plot_found_segments_for_intervals(video_other_bits, fig_dir_path, [(10,31)], 'two_segments')
 
 def plot_found_segments_for_intervals(video_other_bits, fig_dir_path, found_intervals, segment_name):
     bit_sections = []
@@ -56,54 +57,56 @@ def plot_found_segments_for_intervals(video_other_bits, fig_dir_path, found_inte
     plt.close(fig)
 
 def get_most_probable_bits(video_other_bits, fig_dir_path):
-    get_most_probable_bits_for_intervals(video_other_bits, fig_dir_path, [(10,31)], 'two_segments')
-    get_most_probable_bits_for_intervals(video_other_bits, fig_dir_path, [(0,9), (10,13), (14,17), (18,25), (26,31)], 'found_segments')
+    # get_most_probable_bits_for_intervals(video_other_bits, fig_dir_path, [(10,31)], 'two_segments')
+    get_most_probable_bits_for_intervals(video_other_bits, fig_dir_path, [(0,9), (10, 17), (17, 31)], 'three_segments')
+    # get_most_probable_bits_for_intervals(video_other_bits, fig_dir_path, [(0,9), (10,13), (14,17), (18,25), (26,31)], 'found_segments')
 
 def get_most_probable_bits_for_intervals(video_other_bits, fig_dir_path, found_intervals, segment_name):
     bit_sections = []
     for interval in found_intervals:
         bit_sections.append([int(b[interval[0]:interval[1]+1], 2) for b in video_other_bits])
 
-    # plot percentage of potential IDs hit vs number of combinations
-    probs = [1 - (10 ** i) for i in range(-1, -7, -1)]
-    all_num_combos = []
-    for prob in probs:
-        num_combos = 1
-        combos = {}
-        for interval, section in zip(found_intervals, bit_sections):
-            bins = np.arange(2 ** (interval[1] + 1 - interval[0]))
-            counts = np.bincount(section, minlength=2 ** (interval[1] + 1 - interval[0]))
-            bin_probs = counts / np.sum(counts)
+    if False:
+        # plot percentage of potential IDs hit vs number of combinations
+        probs = [1 - (10 ** i) for i in range(-1, -7, -1)]
+        all_num_combos = []
+        for prob in probs:
+            num_combos = 1
+            combos = {}
+            for interval, section in zip(found_intervals, bit_sections):
+                bins = np.arange(2 ** (interval[1] + 1 - interval[0]))
+                counts = np.bincount(section, minlength=2 ** (interval[1] + 1 - interval[0]))
+                bin_probs = counts / np.sum(counts)
 
-            # get all bins that cover prob of the data
-            bin_probs = np.sort(bin_probs)[::-1]
-            cum_probs = np.cumsum(bin_probs)
-            # get all bins that cover prob of the data
-            num_bins = np.argmax(cum_probs > prob) + 1
-            num_combos *= num_bins
+                # get all bins that cover prob of the data
+                bin_probs = np.sort(bin_probs)[::-1]
+                cum_probs = np.cumsum(bin_probs)
+                # get all bins that cover prob of the data
+                num_bins = np.argmax(cum_probs > prob) + 1
+                num_combos *= num_bins
 
-            # get all values that fit into the prob
-            prob_order = np.argsort(bin_probs)[::-1]
-            bins_ordered = bins[prob_order]
-            bin_probs = bin_probs[prob_order]
-            cum_probs = np.cumsum(bin_probs)
-            # get all bins that cover prob of the data
-            num_bins = np.argmax(cum_probs > prob) + 1
-            combos[str(interval)] = bins_ordered[:num_bins].tolist()
+                # get all values that fit into the prob
+                prob_order = np.argsort(bin_probs)[::-1]
+                bins_ordered = bins[prob_order]
+                bin_probs = bin_probs[prob_order]
+                cum_probs = np.cumsum(bin_probs)
+                # get all bins that cover prob of the data
+                num_bins = np.argmax(cum_probs > prob) + 1
+                combos[str(interval)] = bins_ordered[:num_bins].tolist()
 
-        all_num_combos.append(num_combos)
-        with open(os.path.join(fig_dir_path, f"{str(prob).replace('.', '_')}_{segment_name}_combinations.json"), 'w') as file:
-            json.dump(combos, file, indent=4)
+            all_num_combos.append(num_combos)
+            with open(os.path.join(fig_dir_path, f"{str(prob).replace('.', '_')}_{segment_name}_combinations.json"), 'w') as file:
+                json.dump(combos, file, indent=4)
 
-    fig, ax = plt.subplots()
-    ax.set_xscale('log')
-    ax.set_yscale('log')
-    ax.plot(probs, all_num_combos)
-    ax.set_title('Number of combinations vs percentage of potential IDs hit')
-    ax.set_xlabel('Percentage of potential IDs hit')
-    ax.set_ylabel('Number of combinations')
-    fig.savefig(os.path.join(fig_dir_path, 'potential_ids_vs_combinations.png'))
-    plt.close(fig)
+        fig, ax = plt.subplots()
+        ax.set_xscale('log')
+        ax.set_yscale('log')
+        ax.plot(probs, all_num_combos)
+        ax.set_title('Number of combinations vs percentage of potential IDs hit')
+        ax.set_xlabel('Percentage of potential IDs hit')
+        ax.set_ylabel('Number of combinations')
+        fig.savefig(os.path.join(fig_dir_path, 'potential_ids_vs_combinations.png'))
+        plt.close(fig)
 
     combos = {}
     for interval, section in zip(found_intervals, bit_sections):
@@ -133,19 +136,19 @@ def counter_investigation(video_bits, fig_dir_path):
     time_groups_df = df.groupby(['time_bits', 'geo_bits'])
     num_per_time_df = time_groups_df.count().rename(columns={'counter_bits': 'num'}).reset_index()
     num_per_time_df['num'].value_counts().sort_index().plot(ax=ax)
-    fig.savefig(os.path.join(fig_dir_path, 'num_per_millisecond.png'))
+    fig.savefig(os.path.join(fig_dir_path, 'num_per_milli_geo_combo.png'))
 
     time_groups = {}
     for time in time_groups_df.groups:
         time_groups[time] = time_groups_df.get_group(time)['counter_bits'].values
 
-    milli_dir_path = os.path.join(fig_dir_path, 'num_per_milli')
+    milli_dir_path = os.path.join(fig_dir_path, 'num_per_milli_geo_combo')
     if not os.path.exists(milli_dir_path):
         os.mkdir(milli_dir_path)
 
-    # plot distribution of bits for each group
+    # plot distribution of bits for each group where a group is all videos with the same number of videos per millisecond
     counts_per_milli = num_per_time_df['num'].unique()
-    df = df.merge(num_per_time_df, how='left', on='time_bits')
+    df = df.merge(num_per_time_df, how='left', on=['time_bits', 'geo_bits'])
     num_group_df = df.groupby('num')
     for count_per_milli in counts_per_milli:
         bits_df = num_group_df.get_group(count_per_milli)
@@ -155,8 +158,27 @@ def counter_investigation(video_bits, fig_dir_path):
         counts = np.bincount(other_bits, minlength=2 ** (interval[1] + 1 - interval[0]))
         fig, ax = plt.subplots(nrows=1, ncols=1)
         ax.plot(bins, counts)
-        fig.savefig(os.path.join(milli_dir_path, f"{count_per_milli}.png"))
+        fig.savefig(os.path.join(milli_dir_path, f"{count_per_milli}_bit_seq_counts.png"))
         plt.close(fig)
+
+    # plot heat map of counter values for each geo bit sequence
+    df['counter_val'] = df['counter_bits'].apply(lambda x: int(x, 2))
+    geo_groups = df.groupby('geo_bits')
+    min_counter = df['counter_val'].min()
+    max_counter = df['counter_val'].max()
+    heatmap = np.zeros((len(geo_groups.groups), max_counter - min_counter + 1))
+    geo_idx = {geo: i for i, geo in enumerate(geo_groups.groups)}
+    for geo in geo_groups.groups:
+        geo_df = geo_groups.get_group(geo)
+        counter_vals = geo_df['counter_val'].values
+        counter_counts = np.bincount(counter_vals, minlength=max_counter - min_counter + 1)
+        heatmap[geo_idx[geo], :] = counter_counts
+    fig, ax = plt.subplots(nrows=1, ncols=1)
+    im = ax.matshow(heatmap, cmap='hot', aspect='auto')
+    fig.colorbar(im)
+    ax.set_xlabel('Counter value')
+    ax.set_ylabel('Geo bit sequence')
+    fig.savefig(os.path.join(fig_dir_path, 'geo_counter_heatmap.png'))
 
 def do_analysis(video_ids, fig_dir_path):
     video_bits = [format(int(id), '064b') for id in video_ids]
@@ -310,26 +332,55 @@ def do_country_analysis(country):
     country_videos = country_video_df.to_dict('records')
     return country_videos
 
-def parse_result(result):
+def possible_created_video(result):
     ret = result['result']['return']
     if not ret:
         return False
+    # only return false if definite confirmation that it doesn't exist or is cannot have existed
     if 'statusCode' in ret:
-        if ret['statusCode'] == 10204:
+        if ret['statusCode'] == 10204 or ret['statusCode'] == 10222:
             if ret['statusMsg'] == "item doesn't exist":
                 return False
             elif ret['statusMsg'] == "status_deleted":
                 return True
-            elif ret['statusMsg'] == "status_self_see":
+            elif "status_self_see" in ret['statusMsg']:
+                return True
+            elif 'author_secret' in ret['statusMsg']:
+                return True
+            elif 'status_deleted' in ret['statusMsg']:
+                return True
+            elif 'status_reviewing' in ret['statusMsg']:
+                return True
+            elif 'content_classification' in ret['statusMsg']:
+                return True
+            elif 'status_audit_not_pass' in ret['statusMsg']:
+                return True
+            elif 'status_friend_see' in ret['statusMsg']:
+                return True
+            elif 'author_status' in ret['statusMsg']:
+                return True
+            elif 'author_test_tag' in ret['statusMsg']:
+                return True
+            elif 'status_abnormal' in ret['statusMsg']:
                 return True
             else:
                 return True
-        elif ret['statusCode'] == 10222:
+        elif ret['statusCode'] == 10235 and ret['statusMsg'] == 'item is storypost':
             return True
-        elif ret['statusCode'] == 10235:
+        elif ret['statusCode'] == 10231 and 'status_audit_not_pass' in ret['statusMsg']:
             return True
-        else:
+        elif ret['statusCode'] == 10101 and ret['statusMsg'] == 'ErrSysPanic':
+            return True
+        elif ret['statusCode'] == 100002 and ret['statusMsg'] == 'invalid item id':
             return False
+        elif ret['statusCode'] == 100004:
+            if 'RPCError' in ret['statusMsg']:
+                return True
+            elif 'songs loader get empty song info' in ret['statusMsg']:
+                return True
+        else:
+            return True
+
     return True
 
 def read_result_path(result_path):
@@ -338,7 +389,7 @@ def read_result_path(result_path):
             results = json.load(f)
         except:
             return []
-    return [r['args'] for r in results if parse_result(r)]
+    return [r['args'] for r in results if possible_created_video(r)]
 
 def main():
     this_dir_path = os.path.dirname(os.path.realpath(__file__))

@@ -4,12 +4,10 @@ import os
 from setup_pis import scan_for_pis
 
 async def main():
-    hello = 1
-    f"{hello} {{hi}}"
     possible_usernames = [
-        'hoare', 'tarjan', 'miacli', 'fred', 'geoffrey', 'rivest', 'edmund', 'juris',
-        'frances', 'ivan', 'milner', 'cook', 'lee', 'barbara', 'goldwasser', 'hemming',
-        'floyd', 'turing'
+        # 'hoare', 'tarjan', 'miacli', 'fred', 'geoffrey', 'rivest', 'edmund',
+        # 'frances', 'ivan', 'milner', 'cook', 'lee', 'barbara', 'goldwasser', 'hemming',
+        'floyd', 'turing', 'marvin', 'juris', 'edsger'
     ]
     
     hosts, usernames = await scan_for_pis(possible_usernames)

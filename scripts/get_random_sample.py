@@ -21,6 +21,7 @@ import httpx
 from tqdm import tqdm
 from tqdm.asyncio import tqdm as atqdm
 
+from analyse_ids import possible_created_video
 from map_funcs import _amap
 from setup_pis import change_mac_addresses, get_hosts_with_retries, get_local_ip, start_wifi_connections, stop_stale_workers
 
@@ -108,7 +109,11 @@ class DaskCluster:
                 'milner',
                 'hemming',
                 'frances',
-                'lee'
+                'lee',
+                'turing',
+                'floyd',
+                'marvin',
+                'juris',
             ]
             print("Finding hosts...")
             hosts, usernames = await get_hosts_with_retries(potential_usernames, max_tries=10)
@@ -124,27 +129,6 @@ class DaskCluster:
                 worker_options={ 'nthreads': self.worker_nthreads },
                 remote_python=remote_python,
             )
-            # worker_options={ 'nthreads': self.worker_nthreads }
-            
-            # print("Creating cluster...")
-            # workers = {
-            #     i: {
-            #         "cls": DaskSSHWorker,
-            #         "options": {
-            #             "address": host,
-            #             "connect_options": connect_options[i],
-            #             "kwargs": worker_options,
-            #             "worker_class": "distributed.Nanny",
-            #             "remote_python": remote_python,
-            #         },
-            #     }
-            #     for i, host in enumerate(hosts)
-            # }
-            # self.cluster = DaskSpecCluster(
-            #     workers,
-            #     scheduler=None,
-            #     name="raspi-cluster",
-            # )
         return self.cluster
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -186,14 +170,92 @@ class Counter:
     def add(self, n):
         self.count += n
 
-async def dask_map(function, args, num_workers=16, reqs_per_ip=1000, batch_size=100000, task_batch_size=1000, max_task_tries=3, task_nthreads=1, task_timeout=10, worker_cpu=256, worker_mem=512, cluster_type='local'):
+class IDDataset:
+    def __init__(self, start_time, num_time, time_unit):
+        self.start_time = start_time
+        self.num_time = num_time
+        self.time_unit = time_unit
+        with open(os.path.join(this_dir_path, '..', 'figs', 'all_videos', f'all_three_segments_combinations.json'), 'r') as file:
+            interval_values = json.load(file)
+
+        # get bits of non timestamp sections of ID
+        # order dict according to interval
+        # interval_values = [(tuple(map(int, interval.strip('()').split(', '))), vals) for interval, vals in data.items()]
+        # interval_values = sorted(interval_values, key=lambda x: x[0][0])
+        # get rid of millisecond bits
+        # data = [t for t in data if t[0] != (0,9)]
+        id_bits = []
+        self.id_interval = (54, 63)
+        assert self.id_interval in interval_values, f"ID interval {self.id_interval} not in interval values"
+        num_bits = self.id_interval[1] - self.id_interval[0] + 1
+        id_bits = [format(i, f'0{num_bits}b') for i in interval_values[self.id_interval]]
+
+        counter_interval = (10, 23)
+        assert counter_interval in interval_values, f"Counter interval {counter_interval} not in interval values"
+        num_bits = counter_interval[1] - counter_interval[0] + 1
+        counter_bits = [format(i, f'0{num_bits}b') for i in interval_values[counter_interval]]
+        counter_bits = sorted(counter_bits)
+        min_counter = int(counter_bits[0], 2)
+        max_counter = int(counter_bits[-1], 2)
+
+        # other_bit_sequences = itertools.product(*interval_bits)
+        # other_bit_sequences = [''.join(bits) for bits in other_bit_sequences]
+
+        # get all videos in 1 millisecond
+        
+        unit_map = {
+            'ms': 'milliseconds',
+            's': 'seconds',
+            'm': 'minutes',
+        }
+        time_delta = datetime.timedelta(**{unit_map[time_unit]: num_time})
+        
+        end_time = start_time + time_delta
+        c_time = start_time
+        all_timestamp_bits = []
+        while c_time < end_time:
+            unix_timestamp_bits = format(int(c_time.timestamp()), '032b')
+            milliseconds = int(format(c_time.timestamp(), '.3f').split('.')[1])
+            milliseconds_bits = format(milliseconds, '010b')
+            timestamp_bits = unix_timestamp_bits + milliseconds_bits
+            all_timestamp_bits.append(timestamp_bits)
+            c_time += datetime.timedelta(milliseconds=1)
+
+        potential_video_bits = itertools.product(all_timestamp_bits, [min_counter], id_bits)
+        potential_video_bits = [''.join(bits) for bits in potential_video_bits]
+        potential_video_ids = [int(bits, 2) for bits in potential_video_bits]
+
+        self.tasks = [DaskTask(id) for id in potential_video_ids]
+
+    def get_batch(self, batch_size):
+        for t in self.tasks:
+            if t.completed:
+                # check if result indicates that it was a hit (could be valid video, or private, or deleted etc.)
+                if is_created_video(t.result):
+                    # check next values on the counter
+                    task_video_id = t.args[0]
+                    this_counter = int(task_video_id[self.counter_interval], 2)
+                    next_counter = this_counter + 1
+                    if next_counter <= self.max_counter:
+                        next_counter_bits = format(next_counter, f'0{self.counter_bits}b')
+                        next_potential_video_bits = task_video_id[self.timestamp_interval] + task_video_id[self.milliseconds_interval] + next_counter_bits + task_video_id[self.id_interval]
+                        next_potential_video_id = int(next_potential_video_bits, 2)
+                        self.tasks.append(DaskTask(next_potential_video_id))
+        return [t for t in self.tasks if not t.completed][:batch_size]
+    
+    def num_left(self):
+        return len([t for t in self.tasks if not t.completed])
+    
+    def __len__(self):
+        return len(self.tasks)
+
+async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_size=100000, task_batch_size=1000, max_task_tries=3, task_nthreads=1, task_timeout=10, worker_cpu=256, worker_mem=512, cluster_type='local'):
     network_interface = 'wlan0' if cluster_type == 'raspi' else None
     function = DaskBatchFunc(DaskFunc(function), network_interface=network_interface, task_nthreads=task_nthreads)
-    tasks = [DaskTask(arg) for arg in args]
     dotenv.load_dotenv()
-    tasks_progress_bar = tqdm(total=len(tasks), desc="All Tasks")
-    batch_progress_bar = tqdm(total=min(batch_size, len(tasks)), desc="Batch Tasks", leave=False)
-    while len([t for t in tasks if not t.completed]) > 0:
+    tasks_progress_bar = tqdm(total=len(dataset), desc="All Tasks")
+    batch_progress_bar = tqdm(total=min(batch_size, len(dataset)), desc="Batch Tasks", leave=False)
+    while dataset.num_left() > 0:
         try:
             async with DaskCluster(cluster_type, worker_cpu=worker_cpu, worker_mem=worker_mem) as cluster:
                 with DaskClient(cluster) as client:
@@ -203,13 +265,13 @@ async def dask_map(function, args, num_workers=16, reqs_per_ip=1000, batch_size=
                         client.wait_for_workers(1, timeout=120)
                     num_reqs_for_current_ips = 0
                     num_exceptions_for_current_ips = 0
-                    while len([t for t in tasks if not t.completed]) > 0:
+                    while dataset.num_left() > 0:
                         try:
-                            current_batch_size = min(batch_size, len([t for t in tasks if not t.completed]))
+                            current_batch_size = min(batch_size, dataset.num_left())
 
                             # prepping args for mapping 
                             # batching tasks as we want to avoid having dask tasks that are too small
-                            all_batch_tasks = [t for t in tasks if not t.completed][:current_batch_size]
+                            all_batch_tasks = dataset.get_batch(current_batch_size)
                             batch_tasks = []
                             for i in range(0, len(all_batch_tasks), batch_size):
                                 batch_tasks.append(all_batch_tasks[i:i+batch_size])
@@ -275,7 +337,7 @@ async def dask_map(function, args, num_workers=16, reqs_per_ip=1000, batch_size=
     tasks_progress_bar.close()
     batch_progress_bar.close()
 
-    return tasks
+    return dataset
 
 class InvalidResponseException(Exception):
     pass
@@ -337,6 +399,7 @@ class ProcessVideo:
             )
         video_detail = json.loads(self.text)
         if video_detail.get("statusCode", 0) != 0: # assume 0 if not present
+            # TODO retry when status indicates server error
             return video_detail
         video_info = video_detail.get("itemInfo", {}).get("itemStruct")
         if video_info is None:

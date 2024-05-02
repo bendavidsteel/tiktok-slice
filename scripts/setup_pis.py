@@ -225,11 +225,13 @@ async def scan_for_pis(possible_usernames):
                         continue
                     else:
                         return ip, username
+                else:
+                    return None, None
             else:
                 return None, None
             
         results = await async_amap(run_test_connect, all_reports, num_workers=len(all_reports))
-        return [(host, username) for host, username in results if host]
+        return [host for host, username in results if host], [username for host, username in results if host]
 
     else:
         hosts = []
@@ -263,7 +265,7 @@ async def scan_for_pis(possible_usernames):
                 usernames.append(working_username)
                 remaining_usernames.remove(working_username)
 
-    return hosts, usernames
+        return hosts, usernames
 
 def get_local_ip(interface):
     if interface == 'wlan0':
@@ -344,18 +346,20 @@ async def change_mac_addresses(hosts, connect_options, **kwargs):
     await async_amap(run_change_mac_address, args, num_workers=len(hosts), pbar_desc="Changing MAC addresses...")
 
 async def run_on_pis(hosts, connect_options, func, **kwargs):
-    results = []
-    for host, connect_option in zip(hosts, connect_options):
-        print(f'Connecting to {host}...')
+    async def run_func(args):
+        host, connect_option, func, kwargs = args
+        print(f"Connecting to {host}, {connect_option['username']}...")
         try:
             conn = await asyncio.wait_for(asyncssh.connect(host, **connect_option, known_hosts=None), timeout=10)
         except Exception as e:
-            print(f'Failed to connect to {host}: {e}')
-            continue
+            print(f"Failed to connect to {host}, {connect_option['username']}: {e}")
+            return None
         else:
             async with conn:
                 r = await func(conn, **kwargs)
-                results.append(r)
+                return r
+    args = list(zip(hosts, connect_options, [func] * len(hosts), [kwargs] * len(hosts)))
+    results = await async_amap(run_func, args, num_workers=len(hosts))
     return results
 
 async def get_hosts(usernames):
@@ -424,14 +428,18 @@ async def main():
         'hemming',
         'frances',
         'lee',
-        'juris'
+        'turing',
+        'floyd',
+        'juris',
+        'marvin',
+        'edsger'
     ]
     hosts, usernames = await get_hosts(potential_usernames)
     connect_options = [{'username': username, 'password': 'rp145'} for username in usernames]
 
     # TODO look into connecting pis to tum vpn for larger network range
     # TODO add more pis to network
-    todo = 'stop'
+    todo = 'setup'
 
     if todo == 'setup':
         with open('worker_requirements.txt', 'r') as f:
