@@ -545,9 +545,9 @@ async def get_random_sample(
     dataset = IDDataset(potential_video_ids)
 
     if method == 'async':
-        results = await async_map(async_get_video, dataset, num_workers=num_workers)
+        dataset = await async_map(async_get_video, dataset, num_workers=num_workers)
     elif method == 'dask':
-        results = await dask_map(
+        dataset = await dask_map(
             get_video, 
             dataset, 
             num_workers=num_workers, 
@@ -562,6 +562,7 @@ async def get_random_sample(
         )
     else:
         raise ValueError("Invalid method")
+    results = dataset.tasks
     num_hits = len([r for r in results if r.result and 'id' in r.result['res']])
     num_valid = len([r for r in results if len(r.exceptions) < 3])
     print(f"Num hits: {num_hits}, Num valid: {num_valid}, Num potential video IDs: {len(potential_video_ids)}")
