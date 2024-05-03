@@ -55,44 +55,51 @@ def main():
             geo_groups[geo_group] = geo_df[['time_bits', 'counter_vals']].groupby('time_bits').agg(list)['counter_vals'].to_dict()
         return geo_groups
     
-    request_groups = get_groups(df)
-    # success_groups = get_groups(df[df['statusMsg'] != "item doesn't exist"])
+    success_groups = get_groups(df[df['statusMsg'] != "item doesn't exist"])
 
-    # for geo_bits in request_groups:
-    #     request_group = request_groups[geo_bits]
-    #     success_group = success_groups[geo_bits]
-    #     num_milliseconds_requests = len(request_group)
-    #     num_milliseconds_success = len(success_group)
-    #     percent_milliseconds_with_success = num_milliseconds_success / num_milliseconds_requests
-    #     # if we did get successful requests, where all of the requests successful?
-    #     if num_milliseconds_success > 0:
-    #         all_successful = all([len(request_group[time_group]) == len(success_group[time_group]) for time_group in success_group])
-    #         if not all_successful:
-    #             for time_group in success_group:
-                    
+    with open(os.path.join(this_dir_path, '..', 'figs', 'all_videos', 'all_two_segments_combinations.json'), 'r') as f:
+        all_two_segments_combinations = json.load(f)
 
+    requested_ids = all_two_segments_combinations['(10, 31)']
+
+    valid_ids = []
     with httpx.Client() as client:
         # test missing counts
-        for geo_bits in request_groups:
-            # check if we find a sequence of vals with some missing vals
-            time_groups = request_groups[geo_bits]
+        for geo_bits in success_groups:
+            # check if we find a sequence of successful requests with missing vals, where we didn't make the request
+            time_groups = success_groups[geo_bits]
+            missing_vals_top_contendors = set()
             for time in time_groups:
-                vals = time_groups[time]
-                min_val = min(vals)
-                max_val = max(vals)
-                missing_vals = [val for val in range(min_val, max_val) if val not in vals]
+                success_vals = time_groups[time]
+                min_val = min(success_vals)
+                max_val = max(success_vals)
+                missing_vals = [val for val in range(min_val, max_val) if val not in success_vals]
+                if len(missing_vals) / len(success_vals) < 0.2: # suspicious if less than of vals are missing
+                    for missing_val in missing_vals:
+                        missing_bits = format(missing_val, '08b')
+                        all_bits = missing_bits + geo_bits
+                        missing_id = int(all_bits, 2)
+                        if missing_id not in requested_ids:
+                            missing_vals_top_contendors.add(missing_val)
 
-                # create a tiktok id from these missing vals
-                missing_bits = [format(val, '08b') for val in missing_vals]
-                timestamp = math.floor(time_group[0])
-                timestamp_bits = format(timestamp, '032b')
-                milliseconds = math.floor((time_group[0] - timestamp) * 1000)
-                milliseconds_bits = format(milliseconds, '010b')
-                geo_bits = time_group[1]
-                for missing_bit in missing_bits:
-                    missing_id = int(timestamp_bits + milliseconds_bits + missing_bit + geo_bits, 2)
-                    # res = get_video(missing_id, client)
-                    pass
+            for missing_val in missing_vals_top_contendors:
+                for time in time_groups:
+                    success_vals = time_groups[time]
+                    min_val = min(success_vals)
+                    max_val = max(success_vals)
+                    time_missing_vals = [val for val in range(min_val, max_val) if val not in success_vals]
+                    if missing_val not in time_missing_vals:
+                        continue
+                    # create a tiktok id from these missing vals
+                    missing_bits = format(missing_val, '08b')
+                    timestamp = math.floor(time)
+                    timestamp_bits = format(timestamp, '032b')
+                    milliseconds = math.floor((time - timestamp) * 1000)
+                    milliseconds_bits = format(milliseconds, '010b')
+                    missing_id = int(timestamp_bits + milliseconds_bits + missing_bits + geo_bits, 2)
+                    res = get_video(missing_id, client)
+                    if 'statusCode' not in res:
+                        valid_ids.append(int(missing_bits + geo_bits, 2))
 
 if __name__ == '__main__':
     main()
