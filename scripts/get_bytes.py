@@ -29,7 +29,7 @@ async def main():
                 result_paths.append(os.path.join(dir_path, filename))
     # for result_path in tqdm.tqdm(result_paths, desc="Reading result files"):
     
-    all_results = process_amap(read_result_path, result_paths[:3], num_workers=multiprocessing.cpu_count() - 1, pbar_desc="Reading result files")
+    all_results = process_amap(read_result_path, result_paths, num_workers=multiprocessing.cpu_count() - 1, pbar_desc="Reading result files")
     all_results = [v for res in all_results for v in res]
     video_results = [r for r in all_results if r['result']['return'] and 'statusMsg' not in r['result']['return']]
     videos = [r['result']['return'] for r in video_results]
