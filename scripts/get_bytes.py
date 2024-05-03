@@ -3,6 +3,8 @@ import json
 import multiprocessing
 import os
 
+import tqdm
+
 from pytok.tiktok import PyTok
 from TikTokApi import TikTokApi
 
@@ -49,7 +51,7 @@ async def main():
                 bytes = await video.bytes()
                 pass
     elif method == 'pytok':
-        for video_data in videos:
+        for video_data in tqdm.tqdm(videos):
             async with PyTok() as api:
                 video = api.video(
                     url=f"https://www.tiktok.com/@{video_data['author']['uniqueId']}/video/{video_data['id']}",
