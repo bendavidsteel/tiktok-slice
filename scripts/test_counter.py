@@ -62,6 +62,8 @@ def main():
 
     requested_ids = all_two_segments_combinations['(10, 31)']
 
+    # TODO look to see if likely workers in the same datacenter have the same sequence system
+
     valid_ids = []
     with httpx.Client() as client:
         # test missing counts

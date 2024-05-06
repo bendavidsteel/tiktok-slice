@@ -7,10 +7,11 @@ async def main():
     possible_usernames = [
         # 'hoare', 'tarjan', 'miacli', 'fred', 'geoffrey', 'rivest', 'edmund',
         # 'frances', 'ivan', 'milner', 'cook', 'lee', 'barbara', 'goldwasser', 'hemming',
-        'floyd', 'turing', 'marvin', 'juris', 'edsger'
+        # 'floyd', 'turing', 'marvin', 'juris', 'edsger',
+        'conway', 'fernando', 'edward', 'edwin'
     ]
     
-    hosts, usernames = await scan_for_pis(possible_usernames)
+    hosts, usernames = await scan_for_pis(possible_usernames, progress_bar=True)
 
     hosts_users = {host: user for host, user in zip(hosts, usernames)}
     print(hosts_users)

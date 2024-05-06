@@ -3,11 +3,14 @@ import json
 import multiprocessing
 import os
 
+import requests
 import tqdm
 
 from pytok.tiktok import PyTok
+import pytok.exceptions
 from TikTokApi import TikTokApi
 
+from get_random_sample import get_headers, ProcessVideo
 from map_funcs import process_amap
 
 def read_result_path(result_path):
@@ -37,6 +40,9 @@ async def main():
     bytes_dir_path = os.path.join(data_dir_path, "results", 'bytes')
     if not os.path.exists(bytes_dir_path):
         os.makedirs(bytes_dir_path)
+    else:
+        fetched_filenames = os.listdir(bytes_dir_path)
+        fetched_ids = [int(f.split('.')[0]) for f in fetched_filenames]
 
     method = 'pytok'
     if method == 'tiktokapi':
@@ -52,15 +58,41 @@ async def main():
                 pass
     elif method == 'pytok':
         for video_data in tqdm.tqdm(videos):
-            async with PyTok() as api:
-                video = api.video(
-                    url=f"https://www.tiktok.com/@{video_data['author']['uniqueId']}/video/{video_data['id']}",
-                    # data=video_data
-                )
-                video_info = await video.info()
-                bytes = await video.bytes()
-                with open(os.path.join(bytes_dir_path, f"{video_data['id']}.mp4"), 'wb') as f:
-                    f.write(bytes)
+            if video_data['id'] in fetched_ids:
+                continue
+            try:
+                async with PyTok(headless=True) as api:
+                    video = api.video(
+                        url=f"https://www.tiktok.com/@{video_data['author']['uniqueId']}/video/{video_data['id']}",
+                        # data=video_data
+                    )
+                    video_info = await video.info()
+                    bytes = await video.bytes()
+                    with open(os.path.join(bytes_dir_path, f"{video_data['id']}.mp4"), 'wb') as f:
+                        f.write(bytes)
+            except pytok.exceptions.NotAvailableException:
+                continue
+            except pytok.exceptions.TimeoutException:
+                continue
+    elif method == 'requests':
+        for video_data in tqdm.tqdm(videos):
+            if video_data['video']['downloadAddr']:
+                video_id = video_data['id']
+                url = f"https://www.tiktok.com/@{video_data['author']['uniqueId']}/video/{video_id}"
+                headers = get_headers()
+                
+                info_res = requests.get(url, headers=headers)
+                video_processor = ProcessVideo(info_res)
+                text_chunk = info_res.text
+                do = video_processor.process_chunk(text_chunk)
+
+                video_d = video_processor.process_response()
+                cookies = {c.name: c.value for c in info_res.cookies}
+                cookies['bm_sv'] = """41CDD82A3A77D5CCE2B54956EFFBD484~2v+fgMc/HS3XXYBU8DwOrq6CfX2ufpT4w9woRIdO0nl7zCUij0wstoi3DYubs+YquYCQ7WQxx+a5iXEYmA6bTOHqjgAwHDgmdYy+td8sYgU8wqCgjNG0oHmvnWE3JyaePt37uro2bNpZeWSUKFoaYvBFrYs3y1EBXG5nLn9g="""
+                bytes_res = requests.get(video_d['video']['downloadAddr'], headers=headers, cookies=cookies)
+                if 200 <= bytes_res.status_code < 300:
+                    with open(os.path.join(bytes_dir_path, f"{video_data['id']}.mp4"), 'wb') as f:
+                        f.write(bytes_res.content)
 
 
 if __name__ == "__main__":
