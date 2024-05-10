@@ -95,26 +95,15 @@ class DaskCluster:
             self.cluster = DaskLocalCluster()
         elif self.cluster_type == 'raspi':
             potential_usernames = [
-                'hoare',
-                'tarjan',
-                'miacli',
-                'fred',
-                'geoffrey',
-                'rivest',
-                'edmund',
-                'ivan',
-                'cook',
-                'barbara',
-                'goldwasser',
-                'milner',
-                'hemming',
-                'frances',
-                'lee',
-                'turing',
-                'floyd',
-                'marvin',
-                'juris',
-                'edsger',
+                'hoare', 'tarjan', 'miacli', 'fred',
+                'geoffrey', 'rivest', 'edmund', 'ivan',
+                'cook', 'barbara', 'goldwasser', 'milner',
+                'hemming', 'frances', 'lee', 'turing',
+                'floyd', 'juris', 'marvin', 'edsger',
+                'conway', 'fernando', 'edward', 'edwin', 
+                'satoshi', 'buterin', 'lovelace', 'neumann',
+                'putnam', 'beauvoir', 'chan', 'sutskever',
+                'arendt', 'mordvintsev', 'herbert'
             ]
             print("Finding hosts...")
             raspi_password = os.environ['RASPI_PASSWORD']
@@ -198,6 +187,10 @@ async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_si
     dotenv.load_dotenv()
     tasks_progress_bar = tqdm(total=len(dataset), desc="All Tasks")
     batch_progress_bar = tqdm(total=min(batch_size, len(dataset)), desc="Batch Tasks", leave=False)
+
+    num_cluster_errors = 0
+    max_cluster_errors = 3
+
     while dataset.num_left() > 0:
         try:
             async with DaskCluster(cluster_type, worker_cpu=worker_cpu, worker_mem=worker_mem) as cluster:
@@ -278,6 +271,10 @@ async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_si
                                 
         except Exception as ex:
             print(f"Cluster Restart Error: {ex}, Stacktrace: {traceback.format_exc()}")
+            num_cluster_errors += 1
+            if num_cluster_errors > max_cluster_errors:
+                raise
+            continue
     tasks_progress_bar.close()
     batch_progress_bar.close()
 
@@ -624,13 +621,13 @@ async def get_random_sample(
 async def run_random_sample():
     generation_strategy = 'all'
     # TODO run at persistent time after collection, i.e. if collection takes an hour, run after 24s after post time
-    start_time = datetime.datetime(2024, 3, 1, 19, 0, 0)
+    start_time = datetime.datetime(2024, 4, 10, 19, 0, 0)
     num_time = 1
     time_unit = 'h'
     num_workers = 20
     reqs_per_ip = 400
-    batch_size = 10000
-    task_batch_size = 40
+    batch_size = 20000
+    task_batch_size = 50
     task_nthreads = 8
     task_timeout = 20
     worker_cpu = 256

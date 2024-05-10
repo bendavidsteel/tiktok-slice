@@ -35,14 +35,14 @@ def get_ids_to_get_bytes(data_dir_path, bytes_dir_path):
                 videos = [r['result']['return'] for r in video_results]
 
                 for video in videos:
-                    if video['id'] in fetched_ids:
+                    if int(video['id']) in fetched_ids:
                         continue
                     yield video
 
 async def main():
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
     data_dir_path = os.path.join(this_dir_path, "..", "data")
-    bytes_dir_path = os.path.join(data_dir_path, "results", 'bytes')
+    bytes_dir_path = os.path.join('/', 'media', 'elements_harddrive', 'repos', 'what-for-where', 'data', 'bytes')
     if not os.path.exists(bytes_dir_path):
         os.makedirs(bytes_dir_path)
     videos = get_ids_to_get_bytes(data_dir_path, bytes_dir_path)
@@ -77,7 +77,7 @@ async def main():
                     continue
     elif method == 'requests':
         for video_data in tqdm.tqdm(videos):
-            if video_data['video']['downloadAddr']:
+            if 'video' in video_data and 'downloadAddr' in video_data['video'] and video_data['video']['downloadAddr']:
                 try:
                     video_id = video_data['id']
                     url = f"https://www.tiktok.com/@{video_data['author']['uniqueId']}/video/{video_id}"
@@ -99,6 +99,10 @@ async def main():
                     }
 
                     video_d = video_processor.process_response()
+
+                    if 'video' not in video_d:
+                        continue
+
                     cookies = {c.name: c.value for c in info_res.cookies}
                     bytes_res = requests.get(video_d['video']['downloadAddr'], headers=bytes_headers, cookies=cookies)
                     if 200 <= bytes_res.status_code < 300:

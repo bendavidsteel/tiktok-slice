@@ -140,38 +140,67 @@ async def ensure_wifi_connection(conn, connect_options, force_start=False):
     else:
         prepend = "sudo"
 
+    async def create_wifi_connection():
+        username = os.environ['EDUROAM_USERNAME']
+        password = os.environ['EDUROAM_PASSWORD']
+        command = f'{prepend} nmcli con add type wifi con-name "eduroam" ifname "wlan0" ssid "eduroam" wifi-sec.key-mgmt "wpa-eap" 802-1x.identity "{username}" 802-1x.password "{password}" 802-1x.system-ca-certs "yes" 802-1x.eap "peap" 802-1x.phase2-auth "mschapv2"'
+        r = await conn.run(command, check=True)
+
+    async def get_wifi_connections():
+        r = await conn.run("nmcli con", check=True)
+        connections = r.stdout.split('\n')
+        return connections
+
     while num_tries < max_tries:
         num_tries += 1
         try:
             # check if wifi connection exists
-            r = await conn.run("nmcli con", check=True)
-            connections = r.stdout.split('\n')
+            connections = await get_wifi_connections()
             
-            if not any(c.startswith('eduroam') for c in connections):
+            eduroam_lines = [c for c in connections if c.startswith('eduroam')]
+            if len(eduroam_lines) == 0:
                 # create wifi connection
-                username = os.environ['EDUROAM_USERNAME']
-                password = os.environ['EDUROAM_PASSWORD']
-                command = f'{prepend} nmcli con add type wifi con-name "eduroam" ifname "wlan0" ssid "eduroam" wifi-sec.key-mgmt "wpa-eap" 802-1x.identity "{username}" 802-1x.password "{password}" 802-1x.system-ca-certs "yes" 802-1x.eap "peap" 802-1x.phase2-auth "mschapv2"'
-                r = await conn.run(command, check=True)
+                await create_wifi_connection()
                 await asyncio.sleep(3)
-                r = await conn.run("nmcli con", check=True)
-                connections = r.stdout.split('\n')
-            else:
-                eduroam_line = [c for c in connections if c.startswith('eduroam')][0]
+                connections = await get_wifi_connections()
+            elif len(eduroam_lines) > 1:
+                # delete duplicate connections
+                # find if any all valid
+                valid_eduroam_line = None
+                for eduroam_line in eduroam_lines:
+                    reqs = [' wifi ', ' wlan0 ']
+                    if all(req in eduroam_line for req in reqs):
+                        valid_eduroam_line = eduroam_line
+                if valid_eduroam_line:
+                    invalid_eduroam_lines = [eduroam_line for eduroam_line in eduroam_lines if eduroam_line != valid_eduroam_line]
+                    # get uuids
+                    uuids = [line.split(' ')[1] for line in invalid_eduroam_lines]
+                    # delete invalid connections
+                    for uuid in uuids:
+                        r = await conn.run(f"{prepend} nmcli con delete {uuid}", check=True)
+                else:
+                    # delete all connections
+                    for eduroam_line in eduroam_lines:
+                        uuid = eduroam_line.split(' ')[1]
+                        r = await conn.run(f"{prepend} nmcli con delete {uuid}", check=True)
+                    # create wifi connection
+                    await create_wifi_connection()
+                connections = await get_wifi_connections()
+
+            elif len(eduroam_lines) == 1:
+                eduroam_line = eduroam_lines[0]
                 reqs = [' wifi ', ' wlan0 ']
                 if not all(req in eduroam_line for req in reqs):
                     # delete existing connection
                     r = await conn.run(f"{prepend} nmcli con delete eduroam", check=True)
                     # create wifi connection
-                    username = os.environ['EDUROAM_USERNAME']
-                    password = os.environ['EDUROAM_PASSWORD']
-                    command = f'{prepend} nmcli con add type wifi con-name "eduroam" ifname "wlan0" ssid "eduroam" wifi-sec.key-mgmt "wpa-eap" 802-1x.identity "{username}" 802-1x.password "{password}" 802-1x.system-ca-certs "yes" 802-1x.eap "peap" 802-1x.phase2-auth "mschapv2"'
-                    r = await conn.run(command, check=True)
-                    r = await conn.run("nmcli con", check=True)
-                    connections = r.stdout.split('\n')
-            assert any(c.startswith('eduroam') for c in connections), "Failed to create wifi connection"
-            eduroam_line = [c for c in connections if c.startswith('eduroam')][0]
-            assert 'wifi' in eduroam_line and 'wlan0' in eduroam_line, "Failed to create wifi connection"
+                    await create_wifi_connection()
+                    connections = await get_wifi_connections()
+            assert any(c.startswith('eduroam') for c in connections), "No eduroam connection"
+            eduroam_lines = [c for c in connections if c.startswith('eduroam')]
+            assert len(eduroam_lines) == 1, "Duplicate eduroam connections"
+            eduroam_line = eduroam_lines[0]
+            assert 'wifi' in eduroam_line and 'wlan0' in eduroam_line, "Eduroam connection not setup correctly"
             # check if connection is up
             r = await conn.run("nmcli -f GENERAL.STATE con show eduroam", check=True)
             if 'activated' not in r.stdout or force_start:
@@ -339,7 +368,7 @@ async def change_mac_address(conn, connect_options, interface='eth0'):
         await ensure_wifi_connection(conn, connect_options)
         r = await conn.run(f"sudo nmcli con modify --temporary eduroam 802-11-wireless.cloned-mac-address {random_mac}", check=True)
         if r.returncode != 0 or r.stdout or r.stderr:
-            raise Exception(f"Failed to change MAC address: {r.stdout}, {r.stderr}")
+            raise asyncssh.misc.Error(r.returncode, f"Failed to change MAC address: {r.stdout}, {r.stderr}")
         await ensure_wifi_connection(conn, connect_options)
         r = await conn.run(f"sudo nmcli connection up eduroam", check=True)
 
@@ -383,6 +412,8 @@ async def change_mac_addresses(hosts, connect_options, progress_bar=False, **kwa
             except asyncssh.process.ProcessError as e:
                 ex = asyncssh.misc.Error(e.code, e.stderr)
                 exceptions.append(ex)
+            except asyncssh.misc.Error as e:
+                exceptions.append(e)
             except asyncio.exceptions.TimeoutError as ex:
                 exceptions.append(ex)
             else:
