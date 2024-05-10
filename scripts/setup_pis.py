@@ -13,7 +13,7 @@ import tqdm
 
 from map_funcs import async_amap
 
-async def setup_pi(conn, reqs=''):
+async def setup_pi(conn, connect_options, reqs=''):
     # install python
     # TODO use more lightweight raspberry pi image
     r = await conn.run('python3 --version', check=True)
@@ -422,7 +422,7 @@ async def run_on_pis(hosts, connect_options, func, **kwargs):
             return None
 
     args = list(zip(hosts, connect_options, [func] * len(hosts), [kwargs] * len(hosts)))
-    results = await async_amap(run_func, args, num_workers=len(hosts))
+    results = await async_amap(run_func, args, num_workers=len(hosts), progress_bar=True)
     return results
 
 async def get_hosts(usernames):
@@ -482,26 +482,16 @@ async def get_ip(conn, co, interface='eth0'):
 async def main():
     dotenv.load_dotenv()
     potential_usernames = [
-        'hoare',
-        'tarjan',
-        'miacli',
-        'fred',
-        'geoffrey',
-        'rivest',
-        'edmund',
-        'ivan',
-        'cook',
-        'barbara',
-        'goldwasser',
-        'milner',
-        'hemming',
-        'frances',
-        'lee',
-        'turing',
-        'floyd',
-        'juris',
-        'marvin',
-        'edsger'
+        # 'hoare', 'tarjan', 'miacli', 'fred',
+        # 'geoffrey', 'rivest', 'edmund', 'ivan',
+        # 'cook', 'barbara', 'goldwasser', 'milner',
+        # 'hemming', 'frances', 'lee', 'turing',
+        # 'floyd', 'juris', 'marvin',
+        # 'conway', 'fernando', 'edward', 'edwin', 
+        # 'satoshi', 'buterin', 'lovelace',
+        # 'putnam', 'beauvoir'
+        # 'arendt', 'mordvintsev', 'chan', 'sutskever', 'neumann'
+        'edsger', 'herbert'
     ]
     hosts, usernames = await get_hosts_with_retries(potential_usernames, progress_bar=True)
     connect_options = [{'username': username, 'password': 'rp145'} for username in usernames]

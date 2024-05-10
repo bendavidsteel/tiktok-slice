@@ -8,7 +8,8 @@ async def main():
         # 'hoare', 'tarjan', 'miacli', 'fred', 'geoffrey', 'rivest', 'edmund',
         # 'frances', 'ivan', 'milner', 'cook', 'lee', 'barbara', 'goldwasser', 'hemming',
         # 'floyd', 'turing', 'marvin', 'juris', 'edsger',
-        'conway', 'fernando', 'edward', 'edwin'
+        # 'conway', 'fernando', 'edward', 'edwin', 'satoshi', 'buterin', 'lovelace', 'putnam', 'beauvoir'
+        'arendt', 'mordvintsev', 'chan', 'sutskever', 'neumann'
     ]
     
     hosts, usernames = await scan_for_pis(possible_usernames, progress_bar=True)
