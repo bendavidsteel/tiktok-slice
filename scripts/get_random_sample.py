@@ -168,9 +168,9 @@ class Counter:
     def add(self, n):
         self.count += n
 
-class IDDataset:
-    def __init__(self, potential_video_ids):
-        self.tasks = [DaskTask(id) for id in potential_video_ids]
+class TaskDataset:
+    def __init__(self, args):
+        self.tasks = [DaskTask(arg) for arg in args]
 
     def get_batch(self, batch_size):
         return [t for t in self.tasks if not t.completed][:batch_size]
@@ -182,8 +182,9 @@ class IDDataset:
         return len(self.tasks)
 
 async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_size=100000, task_batch_size=1000, max_task_tries=3, task_nthreads=1, task_timeout=10, worker_cpu=256, worker_mem=512, cluster_type='local'):
-    network_interface = 'wlan0' if cluster_type == 'raspi' else None
-    function = DaskBatchFunc(DaskFunc(function), network_interface=network_interface, task_nthreads=task_nthreads)
+    network_interfaces = ['eth0', 'wlan0'] if cluster_type == 'raspi' else [None]
+    interface_ratios = [0.2, 0.8] if cluster_type == 'raspi' else [1]
+    function = MultiNetworkInterfaceFunc(DaskFunc(function), network_interfaces=network_interfaces, ratios=interface_ratios, task_nthreads=task_nthreads)
     dotenv.load_dotenv()
     tasks_progress_bar = tqdm(total=len(dataset), desc="All Tasks")
     batch_progress_bar = tqdm(total=min(batch_size, len(dataset)), desc="Batch Tasks", leave=False)
@@ -429,7 +430,7 @@ def get_local_ip(interface):
 
     return ip_address
 
-class DaskBatchFunc:
+class BatchNetworkInterfaceFunc:
     def __init__(self, func, network_interface=None, task_nthreads=1):
         self.func = func
         self.network_interface = network_interface
@@ -440,6 +441,31 @@ class DaskBatchFunc:
         transport = httpx.HTTPTransport(local_address=interface_ip)
         with httpx.Client(transport=transport) as http_client:
             return thread_map(batch_args, itertools.repeat(http_client), function=self.func, num_workers=self.task_nthreads)
+        
+class MultiNetworkInterfaceFunc:
+    def __init__(self, func, network_interfaces=[], ratios=[], task_nthreads=1):
+        assert len(network_interfaces) == len(ratios), "Number of network interfaces must match number of ratios"
+        self.func = func
+        self.task_nthreads = task_nthreads
+        self.network_interface_funcs = [
+            BatchNetworkInterfaceFunc(func, network_interface=interface, task_nthreads=task_nthreads) for interface in network_interfaces
+        ]
+        self.ratios = ratios
+
+    def __call__(self, batch_args):
+        executor = ThreadPoolExecutor(max_workers=len(self.network_interface_funcs))
+        all_func_args = []
+        for i in range(len(self.ratios)):
+            all_func_args.append(batch_args[int(i * len(batch_args) * self.ratios[i]):int((i + 1) * len(batch_args) * self.ratios[i])])
+        
+        futures = []
+        for network_interface_func, func_args in zip(self.network_interface_funcs, all_func_args):
+            future = executor.submit(network_interface_func, func_args)
+            futures.append(future)
+
+        results = [future.result() for future in futures]
+        return [r for result in results for r in result]
+        
     
 class AsyncDaskFunc:
     def __init__(self, func):
@@ -539,7 +565,7 @@ async def get_random_sample(
     potential_video_bits = itertools.product(all_timestamp_bits, other_bit_sequences)
     potential_video_bits = [''.join(bits) for bits in potential_video_bits]
     potential_video_ids = [int(bits, 2) for bits in potential_video_bits]
-    dataset = IDDataset(potential_video_ids)
+    dataset = TaskDataset(potential_video_ids)
 
     if method == 'async':
         dataset = await async_map(async_get_video, dataset, num_workers=num_workers)
@@ -685,10 +711,10 @@ def get_ip(_, client: httpx.Client):
 async def run_get_ips():
     results = await dask_map(
         get_ip, 
-        range(100), 
+        TaskDataset(range(200)), 
         reqs_per_ip=2, 
-        batch_size=25,
-        task_batch_size=1,
+        batch_size=200,
+        task_batch_size=5,
         task_timeout=10,
         task_nthreads=1,
         cluster_type='raspi'
@@ -699,8 +725,8 @@ async def run_get_ips():
     
 async def main():
     dotenv.load_dotenv()
-    await run_random_sample()
-    # await run_get_ips()
+    # await run_random_sample()
+    await run_get_ips()
 
 if __name__ == '__main__':
     asyncio.run(main())
