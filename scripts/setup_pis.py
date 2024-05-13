@@ -147,7 +147,14 @@ async def ensure_wifi_connection(conn, connect_options, force_start=False):
         r = await conn.run(command, check=True)
 
     async def get_wifi_connections():
-        r = await conn.run("nmcli con", check=True)
+        try:
+            r = await conn.run("nmcli con", check=True)
+        except Exception as e:
+            if e.stderr == "Error: NetworkManager is not running.":
+                r = await conn.run("sudo systemctl start NetworkManager", check=True)
+                r = await conn.run("nmcli con", check=True)
+            else:
+                raise
         connections = r.stdout.split('\n')
         return connections
 
@@ -513,22 +520,22 @@ async def get_ip(conn, co, interface='eth0'):
 async def main():
     dotenv.load_dotenv()
     potential_usernames = [
-        # 'hoare', 'tarjan', 'miacli', 'fred',
-        # 'geoffrey', 'rivest', 'edmund', 'ivan',
-        # 'cook', 'barbara', 'goldwasser', 'milner',
-        # 'hemming', 'frances', 'lee', 'turing',
-        # 'floyd', 'juris', 'marvin',
-        # 'conway', 'fernando', 'edward', 'edwin', 
-        # 'satoshi', 'buterin', 'lovelace',
-        # 'putnam', 'beauvoir'
-        # 'arendt', 'mordvintsev', 'chan', 'sutskever', 'neumann'
+        'hoare', 'tarjan', 'miacli', 'fred',
+        'geoffrey', 'rivest', 'edmund', 'ivan',
+        'cook', 'barbara', 'goldwasser', 'milner',
+        'hemming', 'frances', 'lee', 'turing',
+        'floyd', 'juris', 'marvin',
+        'conway', 'fernando', 'edward', 'edwin', 
+        'satoshi', 'buterin', 'lovelace',
+        'putnam', 'beauvoir',
+        'arendt', 'mordvintsev', 'chan', 'sutskever', 'neumann',
         'edsger', 'herbert'
     ]
     hosts, usernames = await get_hosts_with_retries(potential_usernames, progress_bar=True)
     connect_options = [{'username': username, 'password': 'rp145'} for username in usernames]
 
     # TODO add more pis to network
-    todo = 'setup'
+    todo = 'get_os'
 
     if todo == 'setup':
         with open('worker_requirements.txt', 'r') as f:
@@ -580,6 +587,18 @@ async def main():
         print(f"New IPs: {new_ips}")
     elif todo == 'stop':
         await run_on_pis(hosts, connect_options, killall_python)
+    elif todo == 'get_os':
+        async def get_os(conn, co):
+            # if startx is installed, then it's a desktop
+            r = await conn.run('ls -lh /usr/bin | grep startx', check=False)
+            if 'startx' in r.stdout:
+                os_type = 'desktop'
+            else:
+                os_type = 'server'
+            return {'os_type': os_type, 'username': co['username']}
+        os_types = await run_on_pis(hosts, connect_options, get_os)
+        print(f"OS Types: {os_types}")
+
     else:
         raise ValueError(f"Unknown todo: {todo}")
 
