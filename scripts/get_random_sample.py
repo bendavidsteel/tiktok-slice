@@ -182,9 +182,11 @@ class TaskDataset:
         return len(self.tasks)
 
 async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_size=100000, task_batch_size=1000, max_task_tries=3, task_nthreads=1, task_timeout=10, worker_cpu=256, worker_mem=512, cluster_type='local'):
-    network_interfaces = ['eth0', 'wlan0'] if cluster_type == 'raspi' else [None]
-    interface_ratios = [0.2, 0.8] if cluster_type == 'raspi' else [1]
-    function = MultiNetworkInterfaceFunc(DaskFunc(function), network_interfaces=network_interfaces, ratios=interface_ratios, task_nthreads=task_nthreads)
+    # network_interfaces = ['eth0', 'wlan0'] if cluster_type == 'raspi' else [None]
+    # interface_ratios = [0.2, 0.8] if cluster_type == 'raspi' else [1]
+    # function = MultiNetworkInterfaceFunc(DaskFunc(function), network_interfaces=network_interfaces, ratios=interface_ratios, task_nthreads=task_nthreads)
+    network_interface = 'wlan0' if cluster_type == 'raspi' else None
+    function = BatchNetworkInterfaceFunc(DaskFunc(function), network_interface=network_interface, task_nthreads=task_nthreads)
     dotenv.load_dotenv()
     tasks_progress_bar = tqdm(total=len(dataset), desc="All Tasks")
     batch_progress_bar = tqdm(total=min(batch_size, len(dataset)), desc="Batch Tasks", leave=False)
@@ -725,8 +727,8 @@ async def run_get_ips():
     
 async def main():
     dotenv.load_dotenv()
-    # await run_random_sample()
-    await run_get_ips()
+    await run_random_sample()
+    # await run_get_ips()
 
 if __name__ == '__main__':
     asyncio.run(main())
