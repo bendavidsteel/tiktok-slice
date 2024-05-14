@@ -307,12 +307,7 @@ def get_headers():
     return headers
 
 class ProcessVideo:
-    def __init__(self, r):
-        self.r = r
-        if r.status_code != 200:
-            raise InvalidResponseException(
-                r, f"TikTok returned a {r.status_code} status code."
-            )
+    def __init__(self):
         self.text = ""
         self.start = -1
         self.json_start = '"webapp.video-detail":'
@@ -359,7 +354,11 @@ async def async_get_video(video_id):
 
     async with httpx.AsyncClient() as client:
         async with client.stream("GET", url, headers=headers) as r:
-            video_processor = ProcessVideo(r)
+            if r.status_code != 200:
+                raise InvalidResponseException(
+                    r, f"TikTok returned a {r.status_code} status code."
+                )
+            video_processor = ProcessVideo()
 
             async for text_chunk in r.aiter_text():
                 do = video_processor.process_chunk(text_chunk)
@@ -375,7 +374,7 @@ def get_video(video_id, client):
     headers = get_headers()
     
     with client.stream("GET", url, headers=headers) as r:
-        video_processor = ProcessVideo(r)
+        video_processor = ProcessVideo()
 
         for text_chunk in r.iter_text():
             do = video_processor.process_chunk(text_chunk)

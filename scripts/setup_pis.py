@@ -516,6 +516,8 @@ async def get_hosts_with_retries(usernames, max_tries=2, progress_bar=False):
         hosts_users = [(host, un) for un, host in user_hosts.items()]
         file_hosts, file_usernames = zip(*hosts_users)
         file_hosts, file_usernames = list(file_hosts), list(file_usernames)
+        file_hosts = [h for h, un in zip(file_hosts, file_usernames) if un in usernames]
+        file_usernames = [un for un in file_usernames if un in usernames]
         print("Attempting to load cached connection data")
         num_tries = 0
         while num_tries < max_tries:
@@ -561,22 +563,23 @@ async def get_ip(conn, co, interface='eth0'):
 async def main():
     dotenv.load_dotenv()
     potential_usernames = [
-        'hoare', 'tarjan', 'miacli', 'fred',
-        'geoffrey', 'rivest', 'edmund', 'ivan',
-        'cook', 'barbara', 'goldwasser', 'milner',
-        'hemming', 'frances', 'lee', 'turing',
-        'floyd', 'juris', 'marvin',
-        'conway', 'fernando', 'edward', 'edwin', 
-        'satoshi', 'buterin', 'lovelace',
-        'putnam', 'beauvoir',
-        'arendt', 'mordvintsev', 'chan', 'sutskever', 'neumann',
-        'edsger', 'herbert'
+        # 'hoare', 'tarjan', 'miacli', 'fred',
+        # 'geoffrey', 'rivest', 'edmund', 'ivan',
+        # 'cook', 'barbara', 'goldwasser', 'milner',
+        # 'hemming', 'frances', 'lee', 'turing',
+        # 'floyd', 'juris', 'marvin',
+        # 'conway', 'fernando', 'edward', 'edwin', 
+        # 'satoshi', 'buterin', 'lovelace',
+        # 'putnam', 'beauvoir',
+        # 'arendt', 'chan', 'sutskever', 'neumann',
+        # 'edsger', 'herbert'
+        'mordvintsev'
     ]
     hosts, usernames = await get_hosts_with_retries(potential_usernames, progress_bar=True)
     connect_options = [{'username': username, 'password': 'rp145'} for username in usernames]
 
     # TODO add more pis to network
-    todo = 'get_os'
+    todo = 'setup'
 
     if todo == 'setup':
         with open('worker_requirements.txt', 'r') as f:
