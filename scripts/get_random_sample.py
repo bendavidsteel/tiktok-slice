@@ -9,6 +9,7 @@ import subprocess
 import time
 import traceback
 
+import asyncssh
 from dask.distributed import Client as DaskClient
 from dask.distributed import LocalCluster as DaskLocalCluster
 from dask.distributed import SpecCluster as DaskSpecCluster
@@ -23,7 +24,7 @@ from tqdm import tqdm
 from tqdm.asyncio import tqdm as atqdm
 
 from map_funcs import _amap
-from setup_pis import change_mac_addresses, get_hosts_with_retries, start_wifi_connections, stop_stale_workers
+from setup_pis import change_mac_addresses, get_hosts_with_retries, start_wifi_connections, reboot_workers, get_connect_latency
 
 async def async_map(func, args, num_workers=10):
     all_pbar = tqdm(total=len(args))
@@ -103,36 +104,58 @@ class DaskCluster:
                 'conway', 'fernando', 'edward', 'edwin', 
                 'satoshi', 'buterin', 'lovelace', 'neumann',
                 'putnam', 'beauvoir', 'chan', 'sutskever',
-                'arendt', 'mordvintsev', 'herbert'
+                'arendt', 'herbert', 'mordvintsev'
             ]
             print("Finding hosts...")
             raspi_password = os.environ['RASPI_PASSWORD']
             scheduler_password = os.environ['SCHEDULER_PASSWORD']
 
-            hosts, usernames = await get_hosts_with_retries(potential_usernames, max_tries=2, progress_bar=True)
+            max_latency = 5
+            hosts, usernames = await get_hosts_with_retries(potential_usernames, max_tries=2, progress_bar=True, timeout=max_latency)
             connect_options = [dict(username=un, password=raspi_password, known_hosts=None) for un in usernames]
-
-            hosts, connect_options = await stop_stale_workers(hosts, connect_options)
+            # reboot workers to get rid of stale connections
+            _, connect_options = await reboot_workers(hosts, connect_options, timeout=max_latency)
+            potential_usernames = [co['username'] for co in connect_options]
+            hosts, usernames = await get_hosts_with_retries(potential_usernames, max_tries=2, progress_bar=True, timeout=max_latency)
+            connect_options = [dict(username=un, password=raspi_password, known_hosts=None) for un in usernames]
             print("Starting wifi connections...")
-            hosts, connect_options = await start_wifi_connections(hosts, connect_options, progress_bar=True)
+            hosts, connect_options = await start_wifi_connections(hosts, connect_options, progress_bar=True, timeout=max_latency)
 
             remote_python='~/ben/tiktok/venv/bin/python'
 
             # append client/scheduler
-            hosts = ['localhost'] + hosts
-            connect_options = [dict(username='bsteel', password=scheduler_password)] + connect_options
-            self.cluster = await asyncio.wait_for(DaskSSHCluster(
-                hosts,
-                connect_options=connect_options,
-                worker_options={ 'nthreads': self.worker_nthreads },
-                remote_python=remote_python,
-                asynchronous=True
-            ), timeout=60)
+            all_hosts = ['localhost'] + hosts
+            all_connect_options = [dict(username='bsteel', password=scheduler_password)] + connect_options
+            max_tries = 3
+            num_tries = 0
+            while num_tries < max_tries:
+                num_tries += 1
+                try:
+                    self.cluster = await asyncio.wait_for(DaskSSHCluster(
+                        all_hosts,
+                        connect_options=all_connect_options,
+                        worker_options={ 'nthreads': self.worker_nthreads },
+                        remote_python=remote_python,
+                        asynchronous=True
+                    ), timeout=120)
+                except asyncio.TimeoutError:
+                    # remove high latency workers and try again
+                    hosts, connect_options, latencies = await get_connect_latency(hosts, connect_options)
+                    max_latency -= 1
+                    hosts = [h for h, l in zip(hosts, latencies) if l < max_latency]
+                    connect_options = [c for c, l in zip(connect_options, latencies) if l < max_latency]
+                except asyncssh.misc.ChannelOpenError:
+                    pass
+                else:
+                    break
+            else:
+                raise asyncio.TimeoutError("Timed out creating cluster...")
+
         return self.cluster
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self.cluster is not None:
-            self.cluster.close()
+            await self.cluster.close()
 
 def process_future(f, batch_tasks_lookup, timeout, max_task_tries, tasks_progress_bar, exception_counter, cancel_if_unfinished=False):
     batch_tasks, processed = batch_tasks_lookup[f.key]
@@ -224,7 +247,7 @@ async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_si
 
                             # start the timeout timer
                             total_time = len(batch_tasks) * task_timeout
-                            num_actual_workers = len(client.scheduler_info()['workers'])
+                            num_actual_workers = len(cluster.workers)
                             timeout = total_time / (num_actual_workers * task_nthreads)
 
                             # send out the tasks

@@ -223,12 +223,12 @@ async def ensure_wifi_connection(conn, connect_options, force_start=False):
     else:
         raise Exception("Failed to create wifi connection")
     
-async def start_wifi_connections(hosts, connect_options, progress_bar=True):
+async def start_wifi_connections(hosts, connect_options, progress_bar=True, timeout=10):
     iterable = list(zip(hosts, connect_options))
     async def run_start_wifi(args):
         host, co  = args
-        conn = await asyncio.wait_for(asyncssh.connect(host, **co), timeout=10)
         try:
+            conn = await asyncio.wait_for(asyncssh.connect(host, **co), timeout=timeout)
             await asyncio.wait_for(ensure_wifi_connection(conn, co), timeout=120)
         except asyncssh.process.ProcessError as e:
             ex = asyncssh.misc.Error(e.code, e.stderr)
@@ -249,23 +249,23 @@ async def start_wifi_connections(hosts, connect_options, progress_bar=True):
     working_connect_options = [co for host, co in res if host]
     return working_hosts, working_connect_options
 
-async def check_connection(hosts, usernames, progress_bar=False):
+async def check_connection(hosts, usernames, progress_bar=False, timeout=10):
     assert len(hosts) == len(usernames), "Hosts and usernames must be the same length"
-    iterable = zip(hosts, usernames)
+    iterable = list(zip(hosts, usernames))
     async def run_connect(args):
         host, username = args
         try:
-            await asyncio.wait_for(asyncssh.connect(host, username=username, password='rp145', known_hosts=None), timeout=10)
+            await asyncio.wait_for(asyncssh.connect(host, username=username, password='rp145', known_hosts=None), timeout=timeout)
         except Exception as e:
             return False
         else:
             return True
-    results = await async_amap(run_connect, iterable, num_workers=len(hosts), pbar_desc="Checking connections")
+    results = await async_amap(run_connect, iterable, num_workers=len(hosts), pbar_desc="Checking connections", progress_bar=progress_bar)
     working_hosts = [host for host, res in zip(hosts, results) if res]
     working_usernames = [username for username, res in zip(usernames, results) if res]
     return working_hosts, working_usernames
 
-async def scan_for_pis(possible_usernames, ignore_hosts=[], progress_bar=False, password=None):
+async def scan_for_pis(possible_usernames, ignore_hosts=[], progress_bar=False, password=None, timeout=10):
     if not password:
         password = os.environ['RASPI_PASSWORD']
 
@@ -309,7 +309,7 @@ async def scan_for_pis(possible_usernames, ignore_hosts=[], progress_bar=False, 
             if '22/tcp' in open_ports:
                 for username in possible_usernames:
                     try:
-                        await asyncio.wait_for(asyncssh.connect(ip, username=username, password=password, known_hosts=None), timeout=10)
+                        await asyncio.wait_for(asyncssh.connect(ip, username=username, password=password, known_hosts=None), timeout=timeout)
                     except Exception as e:
                         continue
                     else:
@@ -347,7 +347,7 @@ async def scan_for_pis(possible_usernames, ignore_hosts=[], progress_bar=False, 
             if '22/tcp' in open_ports:
                 for username in remaining_usernames:
                     try:
-                        conn = await asyncio.wait_for(asyncssh.connect(ip, username=username, password=password, known_hosts=None), timeout=10)
+                        await asyncio.wait_for(asyncssh.connect(ip, username=username, password=password, known_hosts=None), timeout=timeout)
                         working_username = username
                         break
                     except Exception as e:
@@ -411,11 +411,11 @@ async def kill_workers(hosts, connect_options):
     args = zip(hosts, connect_options)
     await async_amap(run_killall, args, num_workers=len(hosts))
 
-async def stop_stale_workers(hosts, connect_options):
+async def stop_stale_workers(hosts, connect_options, timeout=10):
     async def run_killall(args):
         host, co = args
         try:
-            conn = await asyncio.wait_for(asyncssh.connect(host, **co), timeout=10)
+            conn = await asyncio.wait_for(asyncssh.connect(host, **co), timeout=timeout)
             await killall_python(conn)
         except:
             return None, None
@@ -426,6 +426,43 @@ async def stop_stale_workers(hosts, connect_options):
     working_hosts = [host for host, co in results if host]
     working_connect_options = [co for host, co in results if host]
     return working_hosts, working_connect_options
+
+async def reboot_workers(hosts, connect_options, timeout=10):
+    async def run_reboot(args):
+        host, co = args
+        try:
+            conn = await asyncio.wait_for(asyncssh.connect(host, **co), timeout=timeout)
+            commands = f"""
+                sudo reboot
+            """
+            r = await conn.run(f'echo "{commands}" > ~/reboot.sh', check=True)
+            r = await conn.run('chmod +x ~/reboot.sh', check=True)
+            await conn.create_process('nohup ~/change_mac.sh &') # no need to check since it will disconnect the ssh connection
+        except:
+            return None, None
+        else:
+            return host, co
+
+    args = zip(hosts, connect_options)
+    results = await async_amap(run_reboot, args, num_workers=len(hosts))
+    return [host for host, co in results if host], [co for host, co in results if host]
+
+async def get_connect_latency(hosts, connect_options):
+    async def run_connect_latency(args):
+        host, co = args
+        try:
+            start_time = datetime.datetime.now()
+            await asyncio.wait_for(asyncssh.connect(host, **co), timeout=10)
+            end_time = datetime.datetime.now()
+            latency = (end_time - start_time).total_seconds()
+            return host, co, latency
+        except:
+            return host, co, 999999
+
+    args = zip(hosts, connect_options)
+    results = await async_amap(run_connect_latency, args, num_workers=len(hosts))
+    hosts, connect_options, latencies = zip(*results)
+    return hosts, connect_options, latencies
 
 async def change_mac_addresses(hosts, connect_options, progress_bar=False, **kwargs):
     async def run_change_mac_address(args):
@@ -506,7 +543,7 @@ async def get_hosts(usernames):
 
     return hosts, found_usernames
 
-async def get_hosts_with_retries(usernames, max_tries=2, progress_bar=False):
+async def get_hosts_with_retries(usernames, max_tries=2, progress_bar=False, timeout=10):
     hosts = []
     found_usernames = []
     try:
@@ -521,7 +558,7 @@ async def get_hosts_with_retries(usernames, max_tries=2, progress_bar=False):
         while num_tries < max_tries:
             num_tries += 1
             print(f"Attempt {num_tries} to find all hosts from file...")
-            try_hosts, try_found_usernames = await check_connection(file_hosts, file_usernames, progress_bar=progress_bar)
+            try_hosts, try_found_usernames = await check_connection(file_hosts, file_usernames, progress_bar=progress_bar, timeout=timeout)
             hosts.extend(try_hosts)
             found_usernames.extend(try_found_usernames)
             if len(found_usernames) == len(usernames):
@@ -538,7 +575,7 @@ async def get_hosts_with_retries(usernames, max_tries=2, progress_bar=False):
         while num_tries < max_tries:
             num_tries += 1
             print(f"Attempt {num_tries} to find all hosts from network scan...")
-            try_hosts, try_found_usernames = await scan_for_pis(non_found_usernames, ignore_hosts=hosts, progress_bar=progress_bar)
+            try_hosts, try_found_usernames = await scan_for_pis(non_found_usernames, ignore_hosts=hosts, progress_bar=progress_bar, timeout=timeout)
             hosts.extend(try_hosts)
             found_usernames.extend(try_found_usernames)
             non_found_usernames = list(set(non_found_usernames) - set(try_found_usernames))
