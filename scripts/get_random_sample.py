@@ -2,13 +2,15 @@ import asyncio
 import collections
 from concurrent.futures import ThreadPoolExecutor
 import datetime
+import io
 import itertools
 import json
 import os
-import subprocess
 import time
 import traceback
 
+import brotli
+import certifi
 from dask.distributed import Client as DaskClient
 from dask.distributed import LocalCluster as DaskLocalCluster
 from dask.distributed import SpecCluster as DaskSpecCluster
@@ -18,7 +20,7 @@ from distributed.scheduler import Scheduler as DaskScheduler
 from distributed.deploy.ssh import Worker as DaskSSHWorker
 from dask_cloudprovider.aws import FargateCluster as DaskFargateCluster
 import dotenv
-import httpx
+import pycurl
 from tqdm import tqdm
 from tqdm.asyncio import tqdm as atqdm
 
@@ -348,42 +350,57 @@ class ProcessVideo:
             )
         return video_info
 
-async def async_get_video(video_id):
-    url = f"https://www.tiktok.com/@/video/{video_id}"
-    headers = get_headers()
+class ResponseHeaders:
+    def __init__(self):
+        self.headers = {}
 
-    async with httpx.AsyncClient() as client:
-        async with client.stream("GET", url, headers=headers) as r:
-            if r.status_code != 200:
-                raise InvalidResponseException(
-                    r, f"TikTok returned a {r.status_code} status code."
-                )
-            video_processor = ProcessVideo()
+    def header_function(self, header_line):
+        header_line = header_line.decode('iso-8859-1')
 
-            async for text_chunk in r.aiter_text():
-                do = video_processor.process_chunk(text_chunk)
-                if do == 'break':
-                    break
-                elif do == 'continue':
-                    continue
+        if ':' not in header_line:
+            return
 
-            return video_processor.process_response()
+        name, value = header_line.split(':', 1)
 
-def get_video(video_id, client):
+        name = name.strip()
+        value = value.strip()
+
+        name = name.lower()
+
+        self.headers[name] = value
+
+def get_video(video_id, c):
     url = f"https://www.tiktok.com/@/video/{video_id}"
     headers = get_headers()
     
-    with client.stream("GET", url, headers=headers) as r:
-        video_processor = ProcessVideo()
+    buffer = io.BytesIO()
+    response_headers = ResponseHeaders()
+    c.setopt(pycurl.URL, url)
+    c.setopt(pycurl.HTTPHEADER, [f"{key}: {value}" for key, value in headers.items()])
+    c.setopt(pycurl.TIMEOUT, 10)
+    c.setopt(pycurl.WRITEFUNCTION, buffer.write)
+    c.setopt(pycurl.HEADERFUNCTION, response_headers.header_function)
+    c.setopt(pycurl.CAINFO, certifi.where())
+        
+    c.perform()
 
-        for text_chunk in r.iter_text():
-            do = video_processor.process_chunk(text_chunk)
-            if do == 'break':
-                break
-            elif do == 'continue':
-                continue
+    status_code = c.getinfo(pycurl.HTTP_CODE)
+    if status_code != 0:
+        raise InvalidResponseException(f"Status code: {status_code}")
 
-        return video_processor.process_response()
+    # Json response
+    resp_bytes = buffer.getvalue()
+
+    if response_headers.headers['content-encoding'] == 'br':
+        resp = brotli.decompress(resp_bytes).decode()
+    else:
+        raise InvalidResponseException("Content encoding not supported")
+
+    buffer.close()
+
+    video_processor = ProcessVideo()
+    video_processor.process_chunk(resp)
+    return video_processor.process_response()
 
 class DaskFunc:
     def __init__(self, func):
@@ -407,31 +424,6 @@ class DaskFunc:
             'post_time': post_time,
         }
     
-def get_local_ip(interface):
-    ip_command = f"ip -4 addr show {interface}"
-    if interface == 'wlan0':
-        regex_command = " | grep -oP '(?<=brd\s)\d+(\.\d+){3}'"
-    elif interface == 'eth0':
-        regex_command = " | grep -oP '(?<=inet\s)\d+(\.\d+){3}'"
-    else:
-        raise ValueError()
-    
-    completed_process = subprocess.run(ip_command + regex_command, shell=True, check=False, capture_output=True)
-
-    if completed_process.returncode != 0:
-        if len(completed_process.stderr) == 0:
-            ip_process = subprocess.run(ip_command, shell=True, check=False, capture_output=True)
-            raise ValueError(f"Could not find IP address for interface {interface}. {ip_process.stdout.decode()}")
-        else:
-            raise subprocess.CalledProcessError(completed_process.returncode, ip_command + regex_command, completed_process.stderr)
-
-    outputs = completed_process.stdout.decode().strip().split('\n')
-    ip_address = outputs[0]
-
-    assert len(ip_address) > 0, f"Could not find IP address for interface {interface}"
-
-    return ip_address
-
 class BatchNetworkInterfaceFunc:
     def __init__(self, func, network_interface=None, task_nthreads=1):
         self.func = func
@@ -439,10 +431,13 @@ class BatchNetworkInterfaceFunc:
         self.task_nthreads = task_nthreads
 
     def __call__(self, batch_args):
-        interface_ip = get_local_ip(self.network_interface) if self.network_interface else None
-        transport = httpx.HTTPTransport(local_address=interface_ip)
-        with httpx.Client(transport=transport) as http_client:
-            return thread_map(batch_args, itertools.repeat(http_client), function=self.func, num_workers=self.task_nthreads)
+        curl_session = pycurl.Curl()
+        curl_session.setopt(pycurl.INTERFACE, self.network_interface)
+        try:
+            results = thread_map(batch_args, itertools.repeat(curl_session), function=self.func, num_workers=self.task_nthreads)
+            return results
+        finally:
+            curl_session.close()
         
 class MultiNetworkInterfaceFunc:
     def __init__(self, func, network_interfaces=[], ratios=[], task_nthreads=1):
