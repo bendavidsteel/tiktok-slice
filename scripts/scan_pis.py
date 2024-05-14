@@ -9,10 +9,11 @@ async def main():
         # 'frances', 'ivan', 'milner', 'cook', 'lee', 'barbara', 'goldwasser', 'hemming',
         # 'floyd', 'turing', 'marvin', 'juris', 'edsger',
         # 'conway', 'fernando', 'edward', 'edwin', 'satoshi', 'buterin', 'lovelace', 'putnam', 'beauvoir'
-        'arendt', 'mordvintsev', 'chan', 'sutskever', 'neumann'
+        # 'arendt', 'mordvintsev', 'chan', 'sutskever', 'neumann'
+        'bsteel'
     ]
     
-    hosts, usernames = await scan_for_pis(possible_usernames, progress_bar=True)
+    hosts, usernames = await scan_for_pis(possible_usernames, progress_bar=True, password='3141')
 
     hosts_users = {host: user for host, user in zip(hosts, usernames)}
     print(hosts_users)

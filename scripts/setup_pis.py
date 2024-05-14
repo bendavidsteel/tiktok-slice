@@ -250,14 +250,24 @@ async def start_wifi_connections(hosts, connect_options, progress_bar=True):
     return working_hosts, working_connect_options
 
 async def check_connection(hosts, usernames, progress_bar=False):
+    assert len(hosts) == len(usernames), "Hosts and usernames must be the same length"
     iterable = zip(hosts, usernames)
     async def run_connect(args):
         host, username = args
-        await asyncio.wait_for(asyncssh.connect(host, username=username, password='rp145', known_hosts=None), timeout=10)
-    await async_amap(run_connect, iterable, num_workers=len(hosts), pbar_desc="Checking connections")
+        try:
+            await asyncio.wait_for(asyncssh.connect(host, username=username, password='rp145', known_hosts=None), timeout=10)
+        except Exception as e:
+            return False
+        else:
+            return True
+    results = await async_amap(run_connect, iterable, num_workers=len(hosts), pbar_desc="Checking connections")
+    working_hosts = [host for host, res in zip(hosts, results) if res]
+    working_usernames = [username for username, res in zip(usernames, results) if res]
+    return working_hosts, working_usernames
 
-async def scan_for_pis(possible_usernames, progress_bar=False):
-    pi_password = 'rp145'
+async def scan_for_pis(possible_usernames, ignore_hosts=[], progress_bar=False, password=None):
+    if not password:
+        password = os.environ['RASPI_PASSWORD']
 
     r = subprocess.run('nmap 10.157.115.0/24', shell=True, capture_output=True)
 
@@ -283,6 +293,8 @@ async def scan_for_pis(possible_usernames, progress_bar=False):
     if concurrent:
         async def run_test_connect(report):
             ip = report[0].split(' ')[4]
+            if ip in ignore_hosts:
+                return None, None
             table_headers = [i for i, l in enumerate(report) if 'PORT' in l]
             if not table_headers:
                 return None, None
@@ -297,7 +309,7 @@ async def scan_for_pis(possible_usernames, progress_bar=False):
             if '22/tcp' in open_ports:
                 for username in possible_usernames:
                     try:
-                        await asyncio.wait_for(asyncssh.connect(ip, username=username, password=pi_password, known_hosts=None), timeout=10)
+                        await asyncio.wait_for(asyncssh.connect(ip, username=username, password=password, known_hosts=None), timeout=10)
                     except Exception as e:
                         continue
                     else:
@@ -318,6 +330,8 @@ async def scan_for_pis(possible_usernames, progress_bar=False):
             all_reports = tqdm.tqdm(all_reports, desc="Scanning for Pis")
         for report in all_reports:
             ip = report[0].split(' ')[4]
+            if ip in ignore_hosts:
+                continue
             table_headers = [i for i, l in enumerate(report) if 'PORT' in l]
             if not table_headers:
                 continue
@@ -333,7 +347,7 @@ async def scan_for_pis(possible_usernames, progress_bar=False):
             if '22/tcp' in open_ports:
                 for username in remaining_usernames:
                     try:
-                        conn = await asyncio.wait_for(asyncssh.connect(ip, username=username, password=pi_password, known_hosts=None), timeout=10)
+                        conn = await asyncio.wait_for(asyncssh.connect(ip, username=username, password=password, known_hosts=None), timeout=10)
                         working_username = username
                         break
                     except Exception as e:
@@ -383,7 +397,7 @@ async def killall_python(conn):
     try:
         r = await conn.run('killall ~/ben/tiktok/venv/bin/python', check=True)
     except Exception as e:
-        if 'no process found' in e.stderr:
+        if hasattr(e, 'stderr') and 'no process found' in e.stderr:
             pass
         else:
             print(f'Failed to stop: {e}')
@@ -400,10 +414,18 @@ async def kill_workers(hosts, connect_options):
 async def stop_stale_workers(hosts, connect_options):
     async def run_killall(args):
         host, co = args
-        conn = await asyncio.wait_for(asyncssh.connect(host, **co), timeout=10)
-        await killall_python(conn)
+        try:
+            conn = await asyncio.wait_for(asyncssh.connect(host, **co), timeout=10)
+            await killall_python(conn)
+        except:
+            return None, None
+        else:
+            return host, co
     args = zip(hosts, connect_options)
-    await async_amap(run_killall, args, num_workers=len(hosts))
+    results = await async_amap(run_killall, args, num_workers=len(hosts))
+    working_hosts = [host for host, co in results if host]
+    working_connect_options = [co for host, co in results if host]
+    return working_hosts, working_connect_options
 
 async def change_mac_addresses(hosts, connect_options, progress_bar=False, **kwargs):
     async def run_change_mac_address(args):
@@ -484,23 +506,42 @@ async def get_hosts(usernames):
 
     return hosts, found_usernames
 
-async def get_hosts_with_retries(usernames, max_tries=3, progress_bar=False):
+async def get_hosts_with_retries(usernames, max_tries=2, progress_bar=False):
+    hosts = []
+    found_usernames = []
     try:
         # load cached hosts and usernames
         with open('hosts.json', 'r') as file:
             user_hosts = json.load(file)
         hosts_users = [(host, un) for un, host in user_hosts.items()]
-        hosts, found_usernames = zip(*hosts_users)
-        hosts, found_usernames = list(hosts), list(found_usernames)
-        assert len(found_usernames) == len(usernames), "Cached usernames do not match expected usernames"
+        file_hosts, file_usernames = zip(*hosts_users)
+        file_hosts, file_usernames = list(file_hosts), list(file_usernames)
         print("Attempting to load cached connection data")
-        await check_connection(hosts, found_usernames, progress_bar=progress_bar)
-    except Exception as ex:
         num_tries = 0
         while num_tries < max_tries:
             num_tries += 1
-            print(f"Attempt {num_tries} to find all hosts...")
-            hosts, found_usernames = await scan_for_pis(usernames, progress_bar=progress_bar)
+            print(f"Attempt {num_tries} to find all hosts from file...")
+            try_hosts, try_found_usernames = await check_connection(file_hosts, file_usernames, progress_bar=progress_bar)
+            hosts.extend(try_hosts)
+            found_usernames.extend(try_found_usernames)
+            if len(found_usernames) == len(usernames):
+                break
+            else:
+                print(f"Found {len(found_usernames)} out of {len(usernames)} hosts, trying again...")
+                file_usernames = list(set(file_usernames) - set(found_usernames))
+                file_hosts = [user_hosts[un] for un in file_usernames]
+        else:
+            raise Exception("Unable to find all hosts from file")
+    except Exception as ex:
+        num_tries = 0
+        non_found_usernames = list(set(usernames) - set(found_usernames))
+        while num_tries < max_tries:
+            num_tries += 1
+            print(f"Attempt {num_tries} to find all hosts from network scan...")
+            try_hosts, try_found_usernames = await scan_for_pis(non_found_usernames, ignore_hosts=hosts, progress_bar=progress_bar)
+            hosts.extend(try_hosts)
+            found_usernames.extend(try_found_usernames)
+            non_found_usernames = list(set(non_found_usernames) - set(try_found_usernames))
             if len(found_usernames) == len(usernames):
                 break
             else:

@@ -109,10 +109,10 @@ class DaskCluster:
             raspi_password = os.environ['RASPI_PASSWORD']
             scheduler_password = os.environ['SCHEDULER_PASSWORD']
 
-            hosts, usernames = await get_hosts_with_retries(potential_usernames, max_tries=3, progress_bar=True)
+            hosts, usernames = await get_hosts_with_retries(potential_usernames, max_tries=2, progress_bar=True)
             connect_options = [dict(username=un, password=raspi_password, known_hosts=None) for un in usernames]
 
-            await stop_stale_workers(hosts, connect_options)
+            hosts, connect_options = await stop_stale_workers(hosts, connect_options)
             print("Starting wifi connections...")
             hosts, connect_options = await start_wifi_connections(hosts, connect_options, progress_bar=True)
 
@@ -121,12 +121,13 @@ class DaskCluster:
             # append client/scheduler
             hosts = ['localhost'] + hosts
             connect_options = [dict(username='bsteel', password=scheduler_password)] + connect_options
-            self.cluster = DaskSSHCluster(
+            self.cluster = await asyncio.wait_for(DaskSSHCluster(
                 hosts,
                 connect_options=connect_options,
                 worker_options={ 'nthreads': self.worker_nthreads },
                 remote_python=remote_python,
-            )
+                asynchronous=True
+            ), timeout=60)
         return self.cluster
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):

@@ -64,44 +64,45 @@ def main():
 
     # TODO look to see if likely workers in the same datacenter have the same sequence system
 
-    valid_ids = []
-    with httpx.Client() as client:
-        # test missing counts
-        for geo_bits in success_groups:
-            # check if we find a sequence of successful requests with missing vals, where we didn't make the request
-            time_groups = success_groups[geo_bits]
-            missing_vals_top_contendors = set()
-            for time in time_groups:
-                success_vals = time_groups[time]
-                min_val = min(success_vals)
-                max_val = max(success_vals)
-                missing_vals = [val for val in range(min_val, max_val) if val not in success_vals]
-                if len(missing_vals) / len(success_vals) < 0.2: # suspicious if less than of vals are missing
-                    for missing_val in missing_vals:
-                        missing_bits = format(missing_val, '08b')
-                        all_bits = missing_bits + geo_bits
-                        missing_id = int(all_bits, 2)
-                        if missing_id not in requested_ids:
-                            missing_vals_top_contendors.add(missing_val)
-
-            for missing_val in missing_vals_top_contendors:
+    if False:
+        valid_ids = []
+        with httpx.Client() as client:
+            # test missing counts
+            for geo_bits in success_groups:
+                # check if we find a sequence of successful requests with missing vals, where we didn't make the request
+                time_groups = success_groups[geo_bits]
+                missing_vals_top_contendors = set()
                 for time in time_groups:
                     success_vals = time_groups[time]
                     min_val = min(success_vals)
                     max_val = max(success_vals)
-                    time_missing_vals = [val for val in range(min_val, max_val) if val not in success_vals]
-                    if missing_val not in time_missing_vals:
-                        continue
-                    # create a tiktok id from these missing vals
-                    missing_bits = format(missing_val, '08b')
-                    timestamp = math.floor(time)
-                    timestamp_bits = format(timestamp, '032b')
-                    milliseconds = math.floor((time - timestamp) * 1000)
-                    milliseconds_bits = format(milliseconds, '010b')
-                    missing_id = int(timestamp_bits + milliseconds_bits + missing_bits + geo_bits, 2)
-                    res = get_video(missing_id, client)
-                    if 'statusCode' not in res:
-                        valid_ids.append(int(missing_bits + geo_bits, 2))
+                    missing_vals = [val for val in range(min_val, max_val) if val not in success_vals]
+                    if len(missing_vals) / len(success_vals) < 0.2: # suspicious if less than of vals are missing
+                        for missing_val in missing_vals:
+                            missing_bits = format(missing_val, '08b')
+                            all_bits = missing_bits + geo_bits
+                            missing_id = int(all_bits, 2)
+                            if missing_id not in requested_ids:
+                                missing_vals_top_contendors.add(missing_val)
+
+                for missing_val in missing_vals_top_contendors:
+                    for time in time_groups:
+                        success_vals = time_groups[time]
+                        min_val = min(success_vals)
+                        max_val = max(success_vals)
+                        time_missing_vals = [val for val in range(min_val, max_val) if val not in success_vals]
+                        if missing_val not in time_missing_vals:
+                            continue
+                        # create a tiktok id from these missing vals
+                        missing_bits = format(missing_val, '08b')
+                        timestamp = math.floor(time)
+                        timestamp_bits = format(timestamp, '032b')
+                        milliseconds = math.floor((time - timestamp) * 1000)
+                        milliseconds_bits = format(milliseconds, '010b')
+                        missing_id = int(timestamp_bits + milliseconds_bits + missing_bits + geo_bits, 2)
+                        res = get_video(missing_id, client)
+                        if 'statusCode' not in res:
+                            valid_ids.append(int(missing_bits + geo_bits, 2))
 
 if __name__ == '__main__':
     main()
