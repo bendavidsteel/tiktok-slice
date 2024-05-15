@@ -14,8 +14,22 @@ import tqdm
 from map_funcs import async_amap
 
 async def setup_pi(conn, connect_options, reqs=''):
+
+    r = await conn.run('sudo apt list', check=True)
+    packages = r.stdout.split('\n')
+
+    to_remove_packages = ['xserver*', 'lightdm*', 'raspberrypi-ui-mods', 'vlc*', 'lxde*', 'chromium*', 'desktop*', 'gnome*', 'gstreamer*', 'gtk*', 'hicolor-icon-theme*', 'lx*', 'mesa*']
+    if any(any(to_remove_package.strip('*') in package for package in packages) for to_remove_package in to_remove_packages):
+        # downsize to raspios lite
+        r = await conn.run(f"sudo apt purge -y {' '.join(to_remove_packages)}", check=True)
+        r = await conn.run("sudo apt autoremove -y", check=True)
+
+    # install required packages
+    apt_reqs = ['libcurl4-openssl-dev', 'libssl-dev']
+    if not all(apt_req in packages for apt_req in apt_reqs):
+        r = await conn.run(f"sudo apt install -y {' '.join(apt_reqs)}", check=True)
+
     # install python
-    # TODO use more lightweight raspberry pi image
     r = await conn.run('python3 --version', check=True)
     if r.stdout.strip() != 'Python 3.10.12':
         await conn.run('sudo apt update', check=True)
@@ -39,16 +53,12 @@ async def setup_pi(conn, connect_options, reqs=''):
 
     # install requirements
     r = await conn.run('~/ben/tiktok/venv/bin/pip list', check=True)
-    if not all(req in r.stdout for req in reqs.split()):
+    installed_packages = r.stdout.split('\n')
+    installed_packages = ['=='.join([e for e in p.split(' ') if e]) for p in installed_packages[2:-1]]
+    required_packages = reqs.split()
+    if any([req for req in required_packages if req not in installed_packages]):
         r = await conn.run(f'~/ben/tiktok/venv/bin/pip install {reqs}', check=True)
 
-    # setup vpn
-    # r = await conn.run('sudo apt install -y openvpn', check=True)
-    # username = conn.get_extra_info('username')
-    # this_dir_path = os.path.dirname(os.path.realpath(__file__))
-    # root_dir_path = os.path.dirname(this_dir_path)
-    # rasp_pi_openvpn_file_path = os.path.join(root_dir_path, "config", f'tum.eduvpn.lrz.de_tum-full-ov_20240415_tarjan@raspi.ovpn')
-    # await asyncssh.scp(rasp_pi_openvpn_file_path, (conn, '~/'))
 
 async def vpn_via_service(conn):
     # check if openvpn service file exists
@@ -269,24 +279,27 @@ async def scan_for_pis(possible_usernames, ignore_hosts=[], progress_bar=False, 
     if not password:
         password = os.environ['RASPI_PASSWORD']
 
-    r = subprocess.run('nmap 10.157.115.0/24', shell=True, capture_output=True)
-
-    if r.returncode != 0:
-        raise subprocess.CalledProcessError(r.returncode, 'nmap', r.stderr)
-
-    stdout = r.stdout.decode()
-    lines = stdout.split('\n')
-    result_lines = lines[1:-2]
-    i = 0
+    ip_cidrs = ['10.157.115.0/24', '10.162.42.0/23']
     all_reports = []
-    report = []
-    while i < len(result_lines):
-        if result_lines[i] == '':
-            all_reports.append(report)
-            report = []
-        else:
-            report.append(result_lines[i])
-        i += 1
+    for ip_cidr in ip_cidrs:
+        r = subprocess.run(f'nmap {ip_cidr}', shell=True, capture_output=True)
+
+        if r.returncode != 0:
+            raise subprocess.CalledProcessError(r.returncode, 'nmap', r.stderr)
+
+        stdout = r.stdout.decode()
+        lines = stdout.split('\n')
+        result_lines = lines[1:-2]
+        i = 0
+        
+        report = []
+        while i < len(result_lines):
+            if result_lines[i] == '':
+                all_reports.append(report)
+                report = []
+            else:
+                report.append(result_lines[i])
+            i += 1
 
     concurrent = True
 
@@ -494,29 +507,29 @@ async def run_on_pis(hosts, connect_options, func, **kwargs):
         host, connect_option, func, kwargs = args
         print(f"Connecting to {host}, {connect_option['username']}...")
         tries = 0
-        max_tries = 3
+        max_tries = 1
         exceptions = []
         while tries < max_tries:
             tries += 1
             try:
                 conn = await asyncio.wait_for(asyncssh.connect(host, **connect_option, known_hosts=None), timeout=10)
             except Exception as e:
-                print(f'Failed to connect to {host}: {e}')
+                print(f"Failed to connect to {host}, {connect_option['username']}: {e}")
                 continue
             else:
                 async with conn:
                     try:
-                        r = await func(conn, connect_option, **kwargs)
+                        r = await asyncio.wait_for(func(conn, connect_option, **kwargs), timeout=600)
                     except asyncssh.process.ProcessError as e:
                         e.args = (e.args[0], e.stderr, traceback.format_exc())
                         exceptions.append(e)
                     except Exception as e:
                         exceptions.append(e)
                     else:
-                        return r
+                        return r, host, connect_option
         else:
             print(f"Failed to run on {host} (username: {connect_option['username']}) after {max_tries} tries: {exceptions}")
-            return None
+            return None, host, connect_option
 
     args = list(zip(hosts, connect_options, [func] * len(hosts), [kwargs] * len(hosts)))
     results = await async_amap(run_func, args, num_workers=len(hosts), progress_bar=True)
@@ -600,17 +613,19 @@ async def get_ip(conn, co, interface='eth0'):
 async def main():
     dotenv.load_dotenv()
     potential_usernames = [
+        # most reliable batch
         # 'hoare', 'tarjan', 'miacli', 'fred',
         # 'geoffrey', 'rivest', 'edmund', 'ivan',
         # 'cook', 'barbara', 'goldwasser', 'milner',
         # 'hemming', 'frances', 'lee', 'turing',
+        # next most reliable
         # 'floyd', 'juris', 'marvin',
         # 'conway', 'fernando', 'edward', 'edwin', 
         # 'satoshi', 'buterin', 'lovelace',
         # 'putnam', 'beauvoir',
         # 'arendt', 'chan', 'sutskever', 'neumann',
-        # 'edsger', 'herbert'
-        'mordvintsev'
+        # 'edsger', 'herbert',
+        # 'mordvintsev'
     ]
     hosts, usernames = await get_hosts_with_retries(potential_usernames, progress_bar=True)
     connect_options = [{'username': username, 'password': 'rp145'} for username in usernames]
