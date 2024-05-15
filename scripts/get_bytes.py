@@ -47,70 +47,41 @@ async def main():
         os.makedirs(bytes_dir_path)
     videos = get_ids_to_get_bytes(data_dir_path, bytes_dir_path)
 
-    method = 'requests'
-    if method == 'tiktokapi':
-        async with TikTokApi() as api:
-            await api.create_sessions(ms_tokens=[None], num_sessions=1, sleep_after=3)
-            for video_data in videos:
-                video = api.video(
-                    url=f"https://www.tiktok.com/@{video_data['author']['uniqueId']}/video/{video_data['id']}",
-                    data=video_data
-                )
-                video_info = await video.info()
-                bytes = await video.bytes()
-                pass
-    elif method == 'pytok':
-        for video_data in tqdm.tqdm(videos):
-            async with PyTok(headless=True) as api:
-                try:
-                    video = api.video(
-                        url=f"https://www.tiktok.com/@{video_data['author']['uniqueId']}/video/{video_data['id']}",
-                        # data=video_data
-                    )
-                    video_info = await video.info()
-                    bytes = await video.bytes()
+    for video_data in tqdm.tqdm(videos):
+        if 'video' in video_data and 'downloadAddr' in video_data['video'] and video_data['video']['downloadAddr']:
+            try:
+                video_id = video_data['id']
+                url = f"https://www.tiktok.com/@{video_data['author']['uniqueId']}/video/{video_id}"
+                headers = get_headers()
+                
+                info_res = requests.get(url, headers=headers)
+                video_processor = ProcessVideo(info_res)
+                text_chunk = info_res.text
+                do = video_processor.process_chunk(text_chunk)
+
+                bytes_headers = {
+                    'sec-ch-ua': '"HeadlessChrome";v="123", "Not:A-Brand";v="8", "Chromium";v="123"', 
+                    'referer': 'https://www.tiktok.com/', 
+                    'accept-encoding': 'identity;q=1, *;q=0', 
+                    'sec-ch-ua-mobile': '?0', 
+                    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.6312.4 Safari/537.36', 
+                    'range': 'bytes=0-', 
+                    'sec-ch-ua-platform': '"Windows"'
+                }
+
+                video_d = video_processor.process_response()
+
+                if 'video' not in video_d:
+                    continue
+
+                cookies = {c.name: c.value for c in info_res.cookies}
+                bytes_res = requests.get(video_d['video']['downloadAddr'], headers=bytes_headers, cookies=cookies)
+                if 200 <= bytes_res.status_code < 300:
                     with open(os.path.join(bytes_dir_path, f"{video_data['id']}.mp4"), 'wb') as f:
-                        f.write(bytes)
-                except pytok.exceptions.NotAvailableException:
-                    continue
-                except pytok.exceptions.TimeoutException as e:
-                    continue
-    elif method == 'requests':
-        for video_data in tqdm.tqdm(videos):
-            if 'video' in video_data and 'downloadAddr' in video_data['video'] and video_data['video']['downloadAddr']:
-                try:
-                    video_id = video_data['id']
-                    url = f"https://www.tiktok.com/@{video_data['author']['uniqueId']}/video/{video_id}"
-                    headers = get_headers()
-                    
-                    info_res = requests.get(url, headers=headers)
-                    video_processor = ProcessVideo(info_res)
-                    text_chunk = info_res.text
-                    do = video_processor.process_chunk(text_chunk)
-
-                    bytes_headers = {
-                        'sec-ch-ua': '"HeadlessChrome";v="123", "Not:A-Brand";v="8", "Chromium";v="123"', 
-                        'referer': 'https://www.tiktok.com/', 
-                        'accept-encoding': 'identity;q=1, *;q=0', 
-                        'sec-ch-ua-mobile': '?0', 
-                        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.6312.4 Safari/537.36', 
-                        'range': 'bytes=0-', 
-                        'sec-ch-ua-platform': '"Windows"'
-                    }
-
-                    video_d = video_processor.process_response()
-
-                    if 'video' not in video_d:
-                        continue
-
-                    cookies = {c.name: c.value for c in info_res.cookies}
-                    bytes_res = requests.get(video_d['video']['downloadAddr'], headers=bytes_headers, cookies=cookies)
-                    if 200 <= bytes_res.status_code < 300:
-                        with open(os.path.join(bytes_dir_path, f"{video_data['id']}.mp4"), 'wb') as f:
-                            f.write(bytes_res.content)
-                except Exception as e:
-                    print(e)
-                    continue
+                        f.write(bytes_res.content)
+            except Exception as e:
+                print(e)
+                continue
 
 
 if __name__ == "__main__":
