@@ -9,6 +9,7 @@ import os
 import time
 import traceback
 
+import asyncssh
 import brotli
 import certifi
 from dask.distributed import Client as DaskClient
@@ -25,7 +26,7 @@ from tqdm import tqdm
 from tqdm.asyncio import tqdm as atqdm
 
 from map_funcs import _amap
-from setup_pis import change_mac_addresses, get_hosts_with_retries, start_wifi_connections, stop_stale_workers
+from setup_pis import change_mac_addresses, get_hosts_with_retries, start_wifi_connections, reboot_workers, stop_stale_workers
 
 async def async_map(func, args, num_workers=10):
     all_pbar = tqdm(total=len(args))
@@ -101,51 +102,71 @@ class DaskCluster:
                 'geoffrey', 'rivest', 'edmund', 'ivan',
                 'cook', 'barbara', 'goldwasser', 'milner',
                 'hemming', 'frances', 'lee', 'turing',
-                'floyd', 'juris', 'marvin', 'edsger',
-                'conway', 'fernando', 'edward', 'edwin', 
-                'satoshi', 'buterin', 'lovelace', 'neumann',
-                'putnam', 'beauvoir', 'chan', 'sutskever',
-                'arendt', 'mordvintsev', 'herbert'
+                # 'floyd', 'juris', 'marvin', 'edsger',
+                # 'conway', 'fernando', 'edward', 'edwin', 
+                # 'satoshi', 'buterin', 'lovelace', 'neumann',
+                # 'putnam', 'beauvoir',
+                # 'arendt', 'herbert', 
+                # 'mordvintsev', 'chan', 'sutskever', # raspberry pi 3s
             ]
             print("Finding hosts...")
             raspi_password = os.environ['RASPI_PASSWORD']
             scheduler_password = os.environ['SCHEDULER_PASSWORD']
 
-            hosts, usernames = await get_hosts_with_retries(potential_usernames, max_tries=2, progress_bar=True)
+            max_latency = 5
+            hosts, usernames = await get_hosts_with_retries(potential_usernames, max_tries=2, progress_bar=True, timeout=max_latency)
             connect_options = [dict(username=un, password=raspi_password, known_hosts=None) for un in usernames]
-
-            hosts, connect_options = await stop_stale_workers(hosts, connect_options)
+            
+            await stop_stale_workers(hosts, connect_options, timeout=max_latency)
             print("Starting wifi connections...")
-            hosts, connect_options = await start_wifi_connections(hosts, connect_options, progress_bar=True)
+            hosts, connect_options = await start_wifi_connections(hosts, connect_options, progress_bar=True, timeout=max_latency)
 
             remote_python='~/ben/tiktok/venv/bin/python'
 
             # append client/scheduler
-            hosts = ['localhost'] + hosts
-            connect_options = [dict(username='bsteel', password=scheduler_password)] + connect_options
-            self.cluster = await asyncio.wait_for(DaskSSHCluster(
-                hosts,
-                connect_options=connect_options,
-                worker_options={ 'nthreads': self.worker_nthreads },
-                remote_python=remote_python,
-                asynchronous=True
-            ), timeout=60)
+            all_hosts = ['localhost'] + hosts
+            all_connect_options = [dict(username='bsteel', password=scheduler_password)] + connect_options
+            max_tries = 3
+            num_tries = 0
+            while num_tries < max_tries:
+                num_tries += 1
+                try:
+                    self.cluster = await asyncio.wait_for(DaskSSHCluster(
+                        all_hosts,
+                        connect_options=all_connect_options,
+                        worker_options={ 'nthreads': self.worker_nthreads },
+                        remote_python=remote_python,
+                        asynchronous=True
+                    ), timeout=120)
+                except asyncio.TimeoutError:
+                    # reboot workers to get rid of stale connections
+                    _, connect_options = await reboot_workers(hosts, connect_options, timeout=max_latency)
+                    potential_usernames = [co['username'] for co in connect_options]
+                    hosts, usernames = await get_hosts_with_retries(potential_usernames, max_tries=2, progress_bar=True, timeout=max_latency)
+                    connect_options = [dict(username=un, password=raspi_password, known_hosts=None) for un in usernames]
+                except asyncssh.misc.ChannelOpenError:
+                    pass # simply retry
+                else:
+                    break
+            else:
+                raise asyncio.TimeoutError("Timed out creating cluster...")
+
         return self.cluster
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self.cluster is not None:
-            self.cluster.close()
+            await self.cluster.close()
 
-def process_future(f, batch_tasks_lookup, timeout, max_task_tries, tasks_progress_bar, exception_counter, cancel_if_unfinished=False):
+async def process_future(f, batch_tasks_lookup, timeout, max_task_tries, tasks_progress_bar, exception_counter, cancel_if_unfinished=False):
     batch_tasks, processed = batch_tasks_lookup[f.key]
     if processed:
         return
     try:
         if cancel_if_unfinished and f.status != "finished":
-            f.cancel()
+            await f.cancel()
             batch_results = [{'res': None, 'exception': TimeoutError(f"Task timed out after {timeout} seconds"), 'pre_time': None, 'post_time': datetime.datetime.now()} for _ in batch_tasks]
         else:
-            batch_results = f.result()
+            batch_results = await f.result()
     except Exception as e:
         batch_results = [{'res': None, 'exception': e, 'pre_time': None, 'post_time': datetime.datetime.now()} for _ in batch_tasks]
     for t, r in zip(batch_tasks, batch_results):
@@ -162,8 +183,8 @@ def process_future(f, batch_tasks_lookup, timeout, max_task_tries, tasks_progres
     batch_tasks_lookup[f.key] = (batch_tasks, True)
 
 async def get_results(task_futures, batch_tasks_lookup, timeout, max_task_tries, tasks_progress_bar, exception_counter):
-    for f in dask_as_completed(task_futures, raise_errors=False):
-        process_future(f, batch_tasks_lookup, timeout, max_task_tries, tasks_progress_bar, exception_counter)
+    async for f in dask_as_completed(task_futures, raise_errors=False):
+        await process_future(f, batch_tasks_lookup, timeout, max_task_tries, tasks_progress_bar, exception_counter)
 
 class Counter:
     def __init__(self):
@@ -185,11 +206,12 @@ class TaskDataset:
         return len(self.tasks)
 
 async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_size=100000, task_batch_size=1000, max_task_tries=3, task_nthreads=1, task_timeout=10, worker_cpu=256, worker_mem=512, cluster_type='local'):
-    # network_interfaces = ['eth0', 'wlan0'] if cluster_type == 'raspi' else [None]
-    # interface_ratios = [0.2, 0.8] if cluster_type == 'raspi' else [1]
-    # function = MultiNetworkInterfaceFunc(DaskFunc(function), network_interfaces=network_interfaces, ratios=interface_ratios, task_nthreads=task_nthreads)
-    network_interface = 'wlan0' if cluster_type == 'raspi' else None
-    function = BatchNetworkInterfaceFunc(DaskFunc(function), network_interface=network_interface, task_nthreads=task_nthreads)
+    network_interfaces = ['eth0', 'wlan0'] if cluster_type == 'raspi' else [None]
+    interface_ratios = [0.3, 0.7] if cluster_type == 'raspi' else [1]
+    assert all(int(ratio * task_nthreads) > 0 for ratio in interface_ratios), "Must have at least one thread per network interface"
+    function = MultiNetworkInterfaceFunc(DaskFunc(function), network_interfaces=network_interfaces, ratios=interface_ratios, task_nthreads=task_nthreads)
+    # network_interface = 'wlan0' if cluster_type == 'raspi' else None
+    # function = BatchNetworkInterfaceFunc(DaskFunc(function), network_interface=network_interface, task_nthreads=task_nthreads)
     dotenv.load_dotenv()
     tasks_progress_bar = tqdm(total=len(dataset), desc="All Tasks")
     batch_progress_bar = tqdm(total=min(batch_size, len(dataset)), desc="Batch Tasks", leave=False)
@@ -200,7 +222,7 @@ async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_si
     while dataset.num_left() > 0:
         try:
             async with DaskCluster(cluster_type, worker_cpu=worker_cpu, worker_mem=worker_mem) as cluster:
-                with DaskClient(cluster) as client:
+                async with DaskClient(cluster) as client:
                     if isinstance(cluster, DaskFargateCluster):
                         cluster.adapt(minimum=1, maximum=num_workers)
                         # wait for workers to start
@@ -226,7 +248,7 @@ async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_si
 
                             # start the timeout timer
                             total_time = len(batch_tasks) * task_timeout
-                            num_actual_workers = len(client.scheduler_info()['workers'])
+                            num_actual_workers = len(cluster.workers)
                             timeout = total_time / (num_actual_workers * task_nthreads)
 
                             # send out the tasks
@@ -241,10 +263,10 @@ async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_si
                             exception_counter = Counter()
                             try:
                                 await asyncio.wait_for(get_results(task_futures, batch_tasks_lookup, timeout, max_task_tries, tasks_progress_bar, exception_counter), timeout=timeout)
-                            except Exception:
+                            except Exception as e:
                                 # cancel all the unfinished tasks, and add the exceptions to the task
                                 for f in task_futures:
-                                    process_future(f, batch_tasks_lookup, timeout, max_task_tries, tasks_progress_bar, exception_counter, cancel_if_unfinished=True)
+                                    await process_future(f, batch_tasks_lookup, timeout, max_task_tries, tasks_progress_bar, exception_counter, cancel_if_unfinished=True)
                             num_exceptions_for_current_ips += exception_counter.count
 
                             # check if we need to recreate workers
@@ -350,11 +372,54 @@ class ProcessVideo:
             )
         return video_info
 
-class ResponseHeaders:
-    def __init__(self):
-        self.headers = {}
 
-    def header_function(self, header_line):
+class PyCurlResponse:
+    status_code: int
+    headers: dict
+    content: bytes
+    text: str
+
+class PyCurlClient:
+    def __init__(self, network_interface=None):
+        self.c = pycurl.Curl()
+        self.response_headers = {}
+        self.network_interface = network_interface
+
+    def get(self, url, headers={}):
+        buffer = io.BytesIO()
+        self.c.setopt(pycurl.URL, url)
+        self.c.setopt(pycurl.HTTPHEADER, [f"{key}: {value}" for key, value in headers.items()])
+        self.c.setopt(pycurl.TIMEOUT, 10)
+        self.c.setopt(pycurl.WRITEFUNCTION, buffer.write)
+        self.c.setopt(pycurl.HEADERFUNCTION, self._header_function)
+        self.c.setopt(pycurl.CAINFO, certifi.where())
+        self.c.setopt(pycurl.IPRESOLVE, pycurl.IPRESOLVE_V4)
+        if self.network_interface:
+            self.c.setopt(pycurl.INTERFACE, self.network_interface)
+        
+        self.c.perform()
+
+        resp = PyCurlResponse()
+        resp.status_code = self.c.getinfo(pycurl.HTTP_CODE)
+
+        # Json response
+        resp_bytes = buffer.getvalue()
+
+        if 'content-encoding' in self.response_headers:
+            if self.response_headers['content-encoding'] == 'br':
+                resp.content = brotli.decompress(resp_bytes)
+            else:
+                raise NotImplementedError("Unknown content encoding")
+        else:
+            resp.content = resp_bytes
+
+        resp.text = resp.content.decode('utf-8')
+
+        buffer.close()
+
+        return resp
+
+    def _header_function(self, header_line):
         header_line = header_line.decode('iso-8859-1')
 
         if ':' not in header_line:
@@ -367,39 +432,27 @@ class ResponseHeaders:
 
         name = name.lower()
 
-        self.headers[name] = value
+        self.response_headers[name] = value
 
-def get_video(video_id, c):
+    def close(self):
+        self.c.close()
+
+
+def get_video(video_id, network_interface):
     url = f"https://www.tiktok.com/@/video/{video_id}"
     headers = get_headers()
     
-    buffer = io.BytesIO()
-    response_headers = ResponseHeaders()
-    c.setopt(pycurl.URL, url)
-    c.setopt(pycurl.HTTPHEADER, [f"{key}: {value}" for key, value in headers.items()])
-    c.setopt(pycurl.TIMEOUT, 10)
-    c.setopt(pycurl.WRITEFUNCTION, buffer.write)
-    c.setopt(pycurl.HEADERFUNCTION, response_headers.header_function)
-    c.setopt(pycurl.CAINFO, certifi.where())
-        
-    c.perform()
+    client = PyCurlClient(network_interface=network_interface)
+    resp = client.get(url, headers=headers)
+    client.close()
 
-    status_code = c.getinfo(pycurl.HTTP_CODE)
-    if status_code != 0:
-        raise InvalidResponseException(f"Status code: {status_code}")
+    if resp.status_code >= 300:
+        raise InvalidResponseException(f"Status code: {resp.status_code}")
 
-    # Json response
-    resp_bytes = buffer.getvalue()
-
-    if response_headers.headers['content-encoding'] == 'br':
-        resp = brotli.decompress(resp_bytes).decode()
-    else:
-        raise InvalidResponseException("Content encoding not supported")
-
-    buffer.close()
+    resp_html = resp.text
 
     video_processor = ProcessVideo()
-    video_processor.process_chunk(resp)
+    video_processor.process_chunk(resp_html)
     return video_processor.process_response()
 
 class DaskFunc:
@@ -431,32 +484,27 @@ class BatchNetworkInterfaceFunc:
         self.task_nthreads = task_nthreads
 
     def __call__(self, batch_args):
-        curl_session = pycurl.Curl()
-        curl_session.setopt(pycurl.INTERFACE, self.network_interface)
-        try:
-            results = thread_map(batch_args, itertools.repeat(curl_session), function=self.func, num_workers=self.task_nthreads)
-            return results
-        finally:
-            curl_session.close()
+        return thread_map(batch_args, itertools.repeat(self.network_interface), function=self.func, num_workers=self.task_nthreads)
         
 class MultiNetworkInterfaceFunc:
     def __init__(self, func, network_interfaces=[], ratios=[], task_nthreads=1):
         assert len(network_interfaces) == len(ratios), "Number of network interfaces must match number of ratios"
+        assert len(network_interfaces) > 0, "Must have at least one network interface"
         self.func = func
         self.task_nthreads = task_nthreads
-        self.network_interface_funcs = [
-            BatchNetworkInterfaceFunc(func, network_interface=interface, task_nthreads=task_nthreads) for interface in network_interfaces
-        ]
+        self.network_interfaces = network_interfaces
         self.ratios = ratios
 
     def __call__(self, batch_args):
-        executor = ThreadPoolExecutor(max_workers=len(self.network_interface_funcs))
+        executor = ThreadPoolExecutor(max_workers=len(self.network_interfaces))
         all_func_args = []
         for i in range(len(self.ratios)):
             all_func_args.append(batch_args[int(i * len(batch_args) * self.ratios[i]):int((i + 1) * len(batch_args) * self.ratios[i])])
         
         futures = []
-        for network_interface_func, func_args in zip(self.network_interface_funcs, all_func_args):
+        for network_interface, ratio, func_args in zip(self.network_interfaces, self.ratios, all_func_args):
+            func_nthreads = int(self.task_nthreads * ratio)
+            network_interface_func = BatchNetworkInterfaceFunc(self.func, network_interface=network_interface, task_nthreads=func_nthreads)
             future = executor.submit(network_interface_func, func_args)
             futures.append(future)
 
@@ -565,6 +613,7 @@ async def get_random_sample(
     dataset = TaskDataset(potential_video_ids)
 
     if method == 'async':
+        raise NotImplementedError("Async method not implemented")
         dataset = await async_map(async_get_video, dataset, num_workers=num_workers)
     elif method == 'dask':
         dataset = await dask_map(
@@ -652,7 +701,7 @@ async def run_random_sample():
     batch_size = 20000
     task_batch_size = 50
     task_nthreads = 8
-    task_timeout = 20
+    task_timeout = 60
     worker_cpu = 256
     worker_mem = 512
     cluster_type = 'raspi'
@@ -702,21 +751,24 @@ async def run_random_sample():
             method
         )
 
-def get_ip(_, client: httpx.Client):
-    return client.get('https://ifconfig.me/ip').content.decode('utf-8')
+def get_ip(_, network_interface):
+    client = PyCurlClient(network_interface=network_interface)
+    resp = client.get('https://ifconfig.me/ip').content.decode('utf-8')
+    client.close()
+    return resp
 
 async def run_get_ips():
     results = await dask_map(
         get_ip, 
         TaskDataset(range(200)), 
-        reqs_per_ip=2, 
+        reqs_per_ip=200, 
         batch_size=200,
         task_batch_size=5,
         task_timeout=10,
-        task_nthreads=1,
+        task_nthreads=5,
         cluster_type='raspi'
     )
-    ips = [r.result['res'] for r in results if r.result is not None]
+    ips = [r.result['res'] for r in results.tasks if r.result is not None]
     print(collections.Counter(ips))
     print(f"Num unique IPs: {len(set(ips))}")
     

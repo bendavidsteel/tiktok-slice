@@ -1,14 +1,9 @@
 import asyncio
 import json
-import multiprocessing
 import os
 
 import requests
 import tqdm
-
-from pytok.tiktok import PyTok
-import pytok.exceptions
-from TikTokApi import TikTokApi
 
 from get_random_sample import get_headers, ProcessVideo
 from map_funcs import process_amap
@@ -42,7 +37,7 @@ def get_ids_to_get_bytes(data_dir_path, bytes_dir_path):
 async def main():
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
     data_dir_path = os.path.join(this_dir_path, "..", "data")
-    bytes_dir_path = os.path.join('/', 'media', 'elements_harddrive', 'repos', 'what-for-where', 'data', 'bytes')
+    bytes_dir_path = os.path.join('/', 'media', 'bsteel', 'Elements', 'repos', 'what-for-where', 'data', 'bytes')
     if not os.path.exists(bytes_dir_path):
         os.makedirs(bytes_dir_path)
     videos = get_ids_to_get_bytes(data_dir_path, bytes_dir_path)
