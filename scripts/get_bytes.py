@@ -55,7 +55,7 @@ async def main():
                 headers = get_headers()
                 
                 info_res = requests.get(url, headers=headers)
-                video_processor = ProcessVideo(info_res)
+                video_processor = ProcessVideo()
                 text_chunk = info_res.text
                 do = video_processor.process_chunk(text_chunk)
 
