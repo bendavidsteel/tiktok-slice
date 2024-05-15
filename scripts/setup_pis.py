@@ -282,26 +282,26 @@ async def scan_for_pis(possible_usernames, ignore_hosts=[], progress_bar=False, 
     ip_cidrs = ['10.157.115.0/24', '10.162.42.0/23']
     all_reports = []
     for ip_cidr in ip_cidrs:
-        r = subprocess.run(f'nmap {ip_cidr}', shell=True, capture_output=True)
+        r = subprocess.run(f'nmap -p 22 --open -n {ip_cidr}', shell=True, capture_output=True)
 
         if r.returncode != 0:
             raise subprocess.CalledProcessError(r.returncode, 'nmap', r.stderr)
 
         stdout = r.stdout.decode()
-        lines = stdout.split('\n')
-        result_lines = lines[1:-2]
-        i = 0
+        result_lines = stdout.split('\n')
         
-        report = []
-        while i < len(result_lines):
-            if result_lines[i] == '':
-                all_reports.append(report)
+        report = None
+        for i in range(len(result_lines)):
+            if 'Nmap scan report' in result_lines[i]:
+                if report:
+                    all_reports.append(report)
                 report = []
-            else:
                 report.append(result_lines[i])
-            i += 1
+            elif result_lines[i] != '':
+                if report:
+                    report.append(result_lines[i])
 
-    concurrent = True
+    concurrent = False
 
     if concurrent:
         async def run_test_connect(report):
@@ -320,15 +320,14 @@ async def scan_for_pis(possible_usernames, ignore_hosts=[], progress_bar=False, 
                     break
 
             if '22/tcp' in open_ports:
-                for username in possible_usernames:
+                async def test_username(username):
                     try:
                         await asyncio.wait_for(asyncssh.connect(ip, username=username, password=password, known_hosts=None), timeout=10)
                     except Exception as e:
-                        continue
+                        return None, None
                     else:
                         return ip, username
-                else:
-                    return None, None
+                results = await async_amap(test_username, possible_usernames, num_workers=2, progress_bar=False)
             else:
                 return None, None
             
