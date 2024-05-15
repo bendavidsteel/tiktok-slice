@@ -1,14 +1,9 @@
 import asyncio
 import json
-import multiprocessing
 import os
 
 import requests
 import tqdm
-
-from pytok.tiktok import PyTok
-import pytok.exceptions
-from TikTokApi import TikTokApi
 
 from get_random_sample import get_headers, ProcessVideo
 from map_funcs import process_amap
