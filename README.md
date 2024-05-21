@@ -13,3 +13,6 @@ Vary by content type (video, comment, user etc.)
 
 ### Last 2 bits (62-63)
 Vary by location of video creation, perhaps associated with a database shard?
+
+# Rate Limiting
+https://smudge.ai/blog/ratelimit-algorithms
