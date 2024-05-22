@@ -1,19 +1,33 @@
 import asyncio
-import os
 
-from setup_pis import scan_for_pis
+import dotenv
+
+from setup_pis import get_hosts_with_retries
 
 async def main():
+    dotenv.load_dotenv()
+
     possible_usernames = [
-        'hoare', 'tarjan', 'miacli', 'fred', 'geoffrey', 'rivest', 'edmund',
-        'frances', 'ivan', 'milner', 'cook', 'lee', 'barbara', 'goldwasser', 'hemming',
-        'floyd', 'turing', 'marvin', 'juris', 'edsger',
-        'conway', 'fernando', 'edward', 'edwin', 'satoshi', 'buterin', 'lovelace', 'putnam', 'beauvoir',
-        'arendt', 'mordvintsev', 'chan', 'sutskever', 'neumann'
-        # 'bsteel'
+        # most reliable batch
+        'hoare', 'tarjan', 'miacli', 'fred',
+        'geoffrey', 'rivest', 'edmund', 'ivan',
+        'cook', 'barbara', 'goldwasser', 'milner',
+        'hemming', 'frances', 'lee', 'turing',
+        'marvin', 'juris', 'floyd', 'edsger',
+        'neumann', 'beauvoir', 'satoshi', 'putnam', 
+        'fernando', 'edwin'
+        # next most reliable
+        # 'conway', 'edward',
+        # 'buterin', 'lovelace',
+        # 'arendt', 'chan', 'sutskever',
+        # 'herbert',
+        # 'mordvintsev'
+        # not setup yet
+        "shannon", "chowning", "tegmark", "hanson"
+        "chomsky", "keynes"
     ]
     
-    hosts, usernames = await scan_for_pis(possible_usernames, progress_bar=True, password='3141')
+    hosts, usernames = await get_hosts_with_retries(possible_usernames, 2, progress_bar=True)
 
     hosts_users = {host: user for host, user in zip(hosts, usernames)}
     print(hosts_users)
