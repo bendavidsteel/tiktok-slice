@@ -14,17 +14,14 @@ import brotli
 import certifi
 from dask.distributed import Client as DaskClient
 from dask.distributed import LocalCluster as DaskLocalCluster
-from dask.distributed import SpecCluster as DaskSpecCluster
-from dask.distributed import SSHCluster as DaskSSHCluster
 from dask.distributed import as_completed as dask_as_completed
-from distributed.scheduler import Scheduler as DaskScheduler
-from distributed.deploy.ssh import Worker as DaskSSHWorker
 from dask_cloudprovider.aws import FargateCluster as DaskFargateCluster
 import dotenv
 import pycurl
 from tqdm import tqdm
 from tqdm.asyncio import tqdm as atqdm
 
+from dask_extensions import UnreliableSSHCluster
 from map_funcs import _amap
 from setup_pis import change_mac_addresses, get_hosts_with_retries, start_wifi_connections, reboot_workers, stop_stale_workers
 
@@ -98,16 +95,19 @@ class DaskCluster:
             self.cluster = DaskLocalCluster()
         elif self.cluster_type == 'raspi':
             potential_usernames = [
+                # most reliable batch
                 'hoare', 'tarjan', 'miacli', 'fred',
                 'geoffrey', 'rivest', 'edmund', 'ivan',
                 'cook', 'barbara', 'goldwasser', 'milner',
                 'hemming', 'frances', 'lee', 'turing',
-                # 'floyd', 'juris', 'marvin', 'edsger',
-                # 'conway', 'fernando', 'edward', 'edwin', 
-                # 'satoshi', 'buterin', 'lovelace', 'neumann',
-                # 'putnam', 'beauvoir',
-                # 'arendt', 'herbert', 
-                # 'mordvintsev', 'chan', 'sutskever', # raspberry pi 3s
+                'marvin', 'juris', 'floyd', 'edsger',
+                'neumann', 'beauvoir', 'satoshi', 'putnam', 
+                'fernando', 'edwin', 'shannon', 'chowning', 
+                'tegmark', 'hanson', 'chomsky', 'keynes',
+                # next most reliable
+                # 'conway', 'edward', 'buterin', 'lovelace',
+                # 'arendt', 'chan', 'sutskever', 'herbert',
+                # 'mordvintsev'
             ]
             print("Finding hosts...")
             raspi_password = os.environ['RASPI_PASSWORD']
@@ -131,21 +131,24 @@ class DaskCluster:
             while num_tries < max_tries:
                 num_tries += 1
                 try:
-                    self.cluster = await asyncio.wait_for(DaskSSHCluster(
+                    # TODO use the task stream plot at the cluster status page to diagnose issues
+                    self.cluster = await asyncio.wait_for(UnreliableSSHCluster(
                         all_hosts,
                         connect_options=all_connect_options,
                         worker_options={ 'nthreads': self.worker_nthreads },
                         remote_python=remote_python,
                         asynchronous=True
                     ), timeout=120)
-                except asyncio.TimeoutError:
+                except asyncio.TimeoutError as ex:
                     # reboot workers to get rid of stale connections
-                    _, connect_options = await reboot_workers(hosts, connect_options, timeout=max_latency)
-                    potential_usernames = [co['username'] for co in connect_options]
-                    hosts, usernames = await get_hosts_with_retries(potential_usernames, max_tries=2, progress_bar=True, timeout=max_latency)
-                    connect_options = [dict(username=un, password=raspi_password, known_hosts=None) for un in usernames]
+                    # _, connect_options = await reboot_workers(hosts, connect_options, timeout=max_latency)
+                    # potential_usernames = [co['username'] for co in connect_options]
+                    # hosts, usernames = await get_hosts_with_retries(potential_usernames, max_tries=2, progress_bar=True, timeout=max_latency)
+                    # connect_options = [dict(username=un, password=raspi_password, known_hosts=None) for un in usernames]
+                    print("Timed out creating cluster, trying again...")
                 except asyncssh.misc.ChannelOpenError:
                     pass # simply retry
+                    print("Channel open error, trying again...")
                 else:
                     break
             else:
@@ -502,6 +505,7 @@ class MultiNetworkInterfaceFunc:
             all_func_args.append(batch_args[int(i * len(batch_args) * self.ratios[i]):int((i + 1) * len(batch_args) * self.ratios[i])])
         
         futures = []
+        # TODO add httpx option back for network interface that doesn't need it
         for network_interface, ratio, func_args in zip(self.network_interfaces, self.ratios, all_func_args):
             func_nthreads = int(self.task_nthreads * ratio)
             network_interface_func = BatchNetworkInterfaceFunc(self.func, network_interface=network_interface, task_nthreads=func_nthreads)
