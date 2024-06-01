@@ -16,3 +16,5 @@ Vary by location of video creation, perhaps associated with a database shard?
 
 # Rate Limiting
 https://smudge.ai/blog/ratelimit-algorithms
+
+https://github.com/SergioMEV/slurm-for-dummies

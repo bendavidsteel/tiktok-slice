@@ -319,6 +319,7 @@ class RestartClusterException(Exception):
 
 
 def get_headers():
+    # TODO randomize headers
     headers = {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Encoding': 'gzip, deflate, br',
@@ -496,6 +497,7 @@ class MultiNetworkInterfaceFunc:
         self.ratios = ratios
 
     def __call__(self, batch_args):
+        # TODO use httpx again for default interface
         executor = ThreadPoolExecutor(max_workers=len(self.network_interfaces))
         all_func_args = []
         for i in range(len(self.ratios)):
