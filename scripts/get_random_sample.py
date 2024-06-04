@@ -22,6 +22,8 @@ from distributed.deploy.ssh import Worker as DaskSSHWorker
 from dask_cloudprovider.aws import FargateCluster as DaskFargateCluster
 import dotenv
 import pycurl
+from random_user_agent import user_agent as rug_user_agent
+from random_user_agent import params as rug_params
 from tqdm import tqdm
 from tqdm.asyncio import tqdm as atqdm
 
@@ -96,7 +98,7 @@ class DaskCluster:
             )
         elif self.cluster_type == 'local':
             self.cluster = DaskLocalCluster()
-        elif self.cluster_type == 'raspi':
+        elif self.cluster_type == 'ssh':
             potential_usernames = [
                 'hoare', 'tarjan', 'miacli', 'fred',
                 'geoffrey', 'rivest', 'edmund', 'ivan',
@@ -319,7 +321,14 @@ class RestartClusterException(Exception):
 
 
 def get_headers():
-    # TODO randomize headers
+    software_names = [rug_params.SoftwareName.CHROME.value, rug_params.SoftwareName.FIREFOX.value]
+    operating_systems = [rug_params.OperatingSystem.WINDOWS.value, rug_params.OperatingSystem.ANDROID.value, rug_params.OperatingSystem.IOS.value, rug_params.OperatingSystem.MAC_OS_X.value]   
+    
+    user_agent_rotator = rug_user_agent.UserAgent(software_names=software_names, operating_systems=operating_systems, limit=100)
+
+    # Get Random User Agent String.
+    user_agent = user_agent_rotator.get_random_user_agent()
+    
     headers = {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Encoding': 'gzip, deflate, br',
@@ -327,7 +336,7 @@ def get_headers():
         'Sec-Fetch-Dest': 'document',
         'Sec-Fetch-Mode': 'navigate',
         'Sec-Fetch-Site': 'none',
-        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15'
+        'User-Agent': user_agent #'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15'
     }
     return headers
 

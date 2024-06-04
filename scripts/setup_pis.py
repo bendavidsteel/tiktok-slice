@@ -142,6 +142,8 @@ async def ensure_wifi_connection(conn, connect_options, force_start=False):
     num_tries = 0
     max_tries = 3
     # TODO use google dns64 server to allow ipv6 connections
+    # https://developers.google.com/speed/public-dns/docs/using#linux
+    # https://developers.google.com/speed/public-dns/docs/dns64
     # test if we need password for sudo
     r = await conn.run("sudo -n true", check=False)
     if r.returncode == 1:
