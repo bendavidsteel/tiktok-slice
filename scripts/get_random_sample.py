@@ -393,30 +393,37 @@ class PyCurlResponse:
     text: str
 
 class PyCurlClient:
-    def __init__(self, network_interface=None):
+    def __init__(self, share=None, network_interface=None):
         self.c = pycurl.Curl()
         self.response_headers = {}
         self.network_interface = network_interface
+        self.share = share
 
-    def get(self, url, headers={}):
-        buffer = io.BytesIO()
+    def _setup(self, url, headers):
+        self.buffer = io.BytesIO()
         self.c.setopt(pycurl.URL, url)
         self.c.setopt(pycurl.HTTPHEADER, [f"{key}: {value}" for key, value in headers.items()])
         self.c.setopt(pycurl.TIMEOUT, 10)
-        self.c.setopt(pycurl.WRITEFUNCTION, buffer.write)
+        self.c.setopt(pycurl.WRITEFUNCTION, self.buffer.write)
         self.c.setopt(pycurl.HEADERFUNCTION, self._header_function)
         self.c.setopt(pycurl.CAINFO, certifi.where())
         self.c.setopt(pycurl.IPRESOLVE, pycurl.IPRESOLVE_V4)
         if self.network_interface:
             self.c.setopt(pycurl.INTERFACE, self.network_interface)
-        
+        if self.share:
+            self.c.setopt(pycurl.SHARE, self.share)
+    
+    def get(self, url, headers={}):
+        self._setup(url, headers)
         self.c.perform()
+        return self._get_response()
 
+    def _get_response(self):
         resp = PyCurlResponse()
         resp.status_code = self.c.getinfo(pycurl.HTTP_CODE)
 
         # Json response
-        resp_bytes = buffer.getvalue()
+        resp_bytes = self.buffer.getvalue()
 
         if 'content-encoding' in self.response_headers:
             if self.response_headers['content-encoding'] == 'br':
@@ -428,7 +435,7 @@ class PyCurlClient:
 
         resp.text = resp.content.decode('utf-8')
 
-        buffer.close()
+        self.buffer.close()
 
         return resp
 
