@@ -16,7 +16,9 @@ from dask.distributed import Client as DaskClient
 from dask.distributed import LocalCluster as DaskLocalCluster
 from dask.distributed import as_completed as dask_as_completed
 from dask_cloudprovider.aws import FargateCluster as DaskFargateCluster
+from dask_jobqueue import SLURMCluster as DaskSLURMCluster
 import dotenv
+import pandas as pd
 import pycurl
 from tqdm import tqdm
 from tqdm.asyncio import tqdm as atqdm
@@ -72,6 +74,30 @@ class DaskCluster:
         self.worker_mem = worker_mem
 
     async def __aenter__(self):
+        remote_python='~/ben/tiktok/venv/bin/python'
+        potential_usernames = [
+            # most reliable batch
+            'hoare', 'miacli', 'fred', 'frances',
+            'geoffrey', 'edmund', 'marvin', 'barbara',
+            'cook', 'goldwasser', 'milner', 'conway',
+            'hemming', 'lee',
+            'juris', 'floyd', 'lovelace', 'edwin',
+            'neumann', 'beauvoir', 'satoshi', 'putnam', 
+            'shannon', 'chowning',
+            'tegmark', 'hanson', 'chomsky', 'keynes',
+            # next most reliable
+            'edward', 'buterin',
+            'arendt', 'chan', 'sutskever', 'herbert',
+            'mordvintsev',
+            # to set up
+            # , 'edsger', 'fernando', 'rivest', 'tarjan', 'turing',
+            # unreliable
+            # 'ivan'
+        ]
+        raspi_password = os.environ['RASPI_PASSWORD']
+
+        max_latency = 5
+
         if self.cluster_type == 'fargate':
             self.cluster = DaskFargateCluster(
                 fargate_spot=True,
@@ -93,27 +119,8 @@ class DaskCluster:
             )
         elif self.cluster_type == 'local':
             self.cluster = DaskLocalCluster()
-        elif self.cluster_type == 'raspi':
-            potential_usernames = [
-                # most reliable batch
-                'hoare', 'tarjan', 'miacli', 'fred',
-                'geoffrey', 'rivest', 'edmund', 'ivan',
-                'cook', 'barbara', 'goldwasser', 'milner',
-                'hemming', 'frances', 'lee', 'turing',
-                'marvin', 'juris', 'floyd', 'edsger',
-                'neumann', 'beauvoir', 'satoshi', 'putnam', 
-                'fernando', 'edwin', 'shannon', 'chowning', 
-                'tegmark', 'hanson', 'chomsky', 'keynes',
-                # next most reliable
-                # 'conway', 'edward', 'buterin', 'lovelace',
-                # 'arendt', 'chan', 'sutskever', 'herbert',
-                # 'mordvintsev'
-            ]
+        elif self.cluster_type == 'ssh':
             print("Finding hosts...")
-            raspi_password = os.environ['RASPI_PASSWORD']
-            scheduler_password = os.environ['SCHEDULER_PASSWORD']
-
-            max_latency = 5
             hosts, usernames = await get_hosts_with_retries(potential_usernames, max_tries=2, progress_bar=True, timeout=max_latency)
             connect_options = [dict(username=un, password=raspi_password, known_hosts=None) for un in usernames]
             
@@ -121,9 +128,8 @@ class DaskCluster:
             print("Starting wifi connections...")
             hosts, connect_options = await start_wifi_connections(hosts, connect_options, progress_bar=True, timeout=max_latency)
 
-            remote_python='~/ben/tiktok/venv/bin/python'
-
             # append client/scheduler
+            scheduler_password = os.environ['SCHEDULER_PASSWORD']
             all_hosts = ['localhost'] + hosts
             all_connect_options = [dict(username='bsteel', password=scheduler_password)] + connect_options
             max_tries = 3
@@ -153,6 +159,28 @@ class DaskCluster:
                     break
             else:
                 raise asyncio.TimeoutError("Timed out creating cluster...")
+        elif self.cluster_type == 'slurm':
+            # TODO could run this via slurm
+            max_latency = 5
+            hosts, usernames = await get_hosts_with_retries(potential_usernames, max_tries=2, progress_bar=True, timeout=max_latency)
+            connect_options = [dict(username=un, password=raspi_password, known_hosts=None) for un in usernames]
+            
+            await start_wifi_connections(hosts, connect_options, progress_bar=True, timeout=max_latency)
+            self.cluster = DaskSLURMCluster(
+                queue='debug',
+                account='slurmuser',
+                cores=4,
+                memory=3793,
+                walltime='00:30:00',
+                python=remote_python,
+                # job_extra_directives=['--uid=slurmuser'],  # Ensure tasks run as slurmuser
+                # job_script_prologue=[
+                #     'export SLURM_ACCOUNT=slurmuser'  # Export SLURM account environment variable
+                # ],
+                asynchronous=True
+            )
+            # TODO ensure this gives us max workers
+            await self.cluster.scale(10)
 
         return self.cluster
     
@@ -252,6 +280,8 @@ async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_si
                             # start the timeout timer
                             total_time = len(batch_tasks) * task_timeout
                             num_actual_workers = len(cluster.workers)
+                            if num_actual_workers == 0:
+                                num_actual_workers = 1
                             timeout = total_time / (num_actual_workers * task_nthreads)
 
                             # send out the tasks
@@ -456,6 +486,7 @@ def get_video(video_id, network_interface):
 
     video_processor = ProcessVideo()
     video_processor.process_chunk(resp_html)
+    # TODO get resolved user
     return video_processor.process_response()
 
 class DaskFunc:
@@ -643,26 +674,6 @@ async def get_random_sample(
         raise ValueError("No valid results")
     print(f"Fraction hits: {num_hits / num_valid}")
     print(f"Fraction valid: {num_valid / len(potential_video_ids)}")
-    # convert to jsonable format
-    json_results = [
-        {
-            'args': r.args, 
-            'exceptions': [{
-                    'exception': str(e['exception']),
-                    'pre_time': e['pre_time'].isoformat() if e['pre_time'] else None,
-                    'post_time': e['post_time'].isoformat()
-                }
-                for e in r.exceptions
-            ], 
-            'result': {
-                'return': r.result['res'] if r.result is not None else None,
-                'pre_time': r.result['pre_time'].isoformat() if r.result is not None else None,
-                'post_time': r.result['post_time'].isoformat() if r.result is not None else None
-            },
-            'completed': r.completed
-        }
-        for r in results
-    ]
 
     results_dir_path = os.path.join(this_dir_path, '..', 'data', 'results', 'hours', str(start_time.hour), str(start_time.minute), str(start_time.second))
     os.makedirs(results_dir_path, exist_ok=True)
@@ -691,8 +702,32 @@ async def get_random_sample(
     with open(os.path.join(results_dir_path, new_result_dir, 'parameters.json'), 'w') as f:
         json.dump(params, f)
 
-    with open(os.path.join(results_dir_path, new_result_dir, 'results.json'), 'w') as f:
-        json.dump(json_results, f)
+    try:
+        df = pd.DataFrame(results)
+        df.to_parquet(os.path.join(results_dir_path, new_result_dir, 'results.parquet.gzip'), compression='gzip')
+    except Exception as e:
+        # convert to jsonable format
+        json_results = [
+            {
+                'args': r.args, 
+                'exceptions': [{
+                        'exception': str(e['exception']),
+                        'pre_time': e['pre_time'].isoformat() if e['pre_time'] else None,
+                        'post_time': e['post_time'].isoformat()
+                    }
+                    for e in r.exceptions
+                ], 
+                'result': {
+                    'return': r.result['res'] if r.result is not None else None,
+                    'pre_time': r.result['pre_time'].isoformat() if r.result is not None else None,
+                    'post_time': r.result['post_time'].isoformat() if r.result is not None else None
+                },
+                'completed': r.completed
+            }
+            for r in results
+        ]
+        with open(os.path.join(results_dir_path, new_result_dir, 'results.json'), 'w') as f:
+            json.dump(json_results, f)
 
 async def run_random_sample():
     generation_strategy = 'all'
@@ -704,11 +739,11 @@ async def run_random_sample():
     reqs_per_ip = 400
     batch_size = 20000
     task_batch_size = 50
-    task_nthreads = 8
+    task_nthreads = 5
     task_timeout = 60
     worker_cpu = 256
     worker_mem = 512
-    cluster_type = 'raspi'
+    cluster_type = 'ssh'
     method = 'dask'
     if (num_time > 1 and time_unit == 's') or (time_unit == 'm') or (time_unit == 'h'):
         if time_unit == 's':
@@ -770,7 +805,7 @@ async def run_get_ips():
         task_batch_size=5,
         task_timeout=10,
         task_nthreads=5,
-        cluster_type='raspi'
+        cluster_type='slurm'
     )
     ips = [r.result['res'] for r in results.tasks if r.result is not None]
     print(collections.Counter(ips))
