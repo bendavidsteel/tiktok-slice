@@ -1,6 +1,7 @@
 dask==2024.3.1
 distributed==2024.3.1
 dask-cloudprovider[aws]
+dask-jobqueue
 httpx
 brotlipy==0.7.0
 tqdm

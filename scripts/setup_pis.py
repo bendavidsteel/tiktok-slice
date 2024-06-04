@@ -15,57 +15,136 @@ from map_funcs import async_amap
 
 async def setup_pi(conn, connect_options, reqs='', ip_host_map={}, munge_key_path=None):
 
+    r = await conn.run('pwd', check=True)
+    if r.stdout.strip() != f'/home/{connect_options["username"]}':
+        raise Exception(f"Need to reset this pi: {r.stdout}")
+
     r = await conn.run('sudo apt update', check=True)
-    r = await conn.run('sudo apt upgrade -y', check=True)
-    r = await conn.run('sudo apt list', check=True)
+    if r.returncode != 0:
+        if "you must manually run 'sudo dpkg --configure -a' to correct the problem" in r.stderr:
+            r = await conn.run('sudo dpkg --configure -a', check=True)
+            r = await conn.run('sudo apt upgrade -y', check=True)
+        elif "Try 'apt --fix-broken install' with no packages" in r.stderr:
+            r = await conn.run('sudo apt --fix-broken install', check=True)
+            r = await conn.run('sudo apt upgrade -y', check=True)
+        else:
+            print(f"Failed to upgrade: {r.stderr}")
+
+    r = await conn.run('sudo apt list --installed', check=True)
     packages = r.stdout.split('\n')
 
-    to_remove_packages = ['xserver*', 'lightdm*', 'raspberrypi-ui-mods', 'vlc*', 'lxde*', 'chromium*', 'desktop*', 'gnome*', 'gstreamer*', 'gtk*', 'hicolor-icon-theme*', 'lx*', 'mesa*']
-    if any(any(to_remove_package.strip('*') in package for package in packages) for to_remove_package in to_remove_packages):
-        # downsize to raspios lite
-        r = await conn.run(f"sudo apt purge -y {' '.join(to_remove_packages)}", check=True)
-        r = await conn.run("sudo apt autoremove -y", check=True)
-
     # install required packages
-    apt_reqs = ['libcurl4-openssl-dev', 'libssl-dev', 'slurm-wlm']
-    if not all(apt_req in packages for apt_req in apt_reqs):
-        r = await conn.run(f"sudo apt install -y {' '.join(apt_reqs)}", check=True)
+    apt_reqs = ['libcurl4-openssl-dev', 'libssl-dev', 'slurm-wlm', 'libpmix-dev', 'munge', 'libmunge2', 'libmunge-dev', 'cgroup-tools']
+    reqs_to_install = [r for r in apt_reqs if not any(r in p for p in packages)]
+    if reqs_to_install:
+        r = await conn.run(f"sudo apt install -y {' '.join(reqs_to_install)}", check=False)
+        if "Try 'apt --fix-broken install' with no packages" in r.stderr:
+            r = await conn.run('sudo apt --fix-broken install', check=True)
+            r = await conn.run(f"sudo apt install -y {' '.join(reqs_to_install)}", check=True)
 
-    munge_reqs = ['munge', 'libmunge2', 'libmunge-dev']
-    if not all(munge_req in packages for munge_req in munge_reqs):
-        # check munge is running
-        r = await conn.run('munge -n | unmunge | grep STATUS', check=False)
-        if r.returncode != 0:
-            raise Exception("Munge is not running")
+    munge_info_r = await conn.run('id munge', check=False)
+    if r.returncode != 0:
+        await conn.run('sudo apt install -y munge libmunge2 libmunge-dev', check=True)
+        munge_info_r = await conn.run('id munge', check=True)
+
+    munge_key_worker_path = '/etc/munge/munge.key'
+    r = await conn.run(f'sudo ls -lh {munge_key_worker_path}')
+    if r.returncode != 0 or 'munge 0' in r.stdout: # munge key doesn't exist or is empty
+        temp_path = '~/munge.key'
+        munge_key_host_path = './config/munge.key'
+        await asyncssh.scp(munge_key_host_path, (conn, temp_path))
+        try:
+            await conn.run(f'sudo mv {temp_path} {munge_key_worker_path}', check=True)
+        except asyncssh.process.ProcessError as e:
+            if 'No such file or directory' in e.stderr:
+                await conn.run('sudo mkdir -p /etc/munge', check=True)
+                await conn.run(f'sudo mv {temp_path} {munge_key_worker_path}', check=True)
+
+    r = await conn.run(f'sudo ls -lh {munge_key_worker_path}')
+    if '-rw-------' not in r.stdout or 'munge munge' not in r.stdout:
+        await conn.run(f'sudo chown munge:munge {munge_key_worker_path}', check=True)
+        await conn.run(f'sudo chmod 600 {munge_key_worker_path}', check=True)
+        await conn.run('sudo systemctl restart munge', check=True)
+
+    # check munge is running
+    r = await conn.run('munge -n | unmunge | grep STATUS', check=False)
+    if r.returncode != 0:
+        raise Exception("Munge is not running")
         
-        assert munge_key_path, "Munge key path not provided"
-        await asyncssh.scp(munge_key_path, (conn, munge_key_path))
-        
-        # set correct munge permissions
-        r = await conn.run('sudo chown -R munge: /etc/munge/ /var/log/munge/ /var/lib/munge/ /run/munge/', check=True)
-        r = await conn.run('sudo chmod 0700 /etc/munge/ /var/log/munge/ /var/lib/munge/', check=True)
-        r = await conn.run('sudo chmod 0755 /run/munge/', check=True)
-        r = await conn.run('sudo chmod 0700 /etc/munge/munge.key', check=True)
-        r = await conn.run('sudo chown -R munge: /etc/munge/munge.key', check=True)
+    # set correct munge permissions
+    r = await conn.run('sudo chown -R munge: /etc/munge/ /var/log/munge/ /var/lib/munge/ /run/munge/', check=True)
+    r = await conn.run('sudo chmod 0700 /etc/munge/ /var/log/munge/ /var/lib/munge/', check=True)
+    r = await conn.run('sudo chmod 0755 /run/munge/', check=True)
+    r = await conn.run('sudo chmod 0700 /etc/munge/munge.key', check=True)
+    r = await conn.run('sudo chown -R munge: /etc/munge/munge.key', check=True)
 
-        r = await conn.run('sudo systemctl enable munge', check=True)
-        r = await conn.run('sudo systemctl restart munge', check=True)
+    # r = await conn.run('sudo systemctl enable munge', check=True)
+    # r = await conn.run('sudo systemctl restart munge', check=True)
 
-        await asyncssh.scp('/etc/slurm/slurm.conf', (conn, '/etc/slurm/slurm.conf'))
-        await conn.run('sudo systemctl enable slurmctld', check=True)
-        await conn.run('sudo systemctl restart slurmctld', check=True)
+    slurm_conf_worker_path = '/etc/slurm/slurm.conf'
+    # r = await conn.run(f'sudo ls {slurm_conf_worker_path}', check=False)
+    # if r.returncode != 0:
+    slurm_conf_host_path = './config/slurm.conf'
+    temp_path = '~/slurm.conf'
+    await asyncssh.scp(slurm_conf_host_path, (conn, temp_path))
+    try:
+        await conn.run(f'sudo mv {temp_path} {slurm_conf_worker_path}', check=True)
+    except asyncssh.process.ProcessError as e:
+        if 'No such file or directory' in e.stderr:
+            await conn.run('sudo mkdir -p /etc/slurm', check=True)
+            await conn.run(f'sudo mv {temp_path} {slurm_conf_worker_path}', check=True)
+
+    r = await conn.run('hostname', check=True)
+    if r.stdout != connect_options['username']:
+        r = await conn.run(f'sudo hostnamectl set-hostname {connect_options["username"]}', check=True)
+
+    # make a bsteel user
+    user_b = await conn.run('id bsteel', check=False)
+    if user_b.returncode != 0:
+        r = await conn.run('sudo adduser --disabled-password --gecos "" -u 1001 bsteel', check=True)
 
     # make a new user with name slurm-user
-    r = await conn.run('id slurmuser', check=False)
+    user_r = await conn.run('id slurm', check=False)
+    if user_r.returncode != 0:
+        r = await conn.run('sudo adduser --disabled-password --gecos "" -u 64030 slurm', check=True)
+    elif 'uid=64030(slurm)' not in user_r.stdout:
+        r = await conn.run('sudo userdel slurm', check=True)
+        r = await conn.run('sudo adduser --disabled-password --gecos "" -u 64030 slurm', check=True)
+        await conn.run('sudo usermod -aG sudo slurm', check=True)
+
+    r = await conn.run('ls -lh /var/log/slurm', check=False)
     if r.returncode != 0:
-        r = await conn.run('sudo adduser slurmuser', check=True)
-        r = await conn.run('sudo usermod -aG sudo slurmuser', check=True)
+        await conn.run('sudo mkdir -p /var/log/slurm', check=True)
+        await conn.run('sudo chown -R slurm:slurm /var/log/slurm', check=True)
+        await conn.run('sudo chmod -R 755 /var/log/slurm', check=True)
+    elif 'slurm:slurm' not in r.stdout:
+        await conn.run('sudo chown -R slurm:slurm /var/log/slurm', check=True)
+        await conn.run('sudo chmod -R 755 /var/log/slurm', check=True)
 
     r = await conn.run('cat /etc/hosts', check=True)
     hosts_file = r.stdout
-    if any(ip_host_map[ip] not in hosts_file for ip in ip_host_map):
-        for ip, host in ip_host_map.items():
-            r = await conn.run(f"echo '{ip} {host}' | sudo tee -a /etc/hosts", check=True)
+
+    # Check and remove incorrect lines
+    for ip, host in ip_host_map.items():
+        for line in hosts_file.splitlines():
+            if host in line and line != f"{ip} {host}":
+                # Remove incorrect lines
+                await conn.run(f"sudo sed -i '/{line}/d' /etc/hosts", check=True)
+
+    # Get the updated /etc/hosts file
+    r = await conn.run('cat /etc/hosts', check=True)
+    hosts_file = r.stdout
+
+    # Add correct lines if they are not already present
+    for ip, host in ip_host_map.items():
+        if f"{ip} {host}" not in hosts_file:
+            await conn.run(f"echo '{ip} {host}' | sudo tee -a /etc/hosts", check=True)
+
+    # r = await conn.run('sudo systemctl enable slurmd', check=False)
+    if 'slurmd.service does not exist' in r.stderr:
+        await conn.run('sudo apt install -y slurm-wlm', check=True)
+        await conn.run('sudo systemctl enable slurmd', check=True)
+    await conn.run('sudo systemctl restart slurmd', check=True)
 
     # install python
     r = await conn.run('python3 --version', check=True)
@@ -80,22 +159,31 @@ async def setup_pi(conn, connect_options, reqs='', ip_host_map={}, munge_key_pat
         assert r.stdout.strip() == 'Python 3.10.12'
 
     # setup virtual environment
-    r = await conn.run('ls ~/ben/tiktok/venv', check=False)
-    if r.returncode != 0:
-        r = await conn.run('python3 -m venv ~/ben/tiktok/venv', check=True)
-    else:
-        r = await conn.run('~/ben/tiktok/venv/bin/python --version', check=False)
-        if r.stdout.strip() != 'Python 3.10.12':
-            r = await conn.run('rm -rf ~/ben/tiktok/venv', check=True)
-            r = await conn.run('python3 -m venv ~/ben/tiktok/venv', check=True)
+    for path in ['~/ben', '/home/bsteel']:
+        if '~' not in path:
+            prepend = 'sudo '
+        else:
+            prepend = ''
+        r = await conn.run(f'{prepend}ls {path}/tiktok/venv', check=False)
+        if r.returncode != 0:
+            r = await conn.run(f'{prepend}python3 -m venv {path}/tiktok/venv', check=True)
+        else:
+            r = await conn.run(f'{prepend}{path}/tiktok/venv/bin/python --version', check=False)
+            if r.stdout.strip() != 'Python 3.10.12':
+                r = await conn.run(f'{prepend}rm -rf {path}/tiktok/venv', check=True)
+                r = await conn.run(f'{prepend}python3 -m venv {path}/tiktok/venv', check=True)
 
-    # install requirements
-    r = await conn.run('~/ben/tiktok/venv/bin/pip list', check=True)
-    installed_packages = r.stdout.split('\n')
-    installed_packages = ['=='.join([e for e in p.split(' ') if e]) for p in installed_packages[2:-1]]
-    required_packages = reqs.split()
-    if any([req for req in required_packages if req not in installed_packages]):
-        r = await conn.run(f'~/ben/tiktok/venv/bin/pip install {reqs}', check=True)
+        # install requirements
+        r = await conn.run(f'{prepend}{path}/tiktok/venv/bin/pip list', check=True)
+        installed_packages = r.stdout.split('\n')
+        installed_packages = ['=='.join([e for e in p.split(' ') if e]) for p in installed_packages[2:-1]]
+        required_packages = reqs.split()
+        not_installed_packages = [req for req in required_packages if req not in installed_packages]
+        if not_installed_packages:
+            r = await conn.run(f"{prepend}{path}/tiktok/venv/bin/pip install {' '.join(not_installed_packages)}", check=True)
+
+        if '~' not in path:
+            r = await conn.run(f'sudo chown -R bsteel:bsteel {path}/tiktok', check=True)
 
 
 async def vpn_via_service(conn):
@@ -467,13 +555,13 @@ async def change_mac_address(conn, connect_options, interface='eth0'):
         r = await conn.run(f"sudo nmcli connection up eduroam", check=True)
 
 async def killall_python(conn):
-    try:
-        r = await conn.run('killall ~/ben/tiktok/venv/bin/python', check=True)
-    except Exception as e:
-        if hasattr(e, 'stderr') and 'no process found' in e.stderr:
+    r = await conn.run('killall ~/ben/tiktok/venv/bin/python', check=False)
+    if r.returncode != 0:
+        stderr = r.stderr
+        if 'no process found' in stderr:
             pass
         else:
-            print(f'Failed to stop: {e}')
+            print(f'Failed to stop on {conn._host}, {conn.get_extra_info("username")}: {stderr}')
 
 async def kill_workers(hosts, connect_options):
     async def run_killall(args):
@@ -562,7 +650,7 @@ async def change_mac_addresses(hosts, connect_options, progress_bar=False, **kwa
     args = list(zip(hosts, connect_options))
     await async_amap(run_change_mac_address, args, num_workers=len(hosts), progress_bar=progress_bar, pbar_desc="Changing MAC addresses...")
 
-async def run_on_pis(hosts, connect_options, func, **kwargs):
+async def run_on_pis(hosts, connect_options, func, timeout=2400, **kwargs):
     async def run_func(args):
         host, connect_option, func, kwargs = args
         print(f"Connecting to {host}, {connect_option['username']}...")
@@ -572,18 +660,20 @@ async def run_on_pis(hosts, connect_options, func, **kwargs):
         while tries < max_tries:
             tries += 1
             try:
-                conn = await asyncio.wait_for(asyncssh.connect(host, **connect_option, known_hosts=None), timeout=10)
+                connection_options = {'connect_timeout': '20s', 'keepalive_interval': '10s', 'keepalive_count_max': 10}
+                connection_options = asyncssh.SSHClientConnectionOptions(**connection_options)
+                conn = await asyncio.wait_for(asyncssh.connect(host, **connect_option, known_hosts=None, options=connection_options), timeout=20)
             except Exception as e:
-                print(f"Failed to connect to {host}, {connect_option['username']}: {e}")
-                continue
+                exceptions.append(e)
             else:
                 async with conn:
                     try:
-                        r = await asyncio.wait_for(func(conn, connect_option, **kwargs), timeout=2400)
+                        r = await asyncio.wait_for(func(conn, connect_option, **kwargs), timeout=timeout)
                     except asyncssh.process.ProcessError as e:
                         e.args = (e.args[0], e.stderr, traceback.format_exc())
                         exceptions.append(e)
                     except Exception as e:
+                        e.args = (e.args, traceback.format_exc())
                         exceptions.append(e)
                     else:
                         return r, host, connect_option
@@ -675,18 +765,22 @@ async def main():
     dotenv.load_dotenv()
     potential_usernames = [
         # most reliable batch
-        'hoare', 'tarjan', 'miacli', 'fred',
-        'geoffrey', 'rivest', 'edmund', 'ivan',
-        'cook', 'barbara', 'goldwasser', 'milner',
-        'hemming', 'frances', 'lee', 'turing',
+        'hoare', 'miacli', 'fred',
+        'geoffrey', 'edmund',
+        'cook', 'goldwasser', 'milner',
+        'hemming', 'lee', 'turing',
+        'juris', 'floyd',
+        'neumann', 'beauvoir', 'satoshi', 'putnam', 
+        'shannon', 'chowning', 
+        'tegmark', 'hanson', 'chomsky', 'keynes',
         # next most reliable
-        'floyd', 'juris', 'marvin',
-        'conway', 'fernando', 'edward', 'edwin', 
-        'satoshi', 'buterin', 'lovelace',
-        'putnam', 'beauvoir',
-        'arendt', 'chan', 'sutskever', 'neumann',
-        'edsger', 'herbert',
-        'mordvintsev'
+        'edward', 'buterin',
+        'arendt', 'chan', 'sutskever', 'herbert',
+        'mordvintsev',
+        # to set up
+        'marvin', 'frances', 'barbara', 'conway', 'tarjan', 'lovelace', 'edwin', 'edsger', 'fernando', 'rivest',
+        # unreliable
+        'ivan'
     ]
     hosts, usernames = await get_hosts_with_retries(potential_usernames, progress_bar=True)
     connect_options = [{'username': username, 'password': 'rp145'} for username in usernames]
@@ -698,7 +792,10 @@ async def main():
             reqs = f.readlines()
         reqs = ' '.join([req.strip() for req in reqs])
         ip_host_map = {host: username for host, username in zip(hosts, usernames)}
-        await run_on_pis(hosts, connect_options, setup_pi, reqs=reqs, ip_host_map=ip_host_map)
+        ip_host_map['10.162.43.238'] = 'pfeffer-HP-ProDesk-405-G4-Desktop-Mini'
+        r = await run_on_pis(hosts, connect_options, setup_pi, timeout=600, reqs=reqs, ip_host_map=ip_host_map)
+        usernames, hosts = zip(*[(co['username'], host) for ret, host, co in r if ret is None])
+        print(f"Successfully set up {usernames} on {hosts}")
     elif todo == 'ping':
         async def ping(conn):
             r = await conn.run('ls', check=True)

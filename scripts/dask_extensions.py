@@ -82,7 +82,8 @@ class UnreliableWorker(Worker):
         while started_workers < self.n_workers:
             line = await self.proc.stderr.readline()
             if not line.strip():
-                raise Exception("Worker failed to start")
+                stdout = await self.proc.stdout.read()
+                raise Exception(f"Worker at {self.address}, with username: {self.connect_options['username']} failed to start: {stdout}")
             logger.info(line.strip())
             if "worker at" in line:
                 started_workers += 1
