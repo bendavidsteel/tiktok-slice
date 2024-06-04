@@ -98,6 +98,11 @@ async def setup_pi(conn, connect_options, reqs='', ip_host_map={}, munge_key_pat
     if r.stdout != connect_options['username']:
         r = await conn.run(f'sudo hostnamectl set-hostname {connect_options["username"]}', check=True)
 
+    # make a bsteel user
+    user_b = await conn.run('id bsteel', check=False)
+    if user_b.returncode != 0:
+        r = await conn.run('sudo adduser --disabled-password --gecos "" -u 1001 bsteel', check=True)
+
     # make a new user with name slurm-user
     user_r = await conn.run('id slurm', check=False)
     if user_r.returncode != 0:
@@ -154,23 +159,31 @@ async def setup_pi(conn, connect_options, reqs='', ip_host_map={}, munge_key_pat
         assert r.stdout.strip() == 'Python 3.10.12'
 
     # setup virtual environment
-    r = await conn.run('ls ~/ben/tiktok/venv', check=False)
-    if r.returncode != 0:
-        r = await conn.run('python3 -m venv ~/ben/tiktok/venv', check=True)
-    else:
-        r = await conn.run('~/ben/tiktok/venv/bin/python --version', check=False)
-        if r.stdout.strip() != 'Python 3.10.12':
-            r = await conn.run('rm -rf ~/ben/tiktok/venv', check=True)
-            r = await conn.run('python3 -m venv ~/ben/tiktok/venv', check=True)
+    for path in ['~/ben', '/home/bsteel']:
+        if '~' not in path:
+            prepend = 'sudo '
+        else:
+            prepend = ''
+        r = await conn.run(f'{prepend}ls {path}/tiktok/venv', check=False)
+        if r.returncode != 0:
+            r = await conn.run(f'{prepend}python3 -m venv {path}/tiktok/venv', check=True)
+        else:
+            r = await conn.run(f'{prepend}{path}/tiktok/venv/bin/python --version', check=False)
+            if r.stdout.strip() != 'Python 3.10.12':
+                r = await conn.run(f'{prepend}rm -rf {path}/tiktok/venv', check=True)
+                r = await conn.run(f'{prepend}python3 -m venv {path}/tiktok/venv', check=True)
 
-    # install requirements
-    r = await conn.run('~/ben/tiktok/venv/bin/pip list', check=True)
-    installed_packages = r.stdout.split('\n')
-    installed_packages = ['=='.join([e for e in p.split(' ') if e]) for p in installed_packages[2:-1]]
-    required_packages = reqs.split()
-    not_installed_packages = [req for req in required_packages if req not in installed_packages]
-    if not_installed_packages:
-        r = await conn.run(f"~/ben/tiktok/venv/bin/pip install {' '.join(not_installed_packages)}", check=True)
+        # install requirements
+        r = await conn.run(f'{prepend}{path}/tiktok/venv/bin/pip list', check=True)
+        installed_packages = r.stdout.split('\n')
+        installed_packages = ['=='.join([e for e in p.split(' ') if e]) for p in installed_packages[2:-1]]
+        required_packages = reqs.split()
+        not_installed_packages = [req for req in required_packages if req not in installed_packages]
+        if not_installed_packages:
+            r = await conn.run(f"{prepend}{path}/tiktok/venv/bin/pip install {' '.join(not_installed_packages)}", check=True)
+
+        if '~' not in path:
+            r = await conn.run(f'sudo chown -R bsteel:bsteel {path}/tiktok', check=True)
 
 
 async def vpn_via_service(conn):

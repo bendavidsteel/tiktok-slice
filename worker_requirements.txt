@@ -7,3 +7,5 @@ cloudpickle==3.0.0
 lz4==4.3.3
 toolz==0.12.1
 tornado==6.4
+random-user-agent==1.0.1
+certifi==2024.6.2

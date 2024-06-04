@@ -5,7 +5,9 @@ import datetime
 import io
 import itertools
 import json
+import logging
 import os
+import subprocess
 import time
 import traceback
 
@@ -76,7 +78,7 @@ class DaskCluster:
         self.worker_mem = worker_mem
 
     async def __aenter__(self):
-        remote_python='~/ben/tiktok/venv/bin/python'
+        
         potential_usernames = [
             # most reliable batch
             'hoare', 'miacli', 'fred', 'frances',
@@ -131,6 +133,7 @@ class DaskCluster:
             hosts, connect_options = await start_wifi_connections(hosts, connect_options, progress_bar=True, timeout=max_latency)
 
             # append client/scheduler
+            remote_python='~/ben/tiktok/venv/bin/python'
             scheduler_password = os.environ['SCHEDULER_PASSWORD']
             all_hosts = ['localhost'] + hosts
             all_connect_options = [dict(username='bsteel', password=scheduler_password)] + connect_options
@@ -162,27 +165,32 @@ class DaskCluster:
             else:
                 raise asyncio.TimeoutError("Timed out creating cluster...")
         elif self.cluster_type == 'slurm':
+            remote_python='~/tiktok/venv/bin/python'
+            account = 'bsteel'
             # TODO could run this via slurm
             max_latency = 5
             hosts, usernames = await get_hosts_with_retries(potential_usernames, max_tries=2, progress_bar=True, timeout=max_latency)
             connect_options = [dict(username=un, password=raspi_password, known_hosts=None) for un in usernames]
             
             await start_wifi_connections(hosts, connect_options, progress_bar=True, timeout=max_latency)
+
+            host_address = subprocess.check_output(['hostname', '-I']).decode().strip()
             self.cluster = DaskSLURMCluster(
                 queue='debug',
-                account='slurmuser',
+                account=account,
                 cores=4,
-                memory=3793,
+                processes=1,
+                memory="3200 MB",
+                n_workers=22, # TODO ensure this gives us max workers
                 walltime='00:30:00',
                 python=remote_python,
-                # job_extra_directives=['--uid=slurmuser'],  # Ensure tasks run as slurmuser
-                # job_script_prologue=[
-                #     'export SLURM_ACCOUNT=slurmuser'  # Export SLURM account environment variable
-                # ],
+                scheduler_options={'host': host_address},
+                local_directory=f'/home/{account}/tiktok',
+                log_directory=f'/home/{account}/tiktok',
+                shared_temp_directory=f'/home/{account}/tiktok',
+                job_extra_directives=[f'-D /home/{account}/tiktok'],  # Ensure tasks run in directory they have permissions in
                 asynchronous=True
             )
-            # TODO ensure this gives us max workers
-            await self.cluster.scale(10)
 
         return self.cluster
     
@@ -354,13 +362,14 @@ class RestartClusterException(Exception):
 
 
 def get_headers():
-    software_names = [rug_params.SoftwareName.CHROME.value, rug_params.SoftwareName.FIREFOX.value]
-    operating_systems = [rug_params.OperatingSystem.WINDOWS.value, rug_params.OperatingSystem.ANDROID.value, rug_params.OperatingSystem.IOS.value, rug_params.OperatingSystem.MAC_OS_X.value]   
+    # TODO different user agent results in different html encoding, need to update process video class for each user agent
+    # software_names = [rug_params.SoftwareName.CHROME.value, rug_params.SoftwareName.FIREFOX.value]
+    # operating_systems = [rug_params.OperatingSystem.WINDOWS.value, rug_params.OperatingSystem.ANDROID.value, rug_params.OperatingSystem.IOS.value, rug_params.OperatingSystem.MAC_OS_X.value]   
     
-    user_agent_rotator = rug_user_agent.UserAgent(software_names=software_names, operating_systems=operating_systems, limit=100)
+    # user_agent_rotator = rug_user_agent.UserAgent(software_names=software_names, operating_systems=operating_systems, limit=100)
 
-    # Get Random User Agent String.
-    user_agent = user_agent_rotator.get_random_user_agent()
+    # # Get Random User Agent String.
+    # user_agent = user_agent_rotator.get_random_user_agent()
     
     headers = {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -369,13 +378,14 @@ def get_headers():
         'Sec-Fetch-Dest': 'document',
         'Sec-Fetch-Mode': 'navigate',
         'Sec-Fetch-Site': 'none',
-        'User-Agent': user_agent #'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15'
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15'
     }
     return headers
 
 class ProcessVideo:
-    def __init__(self):
+    def __init__(self, headers=None):
         self.text = ""
+        self.headers = headers
         self.start = -1
         self.json_start = '"webapp.video-detail":'
         self.json_start_len = len(self.json_start)
@@ -400,9 +410,12 @@ class ProcessVideo:
             
     def process_response(self):
         if self.start == -1 or self.end == -1:
+            err_data = {'text': self.text}
+            if self.headers:
+                err_data['headers'] = self.headers
             raise InvalidResponseException(
                 "Could not find normal JSON section in returned HTML.",
-                json.dumps({'text': self.text, 'encoding': self.r.encoding}),
+                json.dumps(err_data),
             )
         video_detail = json.loads(self.text)
         if video_detail.get("statusCode", 0) != 0: # assume 0 if not present
@@ -444,6 +457,7 @@ class PyCurlClient:
 
         resp = PyCurlResponse()
         resp.status_code = self.c.getinfo(pycurl.HTTP_CODE)
+        resp.headers = self.response_headers
 
         # Json response
         resp_bytes = buffer.getvalue()
@@ -494,7 +508,7 @@ def get_video(video_id, network_interface):
 
     resp_html = resp.text
 
-    video_processor = ProcessVideo()
+    video_processor = ProcessVideo(headers=resp.headers)
     video_processor.process_chunk(resp_html)
     # TODO get resolved user
     return video_processor.process_response()
@@ -754,7 +768,7 @@ async def run_random_sample():
     task_timeout = 60
     worker_cpu = 256
     worker_mem = 512
-    cluster_type = 'ssh'
+    cluster_type = 'slurm'
     method = 'dask'
     if (num_time > 1 and time_unit == 's') or (time_unit == 'm') or (time_unit == 'h'):
         if time_unit == 's':
@@ -823,6 +837,7 @@ async def run_get_ips():
     print(f"Num unique IPs: {len(set(ips))}")
     
 async def main():
+    logging.basicConfig(level=logging.DEBUG)
     dotenv.load_dotenv()
     await run_random_sample()
     # await run_get_ips()
