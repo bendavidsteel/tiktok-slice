@@ -13,8 +13,10 @@ import tqdm
 
 from map_funcs import async_amap
 
-async def setup_pi(conn, connect_options, reqs=''):
+async def setup_pi(conn, connect_options, reqs='', ip_host_map={}, munge_key_path=None):
 
+    r = await conn.run('sudo apt update', check=True)
+    r = await conn.run('sudo apt upgrade -y', check=True)
     r = await conn.run('sudo apt list', check=True)
     packages = r.stdout.split('\n')
 
@@ -25,9 +27,45 @@ async def setup_pi(conn, connect_options, reqs=''):
         r = await conn.run("sudo apt autoremove -y", check=True)
 
     # install required packages
-    apt_reqs = ['libcurl4-openssl-dev', 'libssl-dev']
+    apt_reqs = ['libcurl4-openssl-dev', 'libssl-dev', 'slurm-wlm']
     if not all(apt_req in packages for apt_req in apt_reqs):
         r = await conn.run(f"sudo apt install -y {' '.join(apt_reqs)}", check=True)
+
+    munge_reqs = ['munge', 'libmunge2', 'libmunge-dev']
+    if not all(munge_req in packages for munge_req in munge_reqs):
+        # check munge is running
+        r = await conn.run('munge -n | unmunge | grep STATUS', check=False)
+        if r.returncode != 0:
+            raise Exception("Munge is not running")
+        
+        assert munge_key_path, "Munge key path not provided"
+        await asyncssh.scp(munge_key_path, (conn, munge_key_path))
+        
+        # set correct munge permissions
+        r = await conn.run('sudo chown -R munge: /etc/munge/ /var/log/munge/ /var/lib/munge/ /run/munge/', check=True)
+        r = await conn.run('sudo chmod 0700 /etc/munge/ /var/log/munge/ /var/lib/munge/', check=True)
+        r = await conn.run('sudo chmod 0755 /run/munge/', check=True)
+        r = await conn.run('sudo chmod 0700 /etc/munge/munge.key', check=True)
+        r = await conn.run('sudo chown -R munge: /etc/munge/munge.key', check=True)
+
+        r = await conn.run('sudo systemctl enable munge', check=True)
+        r = await conn.run('sudo systemctl restart munge', check=True)
+
+        await asyncssh.scp('/etc/slurm/slurm.conf', (conn, '/etc/slurm/slurm.conf'))
+        await conn.run('sudo systemctl enable slurmctld', check=True)
+        await conn.run('sudo systemctl restart slurmctld', check=True)
+
+    # make a new user with name slurm-user
+    r = await conn.run('id slurmuser', check=False)
+    if r.returncode != 0:
+        r = await conn.run('sudo adduser slurmuser', check=True)
+        r = await conn.run('sudo usermod -aG sudo slurmuser', check=True)
+
+    r = await conn.run('cat /etc/hosts', check=True)
+    hosts_file = r.stdout
+    if any(ip_host_map[ip] not in hosts_file for ip in ip_host_map):
+        for ip, host in ip_host_map.items():
+            r = await conn.run(f"echo '{ip} {host}' | sudo tee -a /etc/hosts", check=True)
 
     # install python
     r = await conn.run('python3 --version', check=True)
@@ -235,7 +273,7 @@ async def ensure_wifi_connection(conn, connect_options, force_start=False):
     else:
         raise Exception("Failed to create wifi connection")
     
-async def start_wifi_connections(hosts, connect_options, progress_bar=True, timeout=10):
+async def start_wifi_connections(hosts, connect_options, progress_bar=True, timeout=10, num_workers=4):
     iterable = list(zip(hosts, connect_options))
     async def run_start_wifi(args):
         host, co  = args
@@ -256,12 +294,12 @@ async def start_wifi_connections(hosts, connect_options, progress_bar=True, time
         else:
             return host, co
 
-    res = await async_amap(run_start_wifi, iterable, num_workers=len(hosts), progress_bar=progress_bar, pbar_desc="Starting wifi connections")
+    res = await async_amap(run_start_wifi, iterable, num_workers=num_workers, progress_bar=progress_bar, pbar_desc="Starting wifi connections")
     working_hosts = [host for host, co in res if host]
     working_connect_options = [co for host, co in res if host]
     return working_hosts, working_connect_options
 
-async def check_connection(hosts, usernames, progress_bar=False, timeout=10):
+async def check_connection(hosts, usernames, progress_bar=False, timeout=10, num_workers=4):
     assert len(hosts) == len(usernames), "Hosts and usernames must be the same length"
     iterable = list(zip(hosts, usernames))
     async def run_connect(args):
@@ -272,7 +310,7 @@ async def check_connection(hosts, usernames, progress_bar=False, timeout=10):
             return False
         else:
             return True
-    results = await async_amap(run_connect, iterable, num_workers=4, pbar_desc="Checking connections", progress_bar=progress_bar)
+    results = await async_amap(run_connect, iterable, num_workers=num_workers, pbar_desc="Checking connections", progress_bar=progress_bar)
     working_hosts = [host for host, res in zip(hosts, results) if res]
     working_usernames = [username for username, res in zip(usernames, results) if res]
     return working_hosts, working_usernames
@@ -451,7 +489,7 @@ async def stop_stale_workers(hosts, connect_options, timeout=10):
         host, co = args
         try:
             conn = await asyncio.wait_for(asyncssh.connect(host, **co), timeout=timeout)
-            await killall_python(conn)
+            await asyncio.wait_for(killall_python(conn), timeout=120)
         except:
             return None, None
         else:
@@ -637,33 +675,30 @@ async def main():
     dotenv.load_dotenv()
     potential_usernames = [
         # most reliable batch
-        # 'hoare', 'tarjan', 'miacli', 'fred',
-        # 'geoffrey', 'rivest', 'edmund', 'ivan',
-        # 'cook', 'barbara', 'goldwasser', 'milner',
-        # 'hemming', 'frances', 'lee', 'turing',
-        # 'marvin', 'juris', 'floyd', 'edsger',
-        # 'neumann', 'beauvoir', 'satoshi', 'putnam', 
-        # 'fernando', 'edwin'
+        'hoare', 'tarjan', 'miacli', 'fred',
+        'geoffrey', 'rivest', 'edmund', 'ivan',
+        'cook', 'barbara', 'goldwasser', 'milner',
+        'hemming', 'frances', 'lee', 'turing',
         # next most reliable
-        # 'conway', 'edward',
-        # 'buterin', 'lovelace',
-        # 'arendt', 'chan', 'sutskever',
-        # 'herbert',
-        # 'mordvintsev'
-        "shannon", "chowning", "tegmark", "hanson",
-        "chomsky", "keynes"
+        'floyd', 'juris', 'marvin',
+        'conway', 'fernando', 'edward', 'edwin', 
+        'satoshi', 'buterin', 'lovelace',
+        'putnam', 'beauvoir',
+        'arendt', 'chan', 'sutskever', 'neumann',
+        'edsger', 'herbert',
+        'mordvintsev'
     ]
     hosts, usernames = await get_hosts_with_retries(potential_usernames, progress_bar=True)
     connect_options = [{'username': username, 'password': 'rp145'} for username in usernames]
 
-    # TODO add more pis to network
     todo = 'setup'
 
     if todo == 'setup':
         with open('worker_requirements.txt', 'r') as f:
             reqs = f.readlines()
         reqs = ' '.join([req.strip() for req in reqs])
-        await run_on_pis(hosts, connect_options, setup_pi, reqs=reqs)
+        ip_host_map = {host: username for host, username in zip(hosts, usernames)}
+        await run_on_pis(hosts, connect_options, setup_pi, reqs=reqs, ip_host_map=ip_host_map)
     elif todo == 'ping':
         async def ping(conn):
             r = await conn.run('ls', check=True)
