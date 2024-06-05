@@ -68,18 +68,9 @@ def wait_until(condition, interval=0.1, timeout=1, *args):
         raise TimeoutError("Timed out waiting for condition")
 
 
-
-
-class DaskCluster:
-    def __init__(self, cluster_type, worker_nthreads=1, worker_cpu=256, worker_mem=512):
-        self.cluster_type = cluster_type
-        self.worker_nthreads = worker_nthreads
-        self.worker_cpu = worker_cpu
-        self.worker_mem = worker_mem
-
-    async def __aenter__(self):
-        
-        potential_usernames = [
+class ClusterManager:
+    def __init__(self):
+        self.potential_usernames = [
             # most reliable batch
             'hoare', 'miacli', 'fred', 'frances',
             'geoffrey', 'edmund', 'marvin', 'barbara',
@@ -98,9 +89,37 @@ class DaskCluster:
             # unreliable
             # 'ivan'
         ]
-        raspi_password = os.environ['RASPI_PASSWORD']
+        self.max_latency = 5
 
-        max_latency = 5
+    async def get_hosts(self):
+        hosts, usernames = await get_hosts_with_retries(self.potential_usernames, max_tries=2, progress_bar=True, timeout=self.max_latency)
+        return hosts, usernames
+
+    async def stop_stale_workers(self, hosts, connect_options):
+        return await stop_stale_workers(hosts, connect_options, timeout=self.max_latency)
+    
+    async def start_wifi_connections(self, hosts, connect_options):
+        self.hosts, self.connect_options = await start_wifi_connections(hosts, connect_options, progress_bar=True, timeout=self.max_latency)
+        return self.hosts, self.connect_options
+    
+    async def change_mac_addresses(self):
+        await change_mac_addresses(self.hosts, self.connect_options, interface='wlan0', progress_bar=True)
+
+    def get_connect_options(self, usernames):
+        raspi_password = os.environ['RASPI_PASSWORD']
+        return [dict(username=un, password=raspi_password, known_hosts=None) for un in usernames]
+
+
+class DaskCluster:
+    def __init__(self, cluster_type, manager, worker_nthreads=1, worker_cpu=256, worker_mem=512):
+        self.cluster_type = cluster_type
+        self.manager = manager
+        self.worker_nthreads = worker_nthreads
+        self.worker_cpu = worker_cpu
+        self.worker_mem = worker_mem
+
+    async def __aenter__(self):
+        
 
         if self.cluster_type == 'fargate':
             self.cluster = DaskFargateCluster(
@@ -125,12 +144,12 @@ class DaskCluster:
             self.cluster = DaskLocalCluster()
         elif self.cluster_type == 'ssh':
             print("Finding hosts...")
-            hosts, usernames = await get_hosts_with_retries(potential_usernames, max_tries=2, progress_bar=True, timeout=max_latency)
-            connect_options = [dict(username=un, password=raspi_password, known_hosts=None) for un in usernames]
+            hosts, usernames = await self.manager.get_hosts()
+            connect_options = self.manager.get_connect_options(usernames)
             
-            await stop_stale_workers(hosts, connect_options, timeout=max_latency)
+            await self.manager.stop_stale_workers(hosts, connect_options)
             print("Starting wifi connections...")
-            hosts, connect_options = await start_wifi_connections(hosts, connect_options, progress_bar=True, timeout=max_latency)
+            hosts, connect_options = await self.manager.start_wifi_connections(hosts, connect_options)
 
             # append client/scheduler
             remote_python='~/ben/tiktok/venv/bin/python'
@@ -168,11 +187,9 @@ class DaskCluster:
             remote_python='~/tiktok/venv/bin/python'
             account = 'bsteel'
             # TODO could run this via slurm
-            max_latency = 5
-            hosts, usernames = await get_hosts_with_retries(potential_usernames, max_tries=2, progress_bar=True, timeout=max_latency)
-            connect_options = [dict(username=un, password=raspi_password, known_hosts=None) for un in usernames]
-            
-            await start_wifi_connections(hosts, connect_options, progress_bar=True, timeout=max_latency)
+            hosts, usernames = await self.manager.get_hosts()
+            connect_options = self.manager.get_connect_options(usernames)
+            await self.manager.start_wifi_connections(hosts, connect_options)
 
             host_address = subprocess.check_output(['hostname', '-I']).decode().strip()
             self.cluster = DaskSLURMCluster(
@@ -210,6 +227,7 @@ async def process_future(f, batch_tasks_lookup, timeout, max_task_tries, tasks_p
             batch_results = await f.result()
     except Exception as e:
         batch_results = [{'res': None, 'exception': e, 'pre_time': None, 'post_time': datetime.datetime.now()} for _ in batch_tasks]
+    assert len(batch_tasks) == len(batch_results), "Number of tasks and results must match"
     for t, r in zip(batch_tasks, batch_results):
         if r['exception'] is not None:
             t.exceptions.append(r)
@@ -247,11 +265,11 @@ class TaskDataset:
         return len(self.tasks)
 
 async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_size=100000, task_batch_size=1000, max_task_tries=3, task_nthreads=1, task_timeout=10, worker_cpu=256, worker_mem=512, cluster_type='local'):
-    network_interfaces = ['eth0', 'wlan0'] if cluster_type == 'raspi' else [None]
-    interface_ratios = [0.3, 0.7] if cluster_type == 'raspi' else [1]
+    network_interfaces = ['eth0', 'wlan0'] if cluster_type in ['ssh', 'slurm'] else [None]
+    interface_ratios = [0.8, 0.2] if cluster_type in ['ssh', 'slurm'] else [1]
     assert all(int(ratio * task_nthreads) > 0 for ratio in interface_ratios), "Must have at least one thread per network interface"
     function = MultiNetworkInterfaceFunc(DaskFunc(function), network_interfaces=network_interfaces, ratios=interface_ratios, task_nthreads=task_nthreads)
-    # network_interface = 'wlan0' if cluster_type == 'raspi' else None
+    # network_interface = None # 'wlan0' if cluster_type == 'raspi' else None
     # function = BatchNetworkInterfaceFunc(DaskFunc(function), network_interface=network_interface, task_nthreads=task_nthreads)
     dotenv.load_dotenv()
     tasks_progress_bar = tqdm(total=len(dataset), desc="All Tasks")
@@ -262,12 +280,15 @@ async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_si
 
     while dataset.num_left() > 0:
         try:
-            async with DaskCluster(cluster_type, worker_cpu=worker_cpu, worker_mem=worker_mem) as cluster:
+            cluster_manager = ClusterManager()
+            async with DaskCluster(cluster_type, cluster_manager, worker_cpu=worker_cpu, worker_mem=worker_mem) as cluster:
                 async with DaskClient(cluster) as client:
                     if isinstance(cluster, DaskFargateCluster):
                         cluster.adapt(minimum=1, maximum=num_workers)
                         # wait for workers to start
                         client.wait_for_workers(1, timeout=120)
+                    # if isinstance(cluster, DaskSLURMCluster):
+                    #     cluster.adapt(minimum=1, maximum=999)
                     num_reqs_for_current_ips = 0
                     num_exceptions_for_current_ips = 0
                     while dataset.num_left() > 0:
@@ -321,13 +342,10 @@ async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_si
                                     num_reqs_for_current_ips = 0
                                     cluster.adapt(minimum=1, maximum=num_workers)
                                     client.wait_for_workers(1, timeout=120)
-                                elif cluster_type == 'raspi':
+                                elif cluster_type == 'ssh' or cluster_type == 'slurm':
                                     # reset mac address of raspberry pis and rescan for the new assigned IPs
-                                    workers = list(cluster.workers.values())
-                                    hosts = [w.address for w in workers]
-                                    connect_options = [w.connect_options for w in workers]
                                     print("Changing worker IPs...")
-                                    await change_mac_addresses(hosts, connect_options, interface='wlan0', progress_bar=True)
+                                    await cluster_manager.change_mac_addresses()
                                     num_reqs_for_current_ips = 0
                                     num_exceptions_for_current_ips = 0
                         # catch exceptions that are recoverable without restarting the cluster
@@ -508,9 +526,9 @@ def get_video(video_id, network_interface):
 
     resp_html = resp.text
 
+    # cannot get resolved user, tiktok doesn't redirect when video is hidden
     video_processor = ProcessVideo(headers=resp.headers)
     video_processor.process_chunk(resp_html)
-    # TODO get resolved user
     return video_processor.process_response()
 
 class DaskFunc:
@@ -557,8 +575,10 @@ class MultiNetworkInterfaceFunc:
         # TODO use httpx again for default interface
         executor = ThreadPoolExecutor(max_workers=len(self.network_interfaces))
         all_func_args = []
+        cum_ratios = [sum(self.ratios[:i]) for i in range(len(self.ratios) + 1)]
         for i in range(len(self.ratios)):
-            all_func_args.append(batch_args[int(i * len(batch_args) * self.ratios[i]):int((i + 1) * len(batch_args) * self.ratios[i])])
+            all_func_args.append(batch_args[int(len(batch_args) * cum_ratios[i]):int(len(batch_args) * cum_ratios[i+1])])
+        assert sum(len(args) for args in all_func_args) == len(batch_args), "Number of batch args must match number of all batch args"
         
         futures = []
         # TODO add httpx option back for network interface that doesn't need it
@@ -728,29 +748,49 @@ async def get_random_sample(
         json.dump(params, f)
 
     try:
-        df = pd.DataFrame(results)
-        df.to_parquet(os.path.join(results_dir_path, new_result_dir, 'results.parquet.gzip'), compression='gzip')
-    except Exception as e:
-        # convert to jsonable format
-        json_results = [
+        dict_results = [
             {
                 'args': r.args, 
                 'exceptions': [{
                         'exception': str(e['exception']),
-                        'pre_time': e['pre_time'].isoformat() if e['pre_time'] else None,
-                        'post_time': e['post_time'].isoformat()
+                        'pre_time': e['pre_time'] if e['pre_time'] else None,
+                        'post_time': e['post_time']
                     }
                     for e in r.exceptions
                 ], 
                 'result': {
                     'return': r.result['res'] if r.result is not None else None,
-                    'pre_time': r.result['pre_time'].isoformat() if r.result is not None else None,
-                    'post_time': r.result['post_time'].isoformat() if r.result is not None else None
+                    'pre_time': r.result['pre_time'] if r.result is not None else None,
+                    'post_time': r.result['post_time'] if r.result is not None else None
                 },
                 'completed': r.completed
             }
             for r in results
         ]
+        df = pd.DataFrame(dict_results)
+        df.to_parquet(os.path.join(results_dir_path, new_result_dir, 'results.parquet.gzip'), compression='gzip')
+    except Exception as e:
+        print(e)
+        # convert to jsonable format
+        json_results = [
+        {
+            'args': r.args, 
+            'exceptions': [{
+                    'exception': str(e['exception']),
+                    'pre_time': e['pre_time'].isoformat() if e['pre_time'] else None,
+                    'post_time': e['post_time'].isoformat()
+                }
+                for e in r.exceptions
+            ], 
+            'result': {
+                'return': r.result['res'] if r.result is not None else None,
+                'pre_time': r.result['pre_time'].isoformat() if r.result is not None else None,
+                'post_time': r.result['post_time'].isoformat() if r.result is not None else None
+            },
+            'completed': r.completed
+        }
+        for r in results
+    ]
         with open(os.path.join(results_dir_path, new_result_dir, 'results.json'), 'w') as f:
             json.dump(json_results, f)
 
@@ -760,11 +800,11 @@ async def run_random_sample():
     start_time = datetime.datetime(2024, 4, 10, 19, 0, 0)
     num_time = 1
     time_unit = 'h'
-    num_workers = 20
-    reqs_per_ip = 400
+    num_workers = 22
+    reqs_per_ip = 10000
     batch_size = 20000
     task_batch_size = 50
-    task_nthreads = 5
+    task_nthreads = 10
     task_timeout = 60
     worker_cpu = 256
     worker_mem = 512
@@ -837,7 +877,7 @@ async def run_get_ips():
     print(f"Num unique IPs: {len(set(ips))}")
     
 async def main():
-    logging.basicConfig(level=logging.DEBUG)
+    # logging.basicConfig(level=logging.DEBUG)
     dotenv.load_dotenv()
     await run_random_sample()
     # await run_get_ips()

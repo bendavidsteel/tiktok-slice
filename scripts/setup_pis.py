@@ -85,6 +85,14 @@ async def setup_pi(conn, connect_options, reqs='', ip_host_map={}, munge_key_pat
     # r = await conn.run(f'sudo ls {slurm_conf_worker_path}', check=False)
     # if r.returncode != 0:
     slurm_conf_host_path = './config/slurm.conf'
+    # edit slurm conf to ensure up to date IPs
+    with open(slurm_conf_host_path, 'r') as f:
+        slurm_conf = f.read()
+    node_names = re.findall(r'NodeName=(\S+)', slurm_conf)
+    node_addrs = re.findall(r'NodeAddr=(\S+)', slurm_conf)
+    for node_name, node_addr in zip(node_names, node_addrs):
+        pass
+
     temp_path = '~/slurm.conf'
     await asyncssh.scp(slurm_conf_host_path, (conn, temp_path))
     try:
