@@ -1,8 +1,6 @@
 import datetime
-import io
+import time
 
-import brotli
-import certifi
 import httpx
 import pycurl
 
@@ -16,7 +14,7 @@ def using_httpx(ids):
     assert res['id'] == video_id
 
 def using_threaded_curl(ids):
-    get_random_sample.thread_map(ids, use_single_curl, 5)
+    get_random_sample.thread_map(ids, function=use_single_curl, num_workers=2)
 
 def use_single_curl(video_id):
     url = f"https://www.tiktok.com/@/video/{video_id}"
@@ -39,7 +37,7 @@ def use_single_curl(video_id):
 
 def using_multi_curl(ids):
     # Limit the number of concurrent requests
-    max_concurrent_requests = 3
+    max_concurrent_requests = 2
 
     # Create a CurlMulti object
     multi = pycurl.CurlMulti()
@@ -52,21 +50,19 @@ def using_multi_curl(ids):
 
     # Create a list to hold Curl objects and their buffers
     curl_objects = []
-    buffers = []
+    clients = []
+    urls = [f"https://www.tiktok.com/@/video/{video_id}" for video_id in ids]
+    headers = get_random_sample.get_headers()
     url_queue = urls.copy()
     active_transfers = set()
 
     def add_transfer(url):
-        buffer = BytesIO()
-        c = pycurl.Curl()
-        c.setopt(pycurl.URL, url)
-        c.setopt(pycurl.WRITEFUNCTION, buffer.write)
-        c.setopt(pycurl.CAINFO, certifi.where())  # Ensure SSL certificates are verified
-        c.setopt(pycurl.SHARE, share)  # Share session data
-        curl_objects.append(c)
-        buffers.append(buffer)
-        multi.add_handle(c)
-        active_transfers.add(c)
+        client = get_random_sample.PyCurlClient(share=share)
+        client._setup(url, headers=headers)
+        curl_objects.append(client.c)
+        clients.append(client)
+        multi.add_handle(client.c)
+        active_transfers.add(client.c)
 
     # Start the initial batch of transfers
     for _ in range(min(max_concurrent_requests, len(url_queue))):
@@ -76,20 +72,24 @@ def using_multi_curl(ids):
     while active_transfers:
         while True:
             ret, num_handles = multi.perform()
-            if num_handles == 0:
+            print(f'multi perform = {ret} {num_handles}')
+            if ret != pycurl.E_CALL_MULTI_PERFORM:
                 break
-            multi.select(1.0)
+
+        # Wait 1s...
+        ret = multi.select(1)
+        print(f'multi select = {ret}')
 
         # Check for completed transfers and remove them
         while True:
             num_q, ok_list, err_list = multi.info_read()
-            if num_q == 0:
-                break
+            print(f'multi read = {num_q} {ok_list} {err_list}')
+            for err in err_list:
+                print(f"Error: {err.last_error}")
 
             for c in ok_list:
                 index = curl_objects.index(c)
-                print(buffers[index].getvalue().decode('utf-8'))
-                buffers[index].close()
+                print(clients[index]._get_response())
                 multi.remove_handle(c)
                 active_transfers.remove(c)
 
@@ -97,8 +97,8 @@ def using_multi_curl(ids):
                 if url_queue:
                     add_transfer(url_queue.pop(0))
 
-        # Sleep briefly to avoid busy-waiting
-        time.sleep(0.1)
+            if num_q == 0:
+                break
 
     # Cleanup
     multi.close()
@@ -107,7 +107,7 @@ def using_multi_curl(ids):
 
 
 def main():
-    video_ids = ["7248300636498890011"]
+    video_ids = ["7248300636498890011", "7248300636498890012", "7248300636498890013", "7248300636498890014"]
     # time both requests
     # start_httpx = datetime.datetime.now()
     # using_httpx()
