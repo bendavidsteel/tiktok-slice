@@ -428,6 +428,10 @@ class ProcessVideo:
             )
         return video_info
 
+def process_video(text, headers=None):
+    video_processor = ProcessVideo(headers=headers)
+    video_processor.process_chunk(text)
+    return video_processor.process_response()
 
 class PyCurlResponse:
     status_code: int
