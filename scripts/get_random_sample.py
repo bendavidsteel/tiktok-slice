@@ -85,9 +85,9 @@ class ClusterManager:
             'arendt', 'chan', 'sutskever', 'herbert',
             'mordvintsev',
             # to set up
-            # , 'edsger', 'fernando', 'rivest', 'tarjan', 'turing',
+            'edsger', 'fernando', 'rivest', 'tarjan', 'turing',
             # unreliable
-            # 'ivan'
+            'ivan'
         ]
         self.max_latency = 5
 
@@ -190,6 +190,7 @@ class DaskCluster:
             hosts, usernames = await self.manager.get_hosts()
             connect_options = self.manager.get_connect_options(usernames)
             await self.manager.start_wifi_connections(hosts, connect_options)
+            # TODO restart slurmd for workers in down* state
 
             host_address = subprocess.check_output(['hostname', '-I']).decode().strip()
             self.cluster = DaskSLURMCluster(
@@ -198,7 +199,7 @@ class DaskCluster:
                 cores=4,
                 processes=1,
                 memory="3200 MB",
-                n_workers=22, # TODO ensure this gives us max workers
+                n_workers=34, # TODO ensure this gives us max workers
                 walltime='00:30:00',
                 python=remote_python,
                 scheduler_options={'host': host_address},

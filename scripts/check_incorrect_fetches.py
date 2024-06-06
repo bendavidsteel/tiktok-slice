@@ -10,27 +10,14 @@ def get_result_paths(data_dir_path):
 
     for dir_path, dir_names, filenames in os.walk(os.path.join(data_dir_path, 'results')):
         for filename in filenames:
-            if 'results' in filename:
+            if filename == 'results.parquet.gzip':
                 result_path = os.path.join(dir_path, filename)
                 yield result_path
 
-def write_parquet(results, result_path):
-    df = pd.DataFrame(results)
-    parquet_path = result_path.replace('results.json', 'results.parquet.gzip')
-    df.to_parquet(parquet_path, compression='gzip')
-    return parquet_path
-
 def check_results(result_path):
-    if result_path.endswith('.parquet.gzip'):
-        results = pd.read_parquet(result_path).to_dict('records')
-    elif result_path.endswith('.json'):
-        with open(result_path, 'r') as f:
-            try:
-                results = json.load(f)
-            except:
-                return
-    else:
-        raise ValueError(f"Unknown file type: {result_path}")
+    result_df = pd.read_parquet(result_path)
+    result_df = result_df['result'].apply(pd.Series)
+    result_df = result_df['return'].apply(pd.Series)
     
     valid = True
     # check if any video ids don't match up with args

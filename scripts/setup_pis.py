@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -13,7 +14,7 @@ import tqdm
 
 from map_funcs import async_amap
 
-async def setup_pi(conn, connect_options, reqs='', ip_host_map={}, munge_key_path=None):
+async def setup_pi(conn, connect_options, reqs='', ip_host_map={}, slurm_conf_hash=None):
 
     r = await conn.run('pwd', check=True)
     if r.stdout.strip() != f'/home/{connect_options["username"]}':
@@ -41,15 +42,17 @@ async def setup_pi(conn, connect_options, reqs='', ip_host_map={}, munge_key_pat
         if "Try 'apt --fix-broken install' with no packages" in r.stderr:
             r = await conn.run('sudo apt --fix-broken install', check=True)
             r = await conn.run(f"sudo apt install -y {' '.join(reqs_to_install)}", check=True)
+        elif r.returncode != 0:
+            print(f"Failed to install required packages: {r.stderr}")
 
     munge_info_r = await conn.run('id munge', check=False)
-    if r.returncode != 0:
+    if munge_info_r.returncode != 0:
         await conn.run('sudo apt install -y munge libmunge2 libmunge-dev', check=True)
         munge_info_r = await conn.run('id munge', check=True)
 
     munge_key_worker_path = '/etc/munge/munge.key'
-    r = await conn.run(f'sudo ls -lh {munge_key_worker_path}')
-    if r.returncode != 0 or 'munge 0' in r.stdout: # munge key doesn't exist or is empty
+
+    async def copy_munge_key():
         temp_path = '~/munge.key'
         munge_key_host_path = './config/munge.key'
         await asyncssh.scp(munge_key_host_path, (conn, temp_path))
@@ -59,6 +62,15 @@ async def setup_pi(conn, connect_options, reqs='', ip_host_map={}, munge_key_pat
             if 'No such file or directory' in e.stderr:
                 await conn.run('sudo mkdir -p /etc/munge', check=True)
                 await conn.run(f'sudo mv {temp_path} {munge_key_worker_path}', check=True)
+
+    r = await conn.run(f'sudo ls -lh {munge_key_worker_path}')
+    if r.returncode != 0 or 'munge 0' in r.stdout: # munge key doesn't exist or is empty
+        await copy_munge_key()
+
+    r = await conn.run(f'sudo md5sum {munge_key_worker_path}', check=True)
+    correct_munge_hash = 'ad7536990cca9ae1623fa21122cbee12'
+    if correct_munge_hash not in r.stdout:
+        await copy_munge_key()
 
     r = await conn.run(f'sudo ls -lh {munge_key_worker_path}')
     if '-rw-------' not in r.stdout or 'munge munge' not in r.stdout:
@@ -82,25 +94,26 @@ async def setup_pi(conn, connect_options, reqs='', ip_host_map={}, munge_key_pat
     # r = await conn.run('sudo systemctl restart munge', check=True)
 
     slurm_conf_worker_path = '/etc/slurm/slurm.conf'
-    # r = await conn.run(f'sudo ls {slurm_conf_worker_path}', check=False)
-    # if r.returncode != 0:
-    slurm_conf_host_path = './config/slurm.conf'
-    # edit slurm conf to ensure up to date IPs
-    with open(slurm_conf_host_path, 'r') as f:
-        slurm_conf = f.read()
-    node_names = re.findall(r'NodeName=(\S+)', slurm_conf)
-    node_addrs = re.findall(r'NodeAddr=(\S+)', slurm_conf)
-    for node_name, node_addr in zip(node_names, node_addrs):
-        pass
+    scp_slurm_conf = False
+    ls_r = await conn.run(f'sudo ls {slurm_conf_worker_path}', check=False)
+    if ls_r.returncode == 0:
+        hash_r = await conn.run(f'sudo md5sum {slurm_conf_worker_path}', check=True)
+        if slurm_conf_hash not in hash_r.stdout.strip():
+            scp_slurm_conf = True
+    else:
+        scp_slurm_conf = True
+            
+    if scp_slurm_conf:
+        slurm_conf_host_path = './config/slurm.conf'
 
-    temp_path = '~/slurm.conf'
-    await asyncssh.scp(slurm_conf_host_path, (conn, temp_path))
-    try:
-        await conn.run(f'sudo mv {temp_path} {slurm_conf_worker_path}', check=True)
-    except asyncssh.process.ProcessError as e:
-        if 'No such file or directory' in e.stderr:
-            await conn.run('sudo mkdir -p /etc/slurm', check=True)
+        temp_path = '~/slurm.conf'
+        await asyncssh.scp(slurm_conf_host_path, (conn, temp_path))
+        try:
             await conn.run(f'sudo mv {temp_path} {slurm_conf_worker_path}', check=True)
+        except asyncssh.process.ProcessError as e:
+            if 'No such file or directory' in e.stderr:
+                await conn.run('sudo mkdir -p /etc/slurm', check=True)
+                await conn.run(f'sudo mv {temp_path} {slurm_conf_worker_path}', check=True)
 
     r = await conn.run('hostname', check=True)
     if r.stdout != connect_options['username']:
@@ -773,22 +786,22 @@ async def main():
     dotenv.load_dotenv()
     potential_usernames = [
         # most reliable batch
-        'hoare', 'miacli', 'fred',
-        'geoffrey', 'edmund',
-        'cook', 'goldwasser', 'milner',
-        'hemming', 'lee', 'turing',
-        'juris', 'floyd',
-        'neumann', 'beauvoir', 'satoshi', 'putnam', 
-        'shannon', 'chowning', 
-        'tegmark', 'hanson', 'chomsky', 'keynes',
+        # 'hoare', 'miacli', 'fred',
+        # 'geoffrey', 'edmund',
+        # 'cook', 'milner', 'juris',
+        # 'hemming', 'lee', 'turing',
+        # 'floyd', 'goldwasser',
+        # 'neumann', 'beauvoir', 'satoshi', 'putnam', 
+        # 'shannon', 'chowning', 
+        # 'tegmark', 'hanson', 'chomsky', 'keynes',
         # next most reliable
-        'edward', 'buterin',
+        # 'edward', 'buterin',
         'arendt', 'chan', 'sutskever', 'herbert',
-        'mordvintsev',
+        # 'mordvintsev',
         # to set up
-        'marvin', 'frances', 'barbara', 'conway', 'tarjan', 'lovelace', 'edwin', 'edsger', 'fernando', 'rivest',
+        # 'marvin', 'frances', 'barbara', 'conway', 'tarjan', 'lovelace', 'edwin', 'edsger', 'fernando', 'rivest',
         # unreliable
-        'ivan'
+        # 'ivan'
     ]
     hosts, usernames = await get_hosts_with_retries(potential_usernames, progress_bar=True)
     connect_options = [{'username': username, 'password': 'rp145'} for username in usernames]
@@ -799,9 +812,51 @@ async def main():
         with open('worker_requirements.txt', 'r') as f:
             reqs = f.readlines()
         reqs = ' '.join([req.strip() for req in reqs])
-        ip_host_map = {host: username for host, username in zip(hosts, usernames)}
+        with open('hosts.json', 'r') as file:
+            host_ip_map = json.load(file)
+        ip_host_map = {v: k for k, v in host_ip_map.items()}
         ip_host_map['10.162.43.238'] = 'pfeffer-HP-ProDesk-405-G4-Desktop-Mini'
-        r = await run_on_pis(hosts, connect_options, setup_pi, timeout=600, reqs=reqs, ip_host_map=ip_host_map)
+
+        # edit slurm conf to ensure up to date IPs
+        slurm_conf_host_path = './config/slurm.conf'
+        with open(slurm_conf_host_path, 'r') as f:
+            slurm_conf = f.read()
+        rewrite_slurm_conf = False
+        node_name_sections = re.findall(r'NodeName=(\S+)', slurm_conf)
+        node_addr_sections = re.findall(r'NodeAddr=(\S+)', slurm_conf)
+        for node_name_section, node_addr_section in zip(node_name_sections, node_addr_sections):
+            node_names = node_name_section.split(',')
+            node_addrs = node_addr_section.split(',')
+            for node_name, node_addr in zip(node_names, node_addrs):
+                if node_addr not in ip_host_map or ip_host_map[node_addr] != node_name:
+                    rewrite_slurm_conf = True
+                    slurm_conf = slurm_conf.replace(node_addr, host_ip_map[node_name])
+        if rewrite_slurm_conf:
+            print("Rewriting slurm.conf file, move to config directory on controller")
+            with open(slurm_conf_host_path, 'w') as f:
+                f.write(slurm_conf)
+
+        slurm_conf_hash = hashlib.md5(slurm_conf.encode('utf-8')).hexdigest()
+
+        # edit hosts file
+        with open('./config/hosts', 'r') as f:
+            hosts_file = f.read()
+
+        rewrite_hosts_file = False
+        # Check and remove incorrect lines
+        for ip, host in ip_host_map.items():
+            for line in hosts_file.splitlines():
+                if host in line and line != f"{ip} {host}":
+                    # Remove incorrect lines
+                    hosts_file = hosts_file.replace(line, f"{ip} {host}")
+                    rewrite_hosts_file = True
+
+        if rewrite_hosts_file:
+            print("Rewriting hosts file, move to config directory on controller")
+            with open('./config/hosts', 'w') as f:
+                f.write(hosts_file)
+
+        r = await run_on_pis(hosts, connect_options, setup_pi, timeout=600, reqs=reqs, ip_host_map=ip_host_map, slurm_conf_hash=slurm_conf_hash)
         usernames, hosts = zip(*[(co['username'], host) for ret, host, co in r if ret is None])
         print(f"Successfully set up {usernames} on {hosts}")
     elif todo == 'ping':
