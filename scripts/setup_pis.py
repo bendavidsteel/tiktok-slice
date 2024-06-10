@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -13,21 +14,158 @@ import tqdm
 
 from map_funcs import async_amap
 
-async def setup_pi(conn, connect_options, reqs=''):
+async def setup_pi(conn, connect_options, reqs='', ip_host_map={}, slurm_conf_hash=None):
 
-    r = await conn.run('sudo apt list', check=True)
+    r = await conn.run('pwd', check=True)
+    if r.stdout.strip() != f'/home/{connect_options["username"]}':
+        raise Exception(f"Need to reset this pi: {r.stdout}")
+
+    r = await conn.run('sudo apt update', check=True)
+    if r.returncode != 0:
+        if "you must manually run 'sudo dpkg --configure -a' to correct the problem" in r.stderr:
+            r = await conn.run('sudo dpkg --configure -a', check=True)
+            r = await conn.run('sudo apt upgrade -y', check=True)
+        elif "Try 'apt --fix-broken install' with no packages" in r.stderr:
+            r = await conn.run('sudo apt --fix-broken install', check=True)
+            r = await conn.run('sudo apt upgrade -y', check=True)
+        else:
+            print(f"Failed to upgrade: {r.stderr}")
+
+    r = await conn.run('sudo apt list --installed', check=True)
     packages = r.stdout.split('\n')
 
-    to_remove_packages = ['xserver*', 'lightdm*', 'raspberrypi-ui-mods', 'vlc*', 'lxde*', 'chromium*', 'desktop*', 'gnome*', 'gstreamer*', 'gtk*', 'hicolor-icon-theme*', 'lx*', 'mesa*']
-    if any(any(to_remove_package.strip('*') in package for package in packages) for to_remove_package in to_remove_packages):
-        # downsize to raspios lite
-        r = await conn.run(f"sudo apt purge -y {' '.join(to_remove_packages)}", check=True)
-        r = await conn.run("sudo apt autoremove -y", check=True)
-
     # install required packages
-    apt_reqs = ['libcurl4-openssl-dev', 'libssl-dev']
-    if not all(apt_req in packages for apt_req in apt_reqs):
-        r = await conn.run(f"sudo apt install -y {' '.join(apt_reqs)}", check=True)
+    apt_reqs = ['libcurl4-openssl-dev', 'libssl-dev', 'slurm-wlm', 'libpmix-dev', 'munge', 'libmunge2', 'libmunge-dev', 'cgroup-tools']
+    reqs_to_install = [r for r in apt_reqs if not any(r in p for p in packages)]
+    if reqs_to_install:
+        r = await conn.run(f"sudo apt install -y {' '.join(reqs_to_install)}", check=False)
+        if "Try 'apt --fix-broken install' with no packages" in r.stderr:
+            r = await conn.run('sudo apt --fix-broken install', check=True)
+            r = await conn.run(f"sudo apt install -y {' '.join(reqs_to_install)}", check=True)
+        elif r.returncode != 0:
+            print(f"Failed to install required packages: {r.stderr}")
+
+    munge_info_r = await conn.run('id munge', check=False)
+    if munge_info_r.returncode != 0:
+        await conn.run('sudo apt install -y munge libmunge2 libmunge-dev', check=True)
+        munge_info_r = await conn.run('id munge', check=True)
+
+    munge_key_worker_path = '/etc/munge/munge.key'
+
+    async def copy_munge_key():
+        temp_path = '~/munge.key'
+        munge_key_host_path = './config/munge.key'
+        await asyncssh.scp(munge_key_host_path, (conn, temp_path))
+        try:
+            await conn.run(f'sudo mv {temp_path} {munge_key_worker_path}', check=True)
+        except asyncssh.process.ProcessError as e:
+            if 'No such file or directory' in e.stderr:
+                await conn.run('sudo mkdir -p /etc/munge', check=True)
+                await conn.run(f'sudo mv {temp_path} {munge_key_worker_path}', check=True)
+
+    r = await conn.run(f'sudo ls -lh {munge_key_worker_path}')
+    if r.returncode != 0 or 'munge 0' in r.stdout: # munge key doesn't exist or is empty
+        await copy_munge_key()
+
+    r = await conn.run(f'sudo md5sum {munge_key_worker_path}', check=True)
+    correct_munge_hash = 'ad7536990cca9ae1623fa21122cbee12'
+    if correct_munge_hash not in r.stdout:
+        await copy_munge_key()
+
+    r = await conn.run(f'sudo ls -lh {munge_key_worker_path}')
+    if '-rw-------' not in r.stdout or 'munge munge' not in r.stdout:
+        await conn.run(f'sudo chown munge:munge {munge_key_worker_path}', check=True)
+        await conn.run(f'sudo chmod 600 {munge_key_worker_path}', check=True)
+        await conn.run('sudo systemctl restart munge', check=True)
+
+    # check munge is running
+    r = await conn.run('munge -n | unmunge | grep STATUS', check=False)
+    if r.returncode != 0:
+        raise Exception("Munge is not running")
+        
+    # set correct munge permissions
+    r = await conn.run('sudo chown -R munge: /etc/munge/ /var/log/munge/ /var/lib/munge/ /run/munge/', check=True)
+    r = await conn.run('sudo chmod 0700 /etc/munge/ /var/log/munge/ /var/lib/munge/', check=True)
+    r = await conn.run('sudo chmod 0755 /run/munge/', check=True)
+    r = await conn.run('sudo chmod 0700 /etc/munge/munge.key', check=True)
+    r = await conn.run('sudo chown -R munge: /etc/munge/munge.key', check=True)
+
+    # r = await conn.run('sudo systemctl enable munge', check=True)
+    # r = await conn.run('sudo systemctl restart munge', check=True)
+
+    slurm_conf_worker_path = '/etc/slurm/slurm.conf'
+    scp_slurm_conf = False
+    ls_r = await conn.run(f'sudo ls {slurm_conf_worker_path}', check=False)
+    if ls_r.returncode == 0:
+        hash_r = await conn.run(f'sudo md5sum {slurm_conf_worker_path}', check=True)
+        if slurm_conf_hash not in hash_r.stdout.strip():
+            scp_slurm_conf = True
+    else:
+        scp_slurm_conf = True
+            
+    if scp_slurm_conf:
+        slurm_conf_host_path = './config/slurm.conf'
+
+        temp_path = '~/slurm.conf'
+        await asyncssh.scp(slurm_conf_host_path, (conn, temp_path))
+        try:
+            await conn.run(f'sudo mv {temp_path} {slurm_conf_worker_path}', check=True)
+        except asyncssh.process.ProcessError as e:
+            if 'No such file or directory' in e.stderr:
+                await conn.run('sudo mkdir -p /etc/slurm', check=True)
+                await conn.run(f'sudo mv {temp_path} {slurm_conf_worker_path}', check=True)
+
+    r = await conn.run('hostname', check=True)
+    if r.stdout != connect_options['username']:
+        r = await conn.run(f'sudo hostnamectl set-hostname {connect_options["username"]}', check=True)
+
+    # make a bsteel user
+    user_b = await conn.run('id bsteel', check=False)
+    if user_b.returncode != 0:
+        r = await conn.run('sudo adduser --disabled-password --gecos "" -u 1001 bsteel', check=True)
+
+    # make a new user with name slurm-user
+    user_r = await conn.run('id slurm', check=False)
+    if user_r.returncode != 0:
+        r = await conn.run('sudo adduser --disabled-password --gecos "" -u 64030 slurm', check=True)
+    elif 'uid=64030(slurm)' not in user_r.stdout:
+        r = await conn.run('sudo userdel slurm', check=True)
+        r = await conn.run('sudo adduser --disabled-password --gecos "" -u 64030 slurm', check=True)
+        await conn.run('sudo usermod -aG sudo slurm', check=True)
+
+    r = await conn.run('ls -lh /var/log/slurm', check=False)
+    if r.returncode != 0:
+        await conn.run('sudo mkdir -p /var/log/slurm', check=True)
+        await conn.run('sudo chown -R slurm:slurm /var/log/slurm', check=True)
+        await conn.run('sudo chmod -R 755 /var/log/slurm', check=True)
+    elif 'slurm:slurm' not in r.stdout:
+        await conn.run('sudo chown -R slurm:slurm /var/log/slurm', check=True)
+        await conn.run('sudo chmod -R 755 /var/log/slurm', check=True)
+
+    r = await conn.run('cat /etc/hosts', check=True)
+    hosts_file = r.stdout
+
+    # Check and remove incorrect lines
+    for ip, host in ip_host_map.items():
+        for line in hosts_file.splitlines():
+            if host in line and line != f"{ip} {host}":
+                # Remove incorrect lines
+                await conn.run(f"sudo sed -i '/{line}/d' /etc/hosts", check=True)
+
+    # Get the updated /etc/hosts file
+    r = await conn.run('cat /etc/hosts', check=True)
+    hosts_file = r.stdout
+
+    # Add correct lines if they are not already present
+    for ip, host in ip_host_map.items():
+        if f"{ip} {host}" not in hosts_file:
+            await conn.run(f"echo '{ip} {host}' | sudo tee -a /etc/hosts", check=True)
+
+    # r = await conn.run('sudo systemctl enable slurmd', check=False)
+    if 'slurmd.service does not exist' in r.stderr:
+        await conn.run('sudo apt install -y slurm-wlm', check=True)
+        await conn.run('sudo systemctl enable slurmd', check=True)
+    await conn.run('sudo systemctl restart slurmd', check=True)
 
     # install python
     r = await conn.run('python3 --version', check=True)
@@ -42,22 +180,31 @@ async def setup_pi(conn, connect_options, reqs=''):
         assert r.stdout.strip() == 'Python 3.10.12'
 
     # setup virtual environment
-    r = await conn.run('ls ~/ben/tiktok/venv', check=False)
-    if r.returncode != 0:
-        r = await conn.run('python3 -m venv ~/ben/tiktok/venv', check=True)
-    else:
-        r = await conn.run('~/ben/tiktok/venv/bin/python --version', check=False)
-        if r.stdout.strip() != 'Python 3.10.12':
-            r = await conn.run('rm -rf ~/ben/tiktok/venv', check=True)
-            r = await conn.run('python3 -m venv ~/ben/tiktok/venv', check=True)
+    for path in ['~/ben', '/home/bsteel']:
+        if '~' not in path:
+            prepend = 'sudo '
+        else:
+            prepend = ''
+        r = await conn.run(f'{prepend}ls {path}/tiktok/venv', check=False)
+        if r.returncode != 0:
+            r = await conn.run(f'{prepend}python3 -m venv {path}/tiktok/venv', check=True)
+        else:
+            r = await conn.run(f'{prepend}{path}/tiktok/venv/bin/python --version', check=False)
+            if r.stdout.strip() != 'Python 3.10.12':
+                r = await conn.run(f'{prepend}rm -rf {path}/tiktok/venv', check=True)
+                r = await conn.run(f'{prepend}python3 -m venv {path}/tiktok/venv', check=True)
 
-    # install requirements
-    r = await conn.run('~/ben/tiktok/venv/bin/pip list', check=True)
-    installed_packages = r.stdout.split('\n')
-    installed_packages = ['=='.join([e for e in p.split(' ') if e]) for p in installed_packages[2:-1]]
-    required_packages = reqs.split()
-    if any([req for req in required_packages if req not in installed_packages]):
-        r = await conn.run(f'~/ben/tiktok/venv/bin/pip install {reqs}', check=True)
+        # install requirements
+        r = await conn.run(f'{prepend}{path}/tiktok/venv/bin/pip list', check=True)
+        installed_packages = r.stdout.split('\n')
+        installed_packages = ['=='.join([e for e in p.split(' ') if e]) for p in installed_packages[2:-1]]
+        required_packages = reqs.split()
+        not_installed_packages = [req for req in required_packages if req not in installed_packages]
+        if not_installed_packages:
+            r = await conn.run(f"{prepend}{path}/tiktok/venv/bin/pip install {' '.join(not_installed_packages)}", check=True)
+
+        if '~' not in path:
+            r = await conn.run(f'sudo chown -R bsteel:bsteel {path}/tiktok', check=True)
 
 
 async def vpn_via_service(conn):
@@ -142,6 +289,8 @@ async def ensure_wifi_connection(conn, connect_options, force_start=False):
     num_tries = 0
     max_tries = 3
     # TODO use google dns64 server to allow ipv6 connections
+    # https://developers.google.com/speed/public-dns/docs/using#linux
+    # https://developers.google.com/speed/public-dns/docs/dns64
     # test if we need password for sudo
     r = await conn.run("sudo -n true", check=False)
     if r.returncode == 1:
@@ -233,7 +382,7 @@ async def ensure_wifi_connection(conn, connect_options, force_start=False):
     else:
         raise Exception("Failed to create wifi connection")
     
-async def start_wifi_connections(hosts, connect_options, progress_bar=True, timeout=10):
+async def start_wifi_connections(hosts, connect_options, progress_bar=True, timeout=10, num_workers=4):
     iterable = list(zip(hosts, connect_options))
     async def run_start_wifi(args):
         host, co  = args
@@ -254,12 +403,12 @@ async def start_wifi_connections(hosts, connect_options, progress_bar=True, time
         else:
             return host, co
 
-    res = await async_amap(run_start_wifi, iterable, num_workers=len(hosts), progress_bar=progress_bar, pbar_desc="Starting wifi connections")
+    res = await async_amap(run_start_wifi, iterable, num_workers=num_workers, progress_bar=progress_bar, pbar_desc="Starting wifi connections")
     working_hosts = [host for host, co in res if host]
     working_connect_options = [co for host, co in res if host]
     return working_hosts, working_connect_options
 
-async def check_connection(hosts, usernames, progress_bar=False, timeout=10):
+async def check_connection(hosts, usernames, progress_bar=False, timeout=10, num_workers=4):
     assert len(hosts) == len(usernames), "Hosts and usernames must be the same length"
     iterable = list(zip(hosts, usernames))
     async def run_connect(args):
@@ -270,7 +419,7 @@ async def check_connection(hosts, usernames, progress_bar=False, timeout=10):
             return False
         else:
             return True
-    results = await async_amap(run_connect, iterable, num_workers=4, pbar_desc="Checking connections", progress_bar=progress_bar)
+    results = await async_amap(run_connect, iterable, num_workers=num_workers, pbar_desc="Checking connections", progress_bar=progress_bar)
     working_hosts = [host for host, res in zip(hosts, results) if res]
     working_usernames = [username for username, res in zip(usernames, results) if res]
     return working_hosts, working_usernames
@@ -427,13 +576,13 @@ async def change_mac_address(conn, connect_options, interface='eth0'):
         r = await conn.run(f"sudo nmcli connection up eduroam", check=True)
 
 async def killall_python(conn):
-    try:
-        r = await conn.run('killall ~/ben/tiktok/venv/bin/python', check=True)
-    except Exception as e:
-        if hasattr(e, 'stderr') and 'no process found' in e.stderr:
+    r = await conn.run('killall ~/ben/tiktok/venv/bin/python', check=False)
+    if r.returncode != 0:
+        stderr = r.stderr
+        if 'no process found' in stderr:
             pass
         else:
-            print(f'Failed to stop: {e}')
+            print(f'Failed to stop on {conn._host}, {conn.get_extra_info("username")}: {stderr}')
 
 async def kill_workers(hosts, connect_options):
     async def run_killall(args):
@@ -449,7 +598,7 @@ async def stop_stale_workers(hosts, connect_options, timeout=10):
         host, co = args
         try:
             conn = await asyncio.wait_for(asyncssh.connect(host, **co), timeout=timeout)
-            await killall_python(conn)
+            await asyncio.wait_for(killall_python(conn), timeout=120)
         except:
             return None, None
         else:
@@ -522,7 +671,7 @@ async def change_mac_addresses(hosts, connect_options, progress_bar=False, **kwa
     args = list(zip(hosts, connect_options))
     await async_amap(run_change_mac_address, args, num_workers=len(hosts), progress_bar=progress_bar, pbar_desc="Changing MAC addresses...")
 
-async def run_on_pis(hosts, connect_options, func, **kwargs):
+async def run_on_pis(hosts, connect_options, func, timeout=2400, **kwargs):
     async def run_func(args):
         host, connect_option, func, kwargs = args
         print(f"Connecting to {host}, {connect_option['username']}...")
@@ -532,18 +681,20 @@ async def run_on_pis(hosts, connect_options, func, **kwargs):
         while tries < max_tries:
             tries += 1
             try:
-                conn = await asyncio.wait_for(asyncssh.connect(host, **connect_option, known_hosts=None), timeout=10)
+                connection_options = {'connect_timeout': '20s', 'keepalive_interval': '10s', 'keepalive_count_max': 10}
+                connection_options = asyncssh.SSHClientConnectionOptions(**connection_options)
+                conn = await asyncio.wait_for(asyncssh.connect(host, **connect_option, known_hosts=None, options=connection_options), timeout=20)
             except Exception as e:
-                print(f"Failed to connect to {host}, {connect_option['username']}: {e}")
-                continue
+                exceptions.append(e)
             else:
                 async with conn:
                     try:
-                        r = await asyncio.wait_for(func(conn, connect_option, **kwargs), timeout=2400)
+                        r = await asyncio.wait_for(func(conn, connect_option, **kwargs), timeout=timeout)
                     except asyncssh.process.ProcessError as e:
                         e.args = (e.args[0], e.stderr, traceback.format_exc())
                         exceptions.append(e)
                     except Exception as e:
+                        e.args = (e.args, traceback.format_exc())
                         exceptions.append(e)
                     else:
                         return r, host, connect_option
@@ -635,33 +786,79 @@ async def main():
     dotenv.load_dotenv()
     potential_usernames = [
         # most reliable batch
-        # 'hoare', 'tarjan', 'miacli', 'fred',
-        # 'geoffrey', 'rivest', 'edmund', 'ivan',
-        # 'cook', 'barbara', 'goldwasser', 'milner',
-        # 'hemming', 'frances', 'lee', 'turing',
-        # 'marvin', 'juris', 'floyd', 'edsger',
+        # 'hoare', 'miacli', 'fred',
+        # 'geoffrey', 'edmund',
+        # 'cook', 'milner', 'juris',
+        # 'hemming', 'lee', 'turing',
+        # 'floyd', 'goldwasser',
         # 'neumann', 'beauvoir', 'satoshi', 'putnam', 
-        # 'fernando', 'edwin'
+        # 'shannon', 'chowning', 
+        # 'tegmark', 'hanson', 'chomsky', 'keynes',
         # next most reliable
-        # 'conway', 'edward',
-        # 'buterin', 'lovelace',
-        # 'arendt', 'chan', 'sutskever',
-        # 'herbert',
-        # 'mordvintsev'
-        "shannon", "chowning", "tegmark", "hanson",
-        "chomsky", "keynes"
+        # 'edward', 'buterin',
+        'arendt', 'chan', 'sutskever', 'herbert',
+        # 'mordvintsev',
+        # to set up
+        # 'marvin', 'frances', 'barbara', 'conway', 'tarjan', 'lovelace', 'edwin', 'edsger', 'fernando', 'rivest',
+        # unreliable
+        # 'ivan'
     ]
     hosts, usernames = await get_hosts_with_retries(potential_usernames, progress_bar=True)
     connect_options = [{'username': username, 'password': 'rp145'} for username in usernames]
 
-    # TODO add more pis to network
     todo = 'setup'
 
     if todo == 'setup':
         with open('worker_requirements.txt', 'r') as f:
             reqs = f.readlines()
         reqs = ' '.join([req.strip() for req in reqs])
-        await run_on_pis(hosts, connect_options, setup_pi, reqs=reqs)
+        with open('hosts.json', 'r') as file:
+            host_ip_map = json.load(file)
+        ip_host_map = {v: k for k, v in host_ip_map.items()}
+        ip_host_map['10.162.43.238'] = 'pfeffer-HP-ProDesk-405-G4-Desktop-Mini'
+
+        # edit slurm conf to ensure up to date IPs
+        slurm_conf_host_path = './config/slurm.conf'
+        with open(slurm_conf_host_path, 'r') as f:
+            slurm_conf = f.read()
+        rewrite_slurm_conf = False
+        node_name_sections = re.findall(r'NodeName=(\S+)', slurm_conf)
+        node_addr_sections = re.findall(r'NodeAddr=(\S+)', slurm_conf)
+        for node_name_section, node_addr_section in zip(node_name_sections, node_addr_sections):
+            node_names = node_name_section.split(',')
+            node_addrs = node_addr_section.split(',')
+            for node_name, node_addr in zip(node_names, node_addrs):
+                if node_addr not in ip_host_map or ip_host_map[node_addr] != node_name:
+                    rewrite_slurm_conf = True
+                    slurm_conf = slurm_conf.replace(node_addr, host_ip_map[node_name])
+        if rewrite_slurm_conf:
+            print("Rewriting slurm.conf file, move to config directory on controller")
+            with open(slurm_conf_host_path, 'w') as f:
+                f.write(slurm_conf)
+
+        slurm_conf_hash = hashlib.md5(slurm_conf.encode('utf-8')).hexdigest()
+
+        # edit hosts file
+        with open('./config/hosts', 'r') as f:
+            hosts_file = f.read()
+
+        rewrite_hosts_file = False
+        # Check and remove incorrect lines
+        for ip, host in ip_host_map.items():
+            for line in hosts_file.splitlines():
+                if host in line and line != f"{ip} {host}":
+                    # Remove incorrect lines
+                    hosts_file = hosts_file.replace(line, f"{ip} {host}")
+                    rewrite_hosts_file = True
+
+        if rewrite_hosts_file:
+            print("Rewriting hosts file, move to config directory on controller")
+            with open('./config/hosts', 'w') as f:
+                f.write(hosts_file)
+
+        r = await run_on_pis(hosts, connect_options, setup_pi, timeout=600, reqs=reqs, ip_host_map=ip_host_map, slurm_conf_hash=slurm_conf_hash)
+        usernames, hosts = zip(*[(co['username'], host) for ret, host, co in r if ret is None])
+        print(f"Successfully set up {usernames} on {hosts}")
     elif todo == 'ping':
         async def ping(conn):
             r = await conn.run('ls', check=True)

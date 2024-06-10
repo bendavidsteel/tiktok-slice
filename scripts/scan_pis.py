@@ -15,15 +15,14 @@ async def main():
         'hemming', 'frances', 'lee', 'turing',
         'marvin', 'juris', 'floyd', 'edsger',
         'neumann', 'beauvoir', 'satoshi', 'putnam', 
-        'fernando', 'edwin'
+        'fernando', 'edwin',
         # next most reliable
-        # 'conway', 'edward',
-        # 'buterin', 'lovelace',
-        # 'arendt', 'chan', 'sutskever',
-        # 'herbert',
-        # 'mordvintsev'
-        # not setup yet
-        "shannon", "chowning", "tegmark", "hanson"
+        'conway', 'edward',
+        'buterin', 'lovelace',
+        'arendt', 'chan', 'sutskever',
+        'herbert',
+        'mordvintsev',
+        "shannon", "chowning", "tegmark", "hanson",
         "chomsky", "keynes"
     ]
     
