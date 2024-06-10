@@ -359,7 +359,7 @@ class ProcessVideo:
         if self.start == -1 or self.end == -1:
             raise InvalidResponseException(
                 "Could not find normal JSON section in returned HTML.",
-                json.dumps({'text': self.text, 'encoding': self.r.encoding}),
+                self.text,
             )
         video_detail = json.loads(self.text)
         if video_detail.get("statusCode", 0) != 0: # assume 0 if not present
