@@ -1,4 +1,6 @@
 import asyncio
+import datetime
+import json
 import logging
 import multiprocessing
 import os
@@ -7,6 +9,7 @@ import subprocess
 import asyncssh
 import av
 import numpy as np
+import pandas as pd
 import torch
 from transformers import XCLIPVisionModel, XCLIPTextModel, AutoProcessor, AutoTokenizer
 import tqdm
@@ -88,9 +91,27 @@ class MultiModalBackend:
         else:
             return video_embeds
 
-def embed_directory(embedding_model, dir_path):
+def embed_directory(embedding_model, video_df, dir_path):
     host_file_paths = [os.path.join(dir_path, server_filename) for server_filename in os.listdir(dir_path) if server_filename.endswith('.mp4')]
     host_file_paths = host_file_paths[200:]
+    byte_video_ids = [os.path.splitext(os.path.basename(host_file_path))[0] for host_file_path in host_file_paths]
+
+    # get video data for each video
+    video_df['return'] = video_df['result'].map(lambda r: r['return'])
+    video_df['id'] = video_df['return'].map(lambda r: r['id'])
+    video_df = video_df[['return', 'id']].rename(columns={'return': 'video'})
+    video_df = video_df[video_df['id'].map(lambda id: id is not None)]
+    meta_video_ids = video_df['id'].tolist()
+    video_ids = list(set(byte_video_ids).intersection(set(meta_video_ids)))
+
+    host_file_paths = [host_file_path for host_file_path in host_file_paths if os.path.splitext(os.path.basename(host_file_path))[0] in video_ids]
+    bytes_video_id_order = [os.path.splitext(os.path.basename(host_file_path))[0] for host_file_path in host_file_paths]
+    video_df = video_df[video_df['id'].isin(video_ids)]
+    # reorder based on host_file_paths
+    video_df = video_df.set_index('id')
+    video_df = video_df.loc[bytes_video_id_order]
+    video_df = video_df.reset_index()
+
     embeddings = None
     i = 0
     max_batch_file_size = 5e7
@@ -100,7 +121,7 @@ def embed_directory(embedding_model, dir_path):
         batch_file_size = 0
         batch_size = 0
         batch_file_paths = []
-        while batch_file_size < max_batch_file_size and batch_size < max_batch_size:
+        while i < len(host_file_paths) and batch_file_size < max_batch_file_size and batch_size < max_batch_size:
             file_stats = os.stat(host_file_paths[i])
             batch_file_paths.append(host_file_paths[i])
             batch_file_size += file_stats.st_size
@@ -119,6 +140,8 @@ def embed_directory(embedding_model, dir_path):
     with open(os.path.join(dir_path, f'video_embeddings.npy'), 'wb') as f:
         np.save(f, embeddings)
 
+    video_df.to_parquet(os.path.join(dir_path, 'videos.parquet.gzip'), compression='gzip')
+
     # delete the files from the host
     for file_path in host_file_paths:
         os.remove(file_path)
@@ -127,20 +150,22 @@ async def main():
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
     root_dir_path = os.path.dirname(this_dir_path)
     host_bytes_dir_path = os.path.join(root_dir_path, 'data', 'bytes')
+    host_results_dir_path = os.path.join(root_dir_path, 'data', 'results')
 
     embedding_model = MultiModalBackend()
 
-    host_dirs = os.listdir(host_bytes_dir_path)
+    # host_dirs = os.listdir(host_bytes_dir_path)
 
-    for host_dir in host_dirs:
-        print(f"Embedding videos in {host_dir}")
-        host_dir_path = os.path.join(host_bytes_dir_path, host_dir)
-        embed_directory(embedding_model, host_dir_path)
+    # for host_dir in host_dirs:
+    #     print(f"Embedding videos in {host_dir}")
+    #     host_dir_path = os.path.join(host_bytes_dir_path, host_dir)
+    #     embed_directory(embedding_model, host_dir_path)
 
     username = os.environ['USERNAME']
     password = os.environ['PASSWORD']
-    host = os.environ['HOST']
-    server_bytes_dir_path = '/media/bsteel/Elements/repos/what-for-where/data/bytes'
+    host = os.environ['ELITE_HOST']
+    server_bytes_dir_path = '/media/bsteel/Elements/tiktok/mp4s/'
+    server_videos_dir_path = '~/repos/what-for-where/data/results/'
 
     connection = await asyncssh.connect(host, username=username, password=password)
     r = await connection.run(f'ls {server_bytes_dir_path}/', check=True)
@@ -148,20 +173,29 @@ async def main():
     server_dirs = [server_dir for server_dir in server_dirs if "." not in server_dir]
     for server_dir in server_dirs:
         print(f"Embedding videos in {server_dir}")
+        dir_time = datetime.datetime.fromtimestamp(int(server_dir))
+        video_path = os.path.join(dir_time.strftime('%Y_%m_%d'), 'hours', str(dir_time.hour), str(dir_time.minute), str(dir_time.second), '0', 'results.parquet.gzip')
+        host_video_path = os.path.join(host_results_dir_path, video_path)
+        if not os.path.exists(host_video_path):
+            os.makedirs(os.path.dirname(host_video_path), exist_ok=True)
+            server_video_path = os.path.join(server_videos_dir_path, video_path)
+            try:
+                await asyncssh.scp((connection, server_video_path), host_video_path)
+            except:
+                print(f"Failed to copy {server_video_path} to {host_video_path}")
+                continue
+        video_df = pd.read_parquet(host_video_path, columns=['result'])
         server_dir_path = os.path.join(server_bytes_dir_path, server_dir)
         host_dir_path = os.path.join(host_bytes_dir_path, server_dir)
         os.makedirs(host_dir_path, exist_ok=True)
-        r = await connection.run(f'ls {server_dir_path}', check=True)
-        server_filenames = r.stdout.split('\n')
-        server_filenames = [server_filename for server_filename in server_filenames if server_filename.endswith('.mp4')]
         
         r = subprocess.run(f'rsync -avz --include="*.mp4" --exclude="*" {username}@{host}:{server_dir_path}/* {host_dir_path}/', shell=True, capture_output=True)
         
         if r.returncode != 0:
             raise Exception(f"Failed to copy files from {server_dir_path} to {host_dir_path}")
         
-        embed_directory(embedding_model, host_dir_path)
+        embed_directory(embedding_model, video_df, host_dir_path)
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.DEBUG)
+    # logging.basicConfig(level=logging.DEBUG)
     asyncio.run(main())

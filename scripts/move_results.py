@@ -7,7 +7,7 @@ import pandas as pd
 import tqdm
 
 
-def get_result_paths(data_dir_path, result_filename='results.parquet.gzip'):
+def get_result_paths(data_dir_path, result_filename='results.json'):
 
     for dir_path, dir_names, filenames in os.walk(os.path.join(data_dir_path, 'results')):
         for filename in filenames:
@@ -15,7 +15,7 @@ def get_result_paths(data_dir_path, result_filename='results.parquet.gzip'):
                 result_path = os.path.join(dir_path, filename)
                 yield result_path
 
-async def get_remote_result_paths(conn, result_filename='results.parquet.gzip'):
+async def get_remote_result_paths(conn, result_filename='results.json'):
     r = await conn.run('ls -R ~/repos/what-for-where/data/results/')
     output = r.stdout
     lines = output.split('\n')
@@ -99,7 +99,7 @@ async def main():
     remote = True
     if remote:
         local_result_dir = os.path.join(data_dir_path, 'results')
-        conn = await asyncssh.connect(os.environ['PRODESK_HOST'], username=os.environ['USERNAME'], password=os.environ['PASSWORD'])
+        conn = await asyncssh.connect(os.environ['ELITE_HOST'], username=os.environ['USERNAME'], password=os.environ['PASSWORD'])
         result_paths = await get_remote_result_paths(conn)
     else:
         result_paths = list(get_result_paths(data_dir_path))
