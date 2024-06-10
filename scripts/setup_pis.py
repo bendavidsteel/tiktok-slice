@@ -366,7 +366,8 @@ async def ensure_wifi_connection(conn, connect_options, force_start=False):
             eduroam_lines = [c for c in connections if c.startswith('eduroam')]
             assert len(eduroam_lines) == 1, "Duplicate eduroam connections"
             eduroam_line = eduroam_lines[0]
-            assert 'wifi' in eduroam_line and 'wlan0' in eduroam_line, "Eduroam connection not setup correctly"
+            if not ('wifi' in eduroam_line and 'wlan0' in eduroam_line):
+                raise Exception("Eduroam connection not setup correctly")
             # check if connection is up
             r = await conn.run("nmcli -f GENERAL.STATE con show eduroam", check=True)
             if 'activated' not in r.stdout or force_start:
@@ -374,6 +375,12 @@ async def ensure_wifi_connection(conn, connect_options, force_start=False):
                 r = await conn.run(f"{prepend} nmcli connection up eduroam", check=True)
         except asyncssh.misc.ChannelOpenError:
             raise
+        except asyncssh.process.ProcessError as e:
+            if "Error: Connection activation failed" in e.stderr:
+                # delete connection and try again
+                r = await conn.run(f"{prepend} nmcli con delete eduroam", check=True)
+            else:
+                raise
         except Exception as e:
             # delete connection and try again
             r = await conn.run(f"{prepend} nmcli con delete eduroam", check=True)
@@ -646,11 +653,30 @@ async def get_connect_latency(hosts, connect_options):
     hosts, connect_options, latencies = zip(*results)
     return hosts, connect_options, latencies
 
+async def restart_down_slurm_nodes(hosts, connect_options, progress_bar=True):
+    res = subprocess.check_output('sinfo', shell=True)
+    lines = res.decode('utf-8').split('\n')
+    down_lines = [line for line in lines if 'down*' in line]
+    if len(down_lines) == 0:
+        return
+    down_line = down_lines[0]
+    down_nodes = down_line.split(' ')[-1].split(',')
+    if len(down_nodes) == 0:
+        return
+    if not any(co for co in connect_options if co['username'] in down_nodes):
+        return
+    down_hosts, down_connect_options = zip(*[(host, connect_option) for host, connect_option in zip(hosts, connect_options) if connect_option['username'] in down_nodes])
+    
+    async def restart_slurmd(conn, co):
+        r = await conn.run('sudo systemctl restart slurmd', check=True)
+    
+    await run_on_pis(down_hosts, down_connect_options, restart_slurmd)
+
 async def change_mac_addresses(hosts, connect_options, progress_bar=False, **kwargs):
     async def run_change_mac_address(args):
         host, co = args
         tries = 0
-        max_tries = 3
+        max_tries = 1
         exceptions = []
         while tries < max_tries:
             tries += 1
@@ -671,7 +697,7 @@ async def change_mac_addresses(hosts, connect_options, progress_bar=False, **kwa
     args = list(zip(hosts, connect_options))
     await async_amap(run_change_mac_address, args, num_workers=len(hosts), progress_bar=progress_bar, pbar_desc="Changing MAC addresses...")
 
-async def run_on_pis(hosts, connect_options, func, timeout=2400, **kwargs):
+async def run_on_pis(hosts, connect_options, func, timeout=2400, num_workers=4, **kwargs):
     async def run_func(args):
         host, connect_option, func, kwargs = args
         print(f"Connecting to {host}, {connect_option['username']}...")
@@ -683,7 +709,9 @@ async def run_on_pis(hosts, connect_options, func, timeout=2400, **kwargs):
             try:
                 connection_options = {'connect_timeout': '20s', 'keepalive_interval': '10s', 'keepalive_count_max': 10}
                 connection_options = asyncssh.SSHClientConnectionOptions(**connection_options)
-                conn = await asyncio.wait_for(asyncssh.connect(host, **connect_option, known_hosts=None, options=connection_options), timeout=20)
+                if 'known_hosts' not in connect_option:
+                    connect_option['known_hosts'] = None
+                conn = await asyncio.wait_for(asyncssh.connect(host, **connect_option, options=connection_options), timeout=20)
             except Exception as e:
                 exceptions.append(e)
             else:
@@ -703,7 +731,7 @@ async def run_on_pis(hosts, connect_options, func, timeout=2400, **kwargs):
             return None, host, connect_option
 
     args = list(zip(hosts, connect_options, [func] * len(hosts), [kwargs] * len(hosts)))
-    results = await async_amap(run_func, args, num_workers=len(hosts), progress_bar=True)
+    results = await async_amap(run_func, args, num_workers=num_workers, progress_bar=True)
     return results
 
 async def get_hosts(usernames):
@@ -786,27 +814,27 @@ async def main():
     dotenv.load_dotenv()
     potential_usernames = [
         # most reliable batch
-        # 'hoare', 'miacli', 'fred',
-        # 'geoffrey', 'edmund',
-        # 'cook', 'milner', 'juris',
-        # 'hemming', 'lee', 'turing',
-        # 'floyd', 'goldwasser',
-        # 'neumann', 'beauvoir', 'satoshi', 'putnam', 
-        # 'shannon', 'chowning', 
-        # 'tegmark', 'hanson', 'chomsky', 'keynes',
+        'hoare',
+        'marvin', 
+        'milner', 'juris',
+        'hemming', 'lee', 
+        'turing', 'frances', 'miacli', 'edmund', 'ivan',
+        'floyd', 'goldwasser',
+        'neumann', 'beauvoir', 'satoshi', 'putnam', 
+        'shannon', 'chowning', 
+        'tegmark', 'hanson', 'chomsky', 'keynes',
         # next most reliable
-        # 'edward', 'buterin',
+        'edward', 'buterin',
         'arendt', 'chan', 'sutskever', 'herbert',
-        # 'mordvintsev',
-        # to set up
-        # 'marvin', 'frances', 'barbara', 'conway', 'tarjan', 'lovelace', 'edwin', 'edsger', 'fernando', 'rivest',
-        # unreliable
-        # 'ivan'
+        'barbara', 'conway', 'tarjan', 'lovelace', 'edwin', 'edsger', 'fernando', 'rivest',
+        'mordvintsev',
+        'cook', 'geoffrey', 'fred',
+        # 
     ]
     hosts, usernames = await get_hosts_with_retries(potential_usernames, progress_bar=True)
     connect_options = [{'username': username, 'password': 'rp145'} for username in usernames]
 
-    todo = 'setup'
+    todo = 'change_ip'
 
     if todo == 'setup':
         with open('worker_requirements.txt', 'r') as f:
@@ -915,7 +943,8 @@ async def main():
             return {'os_type': os_type, 'username': co['username']}
         os_types = await run_on_pis(hosts, connect_options, get_os)
         print(f"OS Types: {os_types}")
-
+    elif todo == 'restart_down_nodes':
+        await restart_down_slurm_nodes(hosts, connect_options)
     else:
         raise ValueError(f"Unknown todo: {todo}")
 
