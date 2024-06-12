@@ -112,10 +112,20 @@ def embed_directory(embedding_model, video_df, dir_path):
     video_df = video_df.loc[bytes_video_id_order]
     video_df = video_df.reset_index()
 
+    embedding_path = os.path.join(dir_path, 'video_embeddings.npy')
+    video_path = os.path.join(dir_path, 'videos.parquet.gzip')
+
+    if os.path.exists(embedding_path) and os.path.exists(video_path):
+        embeddings = np.load(embedding_path)
+        saved_video_df = pd.read_parquet(video_path)
+
+        if embeddings.shape[0] == video_df.shape[0] and all(saved_video_df['id'] == video_df['id']):
+            return
+
     embeddings = None
     i = 0
     max_batch_file_size = 5e7
-    max_batch_size = 3
+    max_batch_size = 8
     pbar = tqdm.tqdm(total=len(host_file_paths))
     while i < len(host_file_paths):
         batch_file_size = 0
@@ -129,22 +139,25 @@ def embed_directory(embedding_model, video_df, dir_path):
             i += 1
 
         # embed the videos
-        batch_embeddings = embedding_model.embed_videos(batch_file_paths)
+        try:
+            batch_embeddings = embedding_model.embed_videos(batch_file_paths)
+        except Exception as e:
+            print(f"Failed to embed videos: {e}")
+            continue
         pbar.update(batch_size)
         if embeddings is None:
             embeddings = batch_embeddings
         else:
             embeddings = np.concatenate([embeddings, batch_embeddings], axis=0)
-        print(f"Embedding size: {embeddings.nbytes / 1e6} MB")
 
-    with open(os.path.join(dir_path, f'video_embeddings.npy'), 'wb') as f:
+    with open(embedding_path, 'wb') as f:
         np.save(f, embeddings)
 
-    video_df.to_parquet(os.path.join(dir_path, 'videos.parquet.gzip'), compression='gzip')
+    video_df.to_parquet(video_path, compression='gzip')
 
     # delete the files from the host
-    for file_path in host_file_paths:
-        os.remove(file_path)
+    # for file_path in host_file_paths:
+    #     os.remove(file_path)
 
 async def main():
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
@@ -170,11 +183,11 @@ async def main():
     connection = await asyncssh.connect(host, username=username, password=password)
     r = await connection.run(f'ls {server_bytes_dir_path}/', check=True)
     server_dirs = r.stdout.split('\n')
-    server_dirs = [server_dir for server_dir in server_dirs if "." not in server_dir]
+    server_dirs = [server_dir for server_dir in server_dirs if server_dir and "." not in server_dir]
     for server_dir in server_dirs:
         print(f"Embedding videos in {server_dir}")
         dir_time = datetime.datetime.fromtimestamp(int(server_dir))
-        video_path = os.path.join(dir_time.strftime('%Y_%m_%d'), 'hours', str(dir_time.hour), str(dir_time.minute), str(dir_time.second), '0', 'results.parquet.gzip')
+        video_path = os.path.join(dir_time.strftime('%Y_%m_%d'), 'hours', str(dir_time.hour), str(dir_time.minute), str(dir_time.second), 'results.parquet.gzip')
         host_video_path = os.path.join(host_results_dir_path, video_path)
         if not os.path.exists(host_video_path):
             os.makedirs(os.path.dirname(host_video_path), exist_ok=True)
