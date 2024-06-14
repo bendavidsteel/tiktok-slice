@@ -349,6 +349,7 @@ async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_si
                                 elif cluster_type == 'ssh' or cluster_type == 'slurm':
                                     # reset mac address of raspberry pis and rescan for the new assigned IPs
                                     print("Changing worker IPs...")
+                                    # TODO run via slurm
                                     await cluster_manager.change_mac_addresses()
                                     num_reqs_for_current_ips = 0
                                     num_exceptions_for_current_ips = 0
@@ -706,6 +707,25 @@ async def get_random_sample(
     potential_video_bits = itertools.product(all_timestamp_bits, other_bit_sequences)
     potential_video_bits = [''.join(bits) for bits in potential_video_bits]
     potential_video_ids = [int(bits, 2) for bits in potential_video_bits]
+
+    date_dir = start_time.strftime('%Y_%m_%d')
+    results_dir_path = os.path.join(this_dir_path, '..', 'data', 'results', date_dir, 'hours', str(start_time.hour), str(start_time.minute), str(start_time.second))
+    existing_results = False
+    if os.path.exists(results_dir_path):
+        if os.path.exists(os.path.join(results_dir_path, 'results.parquet.gzip')):
+            # remove ids that have already been collected
+            try:
+                existing_df = pd.read_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'), columns=['args'])
+            except Exception as e:
+                print(f"Error reading existing results: {e}")
+            else:
+                existing_results = True
+                collected_ids = set(existing_df['args'])
+                potential_video_ids = [id for id in potential_video_ids if id not in collected_ids]
+                if len(potential_video_ids) == 0:
+                    print("All potential video IDs have been collected")
+                    return
+
     dataset = TaskDataset(potential_video_ids)
 
     if method == 'async':
@@ -763,52 +783,53 @@ async def get_random_sample(
     with open(os.path.join(results_dir_path, 'parameters.json'), 'w') as f:
         json.dump(params, f)
 
-    try:
-        dict_results = [
-            {
-                'args': r.args, 
-                'exceptions': [{
-                        'exception': str(e['exception']),
-                        'pre_time': e['pre_time'] if e['pre_time'] else None,
-                        'post_time': e['post_time']
-                    }
-                    for e in r.exceptions
-                ], 
-                'result': {
-                    'return': r.result['res'] if r.result is not None else None,
-                    'pre_time': r.result['pre_time'] if r.result is not None else None,
-                    'post_time': r.result['post_time'] if r.result is not None else None
-                },
-                'completed': r.completed
-            }
-            for r in results
-        ]
-        df = pd.DataFrame(dict_results)
-        df.to_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'), compression='gzip')
-    except Exception as e:
-        print(e)
-        # convert to jsonable format
-        json_results = [
+    dict_results = [
         {
             'args': r.args, 
             'exceptions': [{
                     'exception': str(e['exception']),
-                    'pre_time': e['pre_time'].isoformat() if e['pre_time'] else None,
-                    'post_time': e['post_time'].isoformat()
+                    'pre_time': e['pre_time'] if e['pre_time'] else None,
+                    'post_time': e['post_time']
                 }
                 for e in r.exceptions
             ], 
             'result': {
                 'return': r.result['res'] if r.result is not None else None,
-                'pre_time': r.result['pre_time'].isoformat() if r.result is not None else None,
-                'post_time': r.result['post_time'].isoformat() if r.result is not None else None
+                'pre_time': r.result['pre_time'] if r.result is not None else None,
+                'post_time': r.result['post_time'] if r.result is not None else None
             },
             'completed': r.completed
         }
         for r in results
     ]
-        with open(os.path.join(results_dir_path, 'results.json'), 'w') as f:
-            json.dump(json_results, f)
+    df = pd.DataFrame(dict_results)
+
+    if existing_results:
+        existing_df = pd.read_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'))
+        new_df = df
+        df = pd.concat([new_df, existing_df])
+
+        try:
+            df.to_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'), compression='gzip')
+        except:
+            if existing_df['result'].map(lambda r: isinstance(r['post_time'], str) if r is not None else False).any():
+                existing_df['exceptions'] = existing_df['exceptions'].map(lambda e: [{
+                    'exception': e['exception'], 
+                    'pre_time': datetime.datetime.fromisoformat(e['pre_time']) if e['pre_time'] and isinstance(e['pre_time'], str) else None, 
+                    'post_time': datetime.datetime.fromisoformat(e['post_time']) if isinstance(e['post_time'], str) else None
+                    } for e in e])
+                existing_df['result'] = existing_df['result'].map(lambda r: {
+                    'return': r['return'] if r is not None else None,
+                    'pre_time': datetime.datetime.fromisoformat(r['pre_time']) if r is not None and isinstance(r['pre_time'], str) else None,
+                    'post_time': datetime.datetime.fromisoformat(r['post_time']) if r is not None and isinstance(r['post_time'], str) else None
+                })
+                pd.concat([new_df, existing_df]).to_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'), compression='gzip')
+            else:
+                raise ValueError("Existing results are not in string format")
+    else:
+        df.to_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'), compression='gzip')
+
+    
 
 async def run_random_sample():
     generation_strategy = 'all'
@@ -817,7 +838,7 @@ async def run_random_sample():
     num_time = 1
     time_unit = 'h'
     num_workers = 36
-    reqs_per_ip = 20000
+    reqs_per_ip = 5000
     batch_size = 10000
     task_batch_size = 50
     task_nthreads = 10
@@ -852,10 +873,6 @@ async def run_random_sample():
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
     date_dir = start_time.strftime('%Y_%m_%d')
     for actual_start_time in actual_start_times:
-        results_dir_path = os.path.join(this_dir_path, '..', 'data', 'results', date_dir, 'hours', str(actual_start_time.hour), str(actual_start_time.minute), str(actual_start_time.second))
-        if os.path.exists(results_dir_path):
-            print(f"Skipping as {results_dir_path} exists")
-            continue
         await get_random_sample(
             generation_strategy,
             actual_start_time,
