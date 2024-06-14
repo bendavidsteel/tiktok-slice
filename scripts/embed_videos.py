@@ -147,7 +147,7 @@ def embed_directory(embedding_model, video_df, dir_path):
     embeddings = None
     i = 0
     max_batch_file_size = 5e7
-    max_batch_size = 64
+    max_batch_size = 16
     pbar = tqdm.tqdm(total=len(host_file_paths))
     while i < len(host_file_paths):
         batch_file_size = 0
@@ -230,8 +230,8 @@ async def main():
             server_video_path = os.path.join(server_videos_dir_path, video_path)
             try:
                 await asyncssh.scp((connection, server_video_path), host_video_path)
-            except:
-                print(f"Failed to copy {server_video_path} to {host_video_path}")
+            except Exception as e:
+                print(f"Failed to copy {server_video_path} to {host_video_path}: {e}")
                 continue
         video_df = pd.read_parquet(host_video_path, columns=['result'])
         server_dir_path = os.path.join(server_bytes_dir_path, server_dir)
@@ -241,7 +241,8 @@ async def main():
         r = subprocess.run(f'rsync -avz --include="*.mp4" --exclude="*" {username}@{host}:{server_dir_path}/* {host_dir_path}/', shell=True, capture_output=True)
         
         if r.returncode != 0:
-            raise Exception(f"Failed to copy files from {server_dir_path} to {host_dir_path}")
+            print(f"Failed to copy files from {server_dir_path} to {host_dir_path}: {r.stderr}")
+            continue
         
         embed_directory(embedding_model, video_df, host_dir_path)
 

@@ -80,7 +80,10 @@ def main():
         images=video_df['image'].tolist()
     )
 
-    df = topic_model.get_topic_info()
+    video_df['topic'] = topics
+    video_df.to_parquet(os.path.join(this_dir_path, '..', 'data', 'video_topics.parquet.gzip'))
+
+    topic_info_df = topic_model.get_topic_info()
 
     def image_base64(im):
         if isinstance(im, str):
@@ -94,7 +97,8 @@ def main():
         return f'<img src="data:image/jpeg;base64,{image_base64(im)}">'
 
     topic_info_path = os.path.join(this_dir_path, '..', 'data', 'topic_info.html')
-    df.to_html(topic_info_path, formatters={'Visual_Aspect': image_formatter}, escape=False)
+    topic_info_df.to_html(topic_info_path, formatters={'Visual_Aspect': image_formatter}, escape=False)
+    topic_info_df[['Topic', 'Count', 'Name', 'Representation', 'Representative_Docs']].to_parquet(os.path.join(this_dir_path, '..', 'data', 'topic_info.parquet.gzip'))
 
 if __name__ == '__main__':
     main()
