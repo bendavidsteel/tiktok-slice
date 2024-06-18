@@ -22,6 +22,7 @@ from dask_jobqueue import SLURMCluster as DaskSLURMCluster
 import dotenv
 import pandas as pd
 import pycurl
+import randmac
 from random_user_agent import user_agent as rug_user_agent
 from random_user_agent import params as rug_params
 from tqdm import tqdm
@@ -31,28 +32,119 @@ from dask_extensions import UnreliableSSHCluster
 from map_funcs import _amap
 from setup_pis import change_mac_addresses, get_hosts_with_retries, start_wifi_connections, restart_down_slurm_nodes, stop_stale_workers
 
-async def async_map(func, args, num_workers=10):
-    all_pbar = tqdm(total=len(args))
-    func = AsyncDaskFunc(func)
-    tasks = [DaskTask(arg) for arg in args]
-    while len([t for t in tasks if not t.completed]) > 0:
-        batch_tasks = [t for t in tasks if not t.completed]
-        batch_pbar = atqdm(total=len(args))
-        def callback(*_):
-            batch_pbar.update(1)
-        res = await _amap(func, batch_tasks, max_concurrent_tasks=num_workers, callback=callback)
-        batch_pbar.close()
-        for t, r in zip(batch_tasks, res):
-            if r['exception'] is not None:
-                t.exceptions.append(r)
-                if len(t.exceptions) >= 3:
-                    t.completed = True
-                    all_pbar.update(1)
+def ensure_wifi_connection(wlan_username, wlan_password, force_start=False, password=None):
+    num_tries = 0
+    max_tries = 3
+    # TODO use google dns64 server to allow ipv6 connections
+    # https://developers.google.com/speed/public-dns/docs/using#linux
+    # https://developers.google.com/speed/public-dns/docs/dns64
+    # prepend = ["sudo"]
+    r = subprocess.run(["sudo", "-n", "true"], capture_output=True)
+    if r.returncode == 1:
+        prepend = ["echo", password, "|", "sudo", "-S"]
+    else:
+        prepend = ["sudo"]
+
+    def create_wifi_connection():
+        command = prepend + ["nmcli", "con", "add", "type", "wifi", "con-name", '"eduroam"', "ifname", '"wlan0"', "ssid", '"eduroam"', "wifi-sec.key-mgmt", '"wpa-eap"', "802-1x.identity", wlan_username, "802-1x.password", wlan_password, "802-1x.system-ca-certs", '"yes"', "802-1x.eap", '"peap"', "802-1x.phase2-auth", '"mschapv2"']
+        r = subprocess.run(command, capture_output=True)
+        assert r.returncode == 0, f"Error creating connection: {r.stderr}"
+
+    def get_wifi_connections():
+        try:
+            r = subprocess.run(["nmcli", "con"], capture_output=True)
+        except Exception as e:
+            if e.stderr == "Error: NetworkManager is not running.":
+                r = subprocess.run(["sudo", "systemctl", "start", "NetworkManager"], capture_output=True)
+                r = subprocess.run(["nmcli", "con"], capture_output=True)
             else:
-                t.result = r
-                t.completed = True
-                all_pbar.update(1)
-    return tasks
+                raise
+        connections = r.stdout.decode('utf-8').split('\n')
+        return connections
+
+    exceptions = []
+    while num_tries < max_tries:
+        num_tries += 1
+        try:
+            # check if wifi connection exists
+            connections = get_wifi_connections()
+            
+            eduroam_lines = [c for c in connections if c.startswith('eduroam')]
+            if len(eduroam_lines) == 0:
+                # create wifi connection
+                create_wifi_connection()
+                connections = get_wifi_connections()
+            elif len(eduroam_lines) > 1:
+                # delete duplicate connections
+                # find if any all valid
+                valid_eduroam_line = None
+                for eduroam_line in eduroam_lines:
+                    reqs = [' wifi ', ' wlan0 ']
+                    if all(req in eduroam_line for req in reqs):
+                        valid_eduroam_line = eduroam_line
+                if valid_eduroam_line:
+                    invalid_eduroam_lines = [eduroam_line for eduroam_line in eduroam_lines if eduroam_line != valid_eduroam_line]
+                    # get uuids
+                    uuids = [line.split(' ')[1] for line in invalid_eduroam_lines]
+                    # delete invalid connections
+                    for uuid in uuids:
+                        r = subprocess.run(prepend + ["nmcli", "con", "delete", uuid], capture_output=True)
+                else:
+                    # delete all connections
+                    for eduroam_line in eduroam_lines:
+                        uuid = eduroam_line.split(' ')[1]
+                        r = subprocess.run(prepend + ["nmcli", "con", "delete", uuid], capture_output=True)
+                    # create wifi connection
+                    create_wifi_connection()
+                connections = get_wifi_connections()
+
+            elif len(eduroam_lines) == 1:
+                eduroam_line = eduroam_lines[0]
+                reqs = [' wifi ', ' wlan0 ']
+                if not all(req in eduroam_line for req in reqs):
+                    # delete existing connection
+                    r = subprocess.run(prepend + ["nmcli", "con", "delete", "eduroam"], capture_output=True)
+                    # create wifi connection
+                    create_wifi_connection()
+                    connections = get_wifi_connections()
+            assert any(c.startswith('eduroam') for c in connections), "No eduroam connection"
+            eduroam_lines = [c for c in connections if c.startswith('eduroam')]
+            assert len(eduroam_lines) == 1, "Duplicate eduroam connections"
+            eduroam_line = eduroam_lines[0]
+            if not ('wifi' in eduroam_line and 'wlan0' in eduroam_line):
+                raise Exception("Eduroam connection not setup correctly")
+            # check if connection is up
+            r = subprocess.run(["nmcli", "-f", "GENERAL.STATE", "con", "show", "eduroam"], capture_output=True)
+            if 'activated' not in r.stdout.decode('utf-8') or force_start:
+                # start wifi connection
+                r = subprocess.run(prepend + ["nmcli", "connection", "up", "eduroam"], capture_output=True)
+        except Exception as e:
+            # delete connection and try again
+            exceptions.append(e)
+            r = subprocess.run(prepend + ["nmcli", "con", "delete", "eduroam"], capture_output=True)
+        else:
+            break
+    else:
+        raise Exception(f"Failed to create wifi connection: {exceptions}")
+    
+def change_mac_address(wlan_username, wlan_password, password=None):
+    random_mac = str(randmac.RandMac())
+    # ensure eduroam connection exists
+    ensure_wifi_connection(wlan_username, wlan_password, password=password)
+
+    # prepend = ["sudo"]
+    r = subprocess.run(["sudo", "-n", "true"], capture_output=True)
+    if r.returncode == 1:
+        prepend = ["echo", password, "|", "sudo", "-S"]
+    else:
+        prepend = ["sudo"]
+    change_mac_cmd = prepend + ["nmcli", "con", "modify", "--temporary", "eduroam", "802-11-wireless.cloned-mac-address", random_mac]
+    r = subprocess.run(" ".join(change_mac_cmd), capture_output=True, shell=True)
+    if r.returncode != 0:
+        raise subprocess.CalledProcessError(r.returncode, " ".join(change_mac_cmd), stderr=r.stderr, output=r.stdout)
+    ensure_wifi_connection(wlan_username, wlan_password)
+    r = subprocess.run(prepend + ["nmcli", "connection", "up", "eduroam"], capture_output=True)
+    
 
 def thread_map(*args, function=None, num_workers=10):
     assert function is not None, "function must be provided"
@@ -92,14 +184,15 @@ class ClusterManager:
         self.max_latency = 5
 
     async def get_hosts(self):
-        hosts, usernames = await get_hosts_with_retries(self.potential_usernames, max_tries=2, progress_bar=True, timeout=self.max_latency)
-        return hosts, usernames
+        self.hosts, usernames = await get_hosts_with_retries(self.potential_usernames, max_tries=2, progress_bar=True, timeout=self.max_latency)
+        self.connect_options = self.get_connect_options(usernames)
+        return self.hosts, self.connect_options
 
-    async def stop_stale_workers(self, hosts, connect_options):
-        return await stop_stale_workers(hosts, connect_options, timeout=self.max_latency)
+    async def stop_stale_workers(self):
+        return await stop_stale_workers(self.hosts, self.connect_options, timeout=self.max_latency)
     
-    async def start_wifi_connections(self, hosts, connect_options):
-        self.hosts, self.connect_options = await start_wifi_connections(hosts, connect_options, progress_bar=True, timeout=self.max_latency)
+    async def start_wifi_connections(self):
+        self.hosts, self.connect_options = await start_wifi_connections(self.hosts, self.connect_options, progress_bar=True, timeout=self.max_latency)
         return self.hosts, self.connect_options
     
     async def change_mac_addresses(self):
@@ -147,10 +240,9 @@ class DaskCluster:
             self.cluster = DaskLocalCluster()
         elif self.cluster_type == 'ssh':
             print("Finding hosts...")
-            hosts, usernames = await self.manager.get_hosts()
-            connect_options = self.manager.get_connect_options(usernames)
+            hosts, connect_options = await self.manager.get_hosts()
             
-            await self.manager.stop_stale_workers(hosts, connect_options)
+            await self.manager.stop_stale_workers()
             print("Starting wifi connections...")
             hosts, connect_options = await self.manager.start_wifi_connections(hosts, connect_options)
 
@@ -190,28 +282,33 @@ class DaskCluster:
             remote_python='~/tiktok/venv/bin/python'
             account = 'bsteel'
             # TODO could run this via slurm
-            hosts, usernames = await self.manager.get_hosts()
-            connect_options = self.manager.get_connect_options(usernames)
-            await self.manager.start_wifi_connections(hosts, connect_options)
+            hosts, connect_options = await self.manager.get_hosts()
+            await self.manager.start_wifi_connections()
             await self.manager.restart_down_slurm_nodes()
 
             host_address = subprocess.check_output(['hostname', '-I']).decode().strip()
+            worker_network_interface = 'eth0'
+            scheduler_network_interface = 'eno1'
+            num_workers = 37
             self.cluster = DaskSLURMCluster(
                 queue='debug',
                 account=account,
                 cores=4,
                 processes=1,
+                interface=worker_network_interface,
                 memory="3200 MB",
-                n_workers=36, # TODO ensure this gives us max workers
+                n_workers=num_workers, # TODO ensure this gives us max workers
+                worker_extra_args=['--worker-port', '9000'],
                 walltime='00:30:00',
                 python=remote_python,
-                scheduler_options={'host': host_address},
+                scheduler_options={'host': host_address},#, 'interface': scheduler_network_interface},
                 local_directory=f'/home/{account}/tiktok',
                 log_directory=f'/home/{account}/tiktok',
                 shared_temp_directory=f'/home/{account}/tiktok',
                 job_extra_directives=[f'-D /home/{account}/tiktok'],  # Ensure tasks run in directory they have permissions in
                 asynchronous=True
             )
+            await self.cluster.scale(num_workers)
 
         return self.cluster
     
@@ -268,6 +365,12 @@ class TaskDataset:
     def __len__(self):
         return len(self.tasks)
 
+def get_workers(cluster, cluster_manager):
+    workers = list(cluster.scheduler.workers.keys())
+    if len(workers) == 0:
+        workers = [f"tcp://{worker_ip}:9000" for worker_ip in cluster_manager.hosts]
+    return workers
+
 async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_size=100000, task_batch_size=1000, max_task_tries=5, task_nthreads=1, task_timeout=10, worker_cpu=256, worker_mem=512, cluster_type='local'):
     network_interfaces = ['eth0', 'wlan0'] if cluster_type in ['ssh', 'slurm'] else [None]
     interface_ratios = [0.8, 0.2] if cluster_type in ['ssh', 'slurm'] else [1]
@@ -278,6 +381,11 @@ async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_si
     dotenv.load_dotenv()
     tasks_progress_bar = tqdm(total=len(dataset), desc="All Tasks")
     batch_progress_bar = tqdm(total=min(batch_size, len(dataset)), desc="Batch Tasks", leave=False)
+
+    wlan_username = os.environ['EDUROAM_USERNAME']
+    wlan_password = os.environ['EDUROAM_PASSWORD']
+    raspi_password = os.environ['RASPI_PASSWORD']
+    slurm_account_password = os.environ['SCHEDULER_PASSWORD']
 
     num_cluster_errors = 0
     max_cluster_errors = 3
@@ -291,8 +399,6 @@ async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_si
                         cluster.adapt(minimum=1, maximum=num_workers)
                         # wait for workers to start
                         client.wait_for_workers(1, timeout=120)
-                    # if isinstance(cluster, DaskSLURMCluster):
-                    #     cluster.adapt(minimum=1, maximum=999)
                     num_reqs_for_current_ips = 0
                     num_exceptions_for_current_ips = 0
                     while dataset.num_left() > 0:
@@ -349,10 +455,21 @@ async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_si
                                 elif cluster_type == 'ssh' or cluster_type == 'slurm':
                                     # reset mac address of raspberry pis and rescan for the new assigned IPs
                                     print("Changing worker IPs...")
-                                    # TODO run via slurm
-                                    await cluster_manager.change_mac_addresses()
+                                    # moving these before so that even if we get exception, we know we tried
                                     num_reqs_for_current_ips = 0
                                     num_exceptions_for_current_ips = 0
+                                    # await cluster_manager.change_mac_addresses()
+                                    res = await client.run(
+                                        change_mac_address, 
+                                        wlan_username, 
+                                        wlan_password,
+                                        password=slurm_account_password,
+                                        on_error='return',
+                                        workers=get_workers(cluster, cluster_manager)
+                                    )
+                                    num_res = len(res)
+                                    num_success = len([r for addr, r in res.items() if r is None])
+                                    print(f"Changed {num_success} out of {num_res} worker MAC addresses")
                         # catch exceptions that are recoverable without restarting the cluster
                         except RestartClusterException:
                             raise
@@ -608,36 +725,6 @@ class MultiNetworkInterfaceFunc:
         return [r for result in results for r in result]
         
     
-class AsyncDaskFunc:
-    def __init__(self, func):
-        self.func = func
-
-    async def __call__(self, arg):
-        
-        pre_time = datetime.datetime.now()
-        try:
-            res = await self.func(arg)
-            exception = None
-        except Exception as e:
-            res = None
-            exception = e
-        post_time = datetime.datetime.now()
-
-        return {
-            'res': res,
-            'exception': exception,
-            'pre_time': pre_time,
-            'post_time': post_time,
-        }
-    
-class AsyncDaskBatchFunc:
-    def __init__(self, func, task_nthreads=1):
-        self.func = func
-        self.task_nthreads = task_nthreads
-
-    async def __call__(self, batch_args):
-        return async_map(self.func, batch_args, num_workers=self.task_nthreads)
-
 class DaskTask:
     def __init__(self, args):
         self.args = args
@@ -900,10 +987,10 @@ def get_ip(_, network_interface):
 async def run_get_ips():
     results = await dask_map(
         get_ip, 
-        TaskDataset(range(200)), 
-        reqs_per_ip=200, 
-        batch_size=200,
-        task_batch_size=5,
+        TaskDataset(range(100)), 
+        reqs_per_ip=5, 
+        batch_size=5,
+        task_batch_size=1,
         task_timeout=10,
         task_nthreads=5,
         cluster_type='slurm'
@@ -915,8 +1002,8 @@ async def run_get_ips():
 async def main():
     # logging.basicConfig(level=logging.DEBUG)
     dotenv.load_dotenv()
-    await run_random_sample()
-    # await run_get_ips()
+    # await run_random_sample()
+    await run_get_ips()
 
 if __name__ == '__main__':
     asyncio.run(main())

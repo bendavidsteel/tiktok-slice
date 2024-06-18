@@ -2,7 +2,7 @@ import asyncio
 
 import dotenv
 
-from setup_pis import get_hosts_with_retries
+from scripts.ssh_setup_pis import get_hosts_with_retries
 
 async def main():
     dotenv.load_dotenv()

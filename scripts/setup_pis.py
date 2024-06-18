@@ -14,7 +14,7 @@ import tqdm
 
 from map_funcs import async_amap
 
-async def setup_pi(conn, connect_options, reqs='', ip_host_map={}, slurm_conf_hash=None):
+async def setup_pi(conn, connect_options, reqs='', ip_host_map={}, slurm_conf_hash=None, bsteel_password=None):
 
     r = await conn.run('pwd', check=True)
     if r.stdout.strip() != f'/home/{connect_options["username"]}':
@@ -123,6 +123,9 @@ async def setup_pi(conn, connect_options, reqs='', ip_host_map={}, slurm_conf_ha
     user_b = await conn.run('id bsteel', check=False)
     if user_b.returncode != 0:
         r = await conn.run('sudo adduser --disabled-password --gecos "" -u 1001 bsteel', check=True)
+        await conn.run('sudo usermod -aG sudo bsteel', check=True)
+        # check password
+        await conn.run(f"echo bsteel:{bsteel_password} | sudo chpasswd", check=True)
 
     # make a new user with name slurm-user
     user_r = await conn.run('id slurm', check=False)
@@ -695,7 +698,7 @@ async def change_mac_addresses(hosts, connect_options, progress_bar=False, **kwa
         else:
             raise Exception(f"Failed to change MAC address on {host} (username: {co['username']}) after {max_tries} tries: {exceptions}")
     args = list(zip(hosts, connect_options))
-    await async_amap(run_change_mac_address, args, num_workers=4, progress_bar=progress_bar, pbar_desc="Changing MAC addresses...")
+    await async_amap(run_change_mac_address, args, num_workers=8, progress_bar=progress_bar, pbar_desc="Changing MAC addresses...")
 
 async def run_on_pis(hosts, connect_options, func, timeout=2400, num_workers=4, **kwargs):
     async def run_func(args):
@@ -834,7 +837,7 @@ async def main():
     hosts, usernames = await get_hosts_with_retries(potential_usernames, progress_bar=True)
     connect_options = [{'username': username, 'password': 'rp145'} for username in usernames]
 
-    todo = 'change_ip'
+    todo = 'setup'
 
     if todo == 'setup':
         with open('worker_requirements.txt', 'r') as f:
@@ -884,7 +887,10 @@ async def main():
             with open('./config/hosts', 'w') as f:
                 f.write(hosts_file)
 
-        r = await run_on_pis(hosts, connect_options, setup_pi, timeout=600, reqs=reqs, ip_host_map=ip_host_map, slurm_conf_hash=slurm_conf_hash)
+        bsteel_password = os.environ['SCHEDULER_PASSWORD']
+
+        r = await run_on_pis(hosts, connect_options, setup_pi, timeout=600, 
+                             reqs=reqs, ip_host_map=ip_host_map, slurm_conf_hash=slurm_conf_hash, bsteel_password=bsteel_password)
         usernames, hosts = zip(*[(co['username'], host) for ret, host, co in r if ret is None])
         print(f"Successfully set up {usernames} on {hosts}")
     elif todo == 'ping':
