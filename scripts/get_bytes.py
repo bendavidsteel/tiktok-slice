@@ -53,13 +53,11 @@ async def fetch_video_data(video_data):
             timestamp = int(timestamp_bits, 2)
             bytes_dir_path = os.path.join('/', 'media', 'bsteel', 'Elements', 'tiktok', 'mp4s')
             timestamp_dir = os.path.join(bytes_dir_path, str(timestamp))
-            if not os.path.exists(timestamp_dir):
-                os.makedirs(timestamp_dir)
             
             async with httpx.AsyncClient() as client:
                 info_res = await client.get(url, headers=headers)
                 if info_res.status_code != 200:
-                    return
+                    return None, None
                 text_chunk = info_res.text
                 video_processor = ProcessVideo()
                 do = video_processor.process_chunk(text_chunk)
@@ -77,14 +75,12 @@ async def fetch_video_data(video_data):
                 video_d = video_processor.process_response()
 
                 timestamp = datetime.datetime.now().timestamp()
-                with open(os.path.join(timestamp_dir, f"{video_id}-{timestamp}.json"), 'w') as f:
-                    json.dump(video_d, f)
 
                 if 'video' not in video_d:
-                    return
+                    return video_d, timestamp
 
                 if not video_d['video']['downloadAddr']:
-                    return
+                    return video_d, timestamp
 
                 cookies = {c: info_res.cookies[c] for c in info_res.cookies}
                 bytes_res = await client.get(video_d['video']['downloadAddr'], headers=bytes_headers, cookies=cookies)
@@ -96,6 +92,8 @@ async def fetch_video_data(video_data):
                     f.write(content)
         except Exception as e:
             print(e)
+        else:
+            return video_d
 
 async def worker(queue, bytes_dir_path, pbar):
     while True:
@@ -116,7 +114,20 @@ async def main():
     num_workers = 4  # Adjust the number of workers as needed
 
     for videos in get_ids_to_get_bytes(data_dir_path, bytes_dir_path):
-        await async_amap(fetch_video_data, videos, num_workers=num_workers, progress_bar=True, pbar_desc='Downloading Bytes')
+        video_id = videos[0]['id']
+        id_bits = format(int(video_id), '064b')
+        timestamp_bits = id_bits[:32]
+        timestamp = int(timestamp_bits, 2)
+        bytes_dir_path = os.path.join('/', 'media', 'bsteel', 'Elements', 'tiktok', 'mp4s')
+        timestamp_dir = os.path.join(bytes_dir_path, str(timestamp))
+        if not os.path.exists(timestamp_dir):
+            os.makedirs(timestamp_dir)
+
+        videos_data = await async_amap(fetch_video_data, videos, num_workers=num_workers, progress_bar=True, pbar_desc='Downloading Bytes')
+        videos_data = [(v, t) for v, t in videos_data if v is not None]
+        video_df = pd.DataFrame(videos_data, columns=['video', 'timestamp'])
+        df_path = os.path.join(timestamp_dir, f"{timestamp}.parquet.gzip")
+        video_df.to_parquet(df_path, compression='gzip')
 
 if __name__ == "__main__":
     asyncio.run(main())
