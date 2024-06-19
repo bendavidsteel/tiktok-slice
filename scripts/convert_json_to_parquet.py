@@ -2,17 +2,12 @@ import asyncio
 import json
 import os
 
+import asyncssh
 import pandas as pd
 import tqdm
 
 
-def get_result_paths(data_dir_path):
 
-    for dir_path, dir_names, filenames in os.walk(os.path.join(data_dir_path, 'results')):
-        for filename in filenames:
-            if filename == 'results.json':
-                result_path = os.path.join(dir_path, filename)
-                yield result_path
 
 def cleanup(result):
     if result['result']['return'] and 'item_control' in result['result']['return'] and len(result['result']['return']['item_control']) == 0:
@@ -65,16 +60,36 @@ def convert_json_to_parquet(result_path):
     #     assert len(df_result['exceptions']) == len(result['exceptions'])
     #     assert df_result['completed'] == result['completed']
     os.remove(result_path)
+    return parquet_path
 
-def main():
+async def main():
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
     data_dir_path = os.path.join(this_dir_path, "..", "data")
-    result_paths = list(get_result_paths(data_dir_path))
+    remote = True
+    if remote:
+        local_result_dir = os.path.join(data_dir_path, 'results')
+        conn = await asyncssh.connect(os.environ['PRODESK_HOST'], username=os.environ['USERNAME'], password=os.environ['PASSWORD'])
+        result_paths = await get_remote_result_paths(conn)
+    else:
+        result_paths = list(get_result_paths(data_dir_path))
 
-    for result_path in tqdm.tqdm(result_paths):
-        convert_json_to_parquet(result_path)
+    for found_result_path in tqdm.tqdm(result_paths):
+        if remote:
+            local_result_path = os.path.join(local_result_dir, found_result_path.split('results/')[1])
+            if not os.path.exists(os.path.dirname(local_result_path)):
+                os.makedirs(os.path.dirname(local_result_path))
+            await asyncssh.scp((conn, found_result_path), local_result_path)
+            result_path = local_result_path
+        else:
+            result_path = found_result_path
+        parquet_path = convert_json_to_parquet(result_path)
+        if remote:
+            remote_parquet_path = found_result_path.replace('results.json', 'results.parquet.gzip')
+            await asyncssh.scp(parquet_path, (conn, remote_parquet_path))
+            # delete remote json file
+            await conn.run(f'rm {found_result_path}')
 
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

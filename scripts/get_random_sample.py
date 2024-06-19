@@ -29,7 +29,7 @@ from tqdm.asyncio import tqdm as atqdm
 
 from dask_extensions import UnreliableSSHCluster
 from map_funcs import _amap
-from setup_pis import change_mac_addresses, get_hosts_with_retries, start_wifi_connections, reboot_workers, stop_stale_workers
+from setup_pis import change_mac_addresses, get_hosts_with_retries, start_wifi_connections, restart_down_slurm_nodes, stop_stale_workers
 
 async def async_map(func, args, num_workers=10):
     all_pbar = tqdm(total=len(args))
@@ -104,6 +104,9 @@ class ClusterManager:
     
     async def change_mac_addresses(self):
         await change_mac_addresses(self.hosts, self.connect_options, interface='wlan0', progress_bar=True)
+
+    async def restart_down_slurm_nodes(self):
+        await restart_down_slurm_nodes(self.hosts, self.connect_options, progress_bar=True)
 
     def get_connect_options(self, usernames):
         raspi_password = os.environ['RASPI_PASSWORD']
@@ -190,7 +193,7 @@ class DaskCluster:
             hosts, usernames = await self.manager.get_hosts()
             connect_options = self.manager.get_connect_options(usernames)
             await self.manager.start_wifi_connections(hosts, connect_options)
-            # TODO restart slurmd for workers in down* state
+            await self.manager.restart_down_slurm_nodes()
 
             host_address = subprocess.check_output(['hostname', '-I']).decode().strip()
             self.cluster = DaskSLURMCluster(
@@ -199,7 +202,7 @@ class DaskCluster:
                 cores=4,
                 processes=1,
                 memory="3200 MB",
-                n_workers=34, # TODO ensure this gives us max workers
+                n_workers=36, # TODO ensure this gives us max workers
                 walltime='00:30:00',
                 python=remote_python,
                 scheduler_options={'host': host_address},
@@ -265,7 +268,7 @@ class TaskDataset:
     def __len__(self):
         return len(self.tasks)
 
-async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_size=100000, task_batch_size=1000, max_task_tries=3, task_nthreads=1, task_timeout=10, worker_cpu=256, worker_mem=512, cluster_type='local'):
+async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_size=100000, task_batch_size=1000, max_task_tries=5, task_nthreads=1, task_timeout=10, worker_cpu=256, worker_mem=512, cluster_type='local'):
     network_interfaces = ['eth0', 'wlan0'] if cluster_type in ['ssh', 'slurm'] else [None]
     interface_ratios = [0.8, 0.2] if cluster_type in ['ssh', 'slurm'] else [1]
     assert all(int(ratio * task_nthreads) > 0 for ratio in interface_ratios), "Must have at least one thread per network interface"
@@ -346,6 +349,7 @@ async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_si
                                 elif cluster_type == 'ssh' or cluster_type == 'slurm':
                                     # reset mac address of raspberry pis and rescan for the new assigned IPs
                                     print("Changing worker IPs...")
+                                    # TODO run via slurm
                                     await cluster_manager.change_mac_addresses()
                                     num_reqs_for_current_ips = 0
                                     num_exceptions_for_current_ips = 0
@@ -653,6 +657,7 @@ async def get_random_sample(
         task_batch_size,
         task_nthreads,
         task_timeout,
+        max_task_tries,
         worker_cpu,
         worker_mem,
         cluster_type,
@@ -702,6 +707,25 @@ async def get_random_sample(
     potential_video_bits = itertools.product(all_timestamp_bits, other_bit_sequences)
     potential_video_bits = [''.join(bits) for bits in potential_video_bits]
     potential_video_ids = [int(bits, 2) for bits in potential_video_bits]
+
+    date_dir = start_time.strftime('%Y_%m_%d')
+    results_dir_path = os.path.join(this_dir_path, '..', 'data', 'results', date_dir, 'hours', str(start_time.hour), str(start_time.minute), str(start_time.second))
+    existing_results = False
+    if os.path.exists(results_dir_path):
+        if os.path.exists(os.path.join(results_dir_path, 'results.parquet.gzip')):
+            # remove ids that have already been collected
+            try:
+                existing_df = pd.read_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'), columns=['args'])
+            except Exception as e:
+                print(f"Error reading existing results: {e}")
+            else:
+                existing_results = True
+                collected_ids = set(existing_df['args'])
+                potential_video_ids = [id for id in potential_video_ids if id not in collected_ids]
+                if len(potential_video_ids) == 0:
+                    print("All potential video IDs have been collected")
+                    return
+
     dataset = TaskDataset(potential_video_ids)
 
     if method == 'async':
@@ -717,6 +741,7 @@ async def get_random_sample(
             task_batch_size=task_batch_size,
             task_timeout=task_timeout,
             task_nthreads=task_nthreads, 
+            max_task_tries=max_task_tries,
             worker_cpu=worker_cpu, 
             worker_mem=worker_mem,
             cluster_type=cluster_type
@@ -732,11 +757,9 @@ async def get_random_sample(
     print(f"Fraction hits: {num_hits / num_valid}")
     print(f"Fraction valid: {num_valid / len(potential_video_ids)}")
 
-    results_dir_path = os.path.join(this_dir_path, '..', 'data', 'results', 'hours', str(start_time.hour), str(start_time.minute), str(start_time.second))
+    date_dir = start_time.strftime('%Y_%m_%d')
+    results_dir_path = os.path.join(this_dir_path, '..', 'data', 'results', date_dir, 'hours', str(start_time.hour), str(start_time.minute), str(start_time.second))
     os.makedirs(results_dir_path, exist_ok=True)
-    results_dirs = [dir_name for dir_name in os.listdir(results_dir_path)]
-    new_result_dir = str(max([int(d) for d in results_dirs]) + 1) if results_dirs else '0'
-    os.makedirs(os.path.join(results_dir_path, new_result_dir), exist_ok=True)
 
     params = {
         'start_time': start_time.isoformat(),
@@ -749,6 +772,7 @@ async def get_random_sample(
         'task_batch_size': task_batch_size,
         'task_timeout': task_timeout,
         'task_nthreads': task_nthreads,
+        'max_task_tries': max_task_tries,
         'worker_cpu': worker_cpu,
         'worker_mem': worker_mem,
         'cluster_type': cluster_type,
@@ -756,55 +780,56 @@ async def get_random_sample(
         'intervals': intervals,
     }
 
-    with open(os.path.join(results_dir_path, new_result_dir, 'parameters.json'), 'w') as f:
+    with open(os.path.join(results_dir_path, 'parameters.json'), 'w') as f:
         json.dump(params, f)
 
-    try:
-        dict_results = [
-            {
-                'args': r.args, 
-                'exceptions': [{
-                        'exception': str(e['exception']),
-                        'pre_time': e['pre_time'] if e['pre_time'] else None,
-                        'post_time': e['post_time']
-                    }
-                    for e in r.exceptions
-                ], 
-                'result': {
-                    'return': r.result['res'] if r.result is not None else None,
-                    'pre_time': r.result['pre_time'] if r.result is not None else None,
-                    'post_time': r.result['post_time'] if r.result is not None else None
-                },
-                'completed': r.completed
-            }
-            for r in results
-        ]
-        df = pd.DataFrame(dict_results)
-        df.to_parquet(os.path.join(results_dir_path, new_result_dir, 'results.parquet.gzip'), compression='gzip')
-    except Exception as e:
-        print(e)
-        # convert to jsonable format
-        json_results = [
+    dict_results = [
         {
             'args': r.args, 
             'exceptions': [{
                     'exception': str(e['exception']),
-                    'pre_time': e['pre_time'].isoformat() if e['pre_time'] else None,
-                    'post_time': e['post_time'].isoformat()
+                    'pre_time': e['pre_time'] if e['pre_time'] else None,
+                    'post_time': e['post_time']
                 }
                 for e in r.exceptions
             ], 
             'result': {
                 'return': r.result['res'] if r.result is not None else None,
-                'pre_time': r.result['pre_time'].isoformat() if r.result is not None else None,
-                'post_time': r.result['post_time'].isoformat() if r.result is not None else None
+                'pre_time': r.result['pre_time'] if r.result is not None else None,
+                'post_time': r.result['post_time'] if r.result is not None else None
             },
             'completed': r.completed
         }
         for r in results
     ]
-        with open(os.path.join(results_dir_path, new_result_dir, 'results.json'), 'w') as f:
-            json.dump(json_results, f)
+    df = pd.DataFrame(dict_results)
+
+    if existing_results:
+        existing_df = pd.read_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'))
+        new_df = df
+        df = pd.concat([new_df, existing_df])
+
+        try:
+            df.to_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'), compression='gzip')
+        except:
+            if existing_df['result'].map(lambda r: isinstance(r['post_time'], str) if r is not None else False).any():
+                existing_df['exceptions'] = existing_df['exceptions'].map(lambda e: [{
+                    'exception': e['exception'], 
+                    'pre_time': datetime.datetime.fromisoformat(e['pre_time']) if e['pre_time'] and isinstance(e['pre_time'], str) else None, 
+                    'post_time': datetime.datetime.fromisoformat(e['post_time']) if isinstance(e['post_time'], str) else None
+                    } for e in e])
+                existing_df['result'] = existing_df['result'].map(lambda r: {
+                    'return': r['return'] if r is not None else None,
+                    'pre_time': datetime.datetime.fromisoformat(r['pre_time']) if r is not None and isinstance(r['pre_time'], str) else None,
+                    'post_time': datetime.datetime.fromisoformat(r['post_time']) if r is not None and isinstance(r['post_time'], str) else None
+                })
+                pd.concat([new_df, existing_df]).to_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'), compression='gzip')
+            else:
+                raise ValueError("Existing results are not in string format")
+    else:
+        df.to_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'), compression='gzip')
+
+    
 
 async def run_random_sample():
     generation_strategy = 'all'
@@ -812,12 +837,13 @@ async def run_random_sample():
     start_time = datetime.datetime(2024, 4, 10, 19, 0, 0)
     num_time = 1
     time_unit = 'h'
-    num_workers = 22
-    reqs_per_ip = 10000
-    batch_size = 20000
+    num_workers = 36
+    reqs_per_ip = 5000
+    batch_size = 10000
     task_batch_size = 50
     task_nthreads = 10
     task_timeout = 60
+    max_task_tries = 5
     worker_cpu = 256
     worker_mem = 512
     cluster_type = 'slurm'
@@ -845,11 +871,8 @@ async def run_random_sample():
         actual_start_times = [start_time]
 
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
+    date_dir = start_time.strftime('%Y_%m_%d')
     for actual_start_time in actual_start_times:
-        results_dir_path = os.path.join(this_dir_path, '..', 'data', 'results', 'hours', str(actual_start_time.hour), str(actual_start_time.minute), str(actual_start_time.second))
-        if os.path.exists(results_dir_path):
-            print(f"Skipping as {results_dir_path} exists")
-            continue
         await get_random_sample(
             generation_strategy,
             actual_start_time,
@@ -861,6 +884,7 @@ async def run_random_sample():
             task_batch_size,
             task_nthreads,
             task_timeout,
+            max_task_tries,
             worker_cpu,
             worker_mem,
             cluster_type,
