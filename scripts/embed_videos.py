@@ -74,7 +74,12 @@ class MultiModalBackend:
             videos = list(p.imap(load_video, video_file_paths))
         
         logger.debug(f"Embedding {len(videos)} videos...")
-        # TODO 
+        # padding videos to the same length
+        vid_num_frames = [len(video) for video in videos]
+        if not all([num_frames == vid_num_frames[0] for num_frames in vid_num_frames]):
+            max_frames = max(vid_num_frames)
+            videos = [video + [video[-1]] * (max_frames - len(video)) for video in videos]
+            
         pixel_values = self.vision_processor(videos=videos, return_tensors="pt").pixel_values
         pixel_values = pixel_values.to(self.device)
         num_videos, num_frames, num_channels, height, width = pixel_values.shape
@@ -147,7 +152,7 @@ def embed_directory(embedding_model, video_df, dir_path):
     embeddings = None
     i = 0
     max_batch_file_size = 5e7
-    max_batch_size = 16
+    max_batch_size = 4
     pbar = tqdm.tqdm(total=len(host_file_paths))
     while i < len(host_file_paths):
         batch_file_size = 0
@@ -203,17 +208,10 @@ async def main():
 
     embedding_model = MultiModalBackend()
 
-    # host_dirs = os.listdir(host_bytes_dir_path)
-
-    # for host_dir in host_dirs:
-    #     print(f"Embedding videos in {host_dir}")
-    #     host_dir_path = os.path.join(host_bytes_dir_path, host_dir)
-    #     embed_directory(embedding_model, host_dir_path)
-
     username = os.environ['USERNAME']
     password = os.environ['PASSWORD']
     host = os.environ['ELITE_HOST']
-    server_bytes_dir_path = '/media/bsteel/Elements/tiktok/mp4s/'
+    server_bytes_dir_path = '/media/bsteel/NAS/TikTok_Hour/mp4s/'
     server_videos_dir_path = '~/repos/what-for-where/data/results/'
 
     connection = await asyncssh.connect(host, username=username, password=password)
