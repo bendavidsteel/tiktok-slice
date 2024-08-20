@@ -8,6 +8,8 @@ from bertopic.representation import VisualRepresentation
 import dotenv
 import numpy as np
 import pandas as pd
+import tqdm
+from umap import UMAP
 
 def get_video_path(video):
     data_dir_path = os.environ['DATA_DIR_PATH']
@@ -26,12 +28,11 @@ def save_first_frame(video_path):
         break
     return video_path.replace('.mp4', '.jpg')
 
-def main():
-    dotenv.load_dotenv()
-    this_dir_path = os.path.dirname(os.path.realpath(__file__))
-    bytes_dir_path = os.path.join(os.environ['DATA_DIR_PATH'], 'bytes')
+def get_videos_embeddings(bytes_dir_path, max_files=None):
     embeddings = None
     video_df = None
+    num_files = 0
+    pbar = tqdm.tqdm(total=max_files)
     for dir_name in os.listdir(bytes_dir_path):
         filenames = os.listdir(os.path.join(bytes_dir_path, dir_name))
         if 'video_embeddings.npy' in filenames and 'videos.parquet.gzip' in filenames:
@@ -64,6 +65,25 @@ def main():
             else:
                 video_df = pd.concat([video_df, batch_video_df])
 
+            pbar.update(1)
+
+            if max_files:
+                num_files += 1
+
+            if num_files == max_files:
+                break
+
+    return embeddings, video_df
+
+
+def main():
+    dotenv.load_dotenv()
+    this_dir_path = os.path.dirname(os.path.realpath(__file__))
+    bytes_dir_path = os.path.join(os.environ['DATA_DIR_PATH'], 'bytes')
+    data_dir_path = os.path.join(this_dir_path, '..', 'data')
+
+    embeddings, video_df = get_videos_embeddings(bytes_dir_path, max_files=10)
+
     # Additional ways of representing a topic
     visual_model = VisualRepresentation()
 
@@ -80,7 +100,10 @@ def main():
         images=video_df['image'].tolist()
     )
 
-    df = topic_model.get_topic_info()
+    video_df['topic'] = topics
+    video_df.to_parquet(os.path.join(data_dir_path, 'video_topics.parquet.gzip'))
+
+    topic_info_df = topic_model.get_topic_info()
 
     def image_base64(im):
         if isinstance(im, str):
@@ -92,9 +115,16 @@ def main():
 
     def image_formatter(im):
         return f'<img src="data:image/jpeg;base64,{image_base64(im)}">'
+    
+    reduced_embeddings = UMAP(n_neighbors=10, n_components=2, min_dist=0.0, metric='cosine').fit_transform(embeddings)
+    np.save(os.path.join(data_dir_path, 'reduced_embeddings.npy'), reduced_embeddings)
 
     topic_info_path = os.path.join(this_dir_path, '..', 'data', 'topic_info.html')
-    df.to_html(topic_info_path, formatters={'Visual_Aspect': image_formatter}, escape=False)
+    topic_info_df.to_html(topic_info_path, formatters={'Visual_Aspect': image_formatter}, escape=False)
+    topic_info_df['Visual_Aspect_Bytes'] = topic_info_df['Visual_Aspect'].map(lambda i: i.tobytes())
+    topic_info_df['Visual_Aspect_Mode'] = topic_info_df['Visual_Aspect'].map(lambda i: i.mode)
+    topic_info_df['Visual_Aspect_Size'] = topic_info_df['Visual_Aspect'].map(lambda i: i.size)
+    topic_info_df[['Topic', 'Count', 'Name', 'Representation', 'Representative_Docs', 'Visual_Aspect_Bytes', 'Visual_Aspect_Mode', 'Visual_Aspect_Size']].to_parquet(os.path.join(data_dir_path, 'topic_info.parquet.gzip'))
 
 if __name__ == '__main__':
     main()

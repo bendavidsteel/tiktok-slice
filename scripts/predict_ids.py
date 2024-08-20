@@ -17,18 +17,18 @@ class IDDataset(Dataset):
         self.seq_len = sequence_length
 
     def binary_to_tensor(self, binary_id):
-        return torch.tensor([int(bit) for bit in binary_id], dtype=torch.float32)
+        return torch.tensor([int(bit) for bit in binary_id], dtype=torch.float16)
 
     def __len__(self):
         return len(self.ids) - self.seq_len
 
     def __getitem__(self, index):
         return (
-            torch.stack(self.ids[index:index+self.seq_len]), 
-            torch.stack(self.ids[index+1:index+self.seq_len+1])
+            torch.stack(self.ids[index:index+self.seq_len], dtype=torch.float16), 
+            torch.stack(self.ids[index+1:index+self.seq_len+1], dtype=torch.float16)
         )
 
-def train(model, loader, epochs=5):
+def train(model, loader, device, epochs=5):
     model.train()
     optimizer = Adam(model.parameters(), lr=0.001)
     loss_fn = torch.nn.CrossEntropyLoss()
@@ -37,6 +37,7 @@ def train(model, loader, epochs=5):
         total_loss = 0
         current_loss = 0
         for input_ids, labels in tqdm.tqdm(loader, desc=f"Epoch {epoch+1}, Loss: {current_loss}"):
+            input_ids, labels = input_ids.to(device), labels.to(device)
             outputs = model(inputs_embeds=input_ids)
             loss = loss_fn(outputs.logits, labels)
             optimizer.zero_grad()
@@ -62,9 +63,8 @@ def get_video_df(result_path):
     
     return video_df
 
-def main():
-    this_dir_path = os.path.dirname(os.path.realpath(__file__))
-    data_dir_path = os.path.join(this_dir_path, "..", "data")
+def load_data():
+    data_dir_path = os.path.join('/', 'mnt', 'bigone', 'bsteel', 'tiktok', 'data')
     result_paths = list(get_result_paths(data_dir_path))
     result_paths = sorted(result_paths)
 
@@ -82,9 +82,16 @@ def main():
 
     # Example IDs
     ids = df['bits'].tolist()
+    return ids
+
+def main():
+    ids = load_data()
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
     seq_len = 2048
     dataset = IDDataset(ids, sequence_length=seq_len)
-    loader = DataLoader(dataset, batch_size=32, shuffle=True)
+    loader = DataLoader(dataset, batch_size=32, shuffle=True, pin_memory=True)
 
     # Assuming each ID has 64 bits
     config = GPT2Config(
@@ -95,6 +102,7 @@ def main():
         n_head=2  # Number of attention heads
     )
     model = GPT2LMHeadModel(config)
+    model.to(device)
 
     train(model, loader, epochs=5)
 
