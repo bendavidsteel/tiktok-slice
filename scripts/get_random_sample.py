@@ -215,7 +215,7 @@ class DaskCluster:
         self.worker_mem = worker_mem
 
     async def __aenter__(self):
-        
+        subprocess.run('ulimit -n 100000', shell=True, capture_output=True)
 
         if self.cluster_type == 'fargate':
             self.cluster = DaskFargateCluster(
@@ -323,11 +323,11 @@ async def process_future(f, batch_tasks_lookup, timeout, max_task_tries, tasks_p
     try:
         if cancel_if_unfinished and f.status != "finished":
             await f.cancel()
-            batch_results = [{'res': None, 'exception': TimeoutError(f"Task timed out after {timeout} seconds"), 'pre_time': None, 'post_time': datetime.datetime.now()} for _ in batch_tasks]
+            batch_results = [{'return': None, 'exception': TimeoutError(f"Task timed out after {timeout} seconds"), 'pre_time': None, 'post_time': datetime.datetime.now()} for _ in batch_tasks]
         else:
             batch_results = await f.result()
     except Exception as e:
-        batch_results = [{'res': None, 'exception': e, 'pre_time': None, 'post_time': datetime.datetime.now()} for _ in batch_tasks]
+        batch_results = [{'return': None, 'exception': e, 'pre_time': None, 'post_time': datetime.datetime.now()} for _ in batch_tasks]
     assert len(batch_tasks) == len(batch_results), "Number of tasks and results must match"
     for t, r in zip(batch_tasks, batch_results):
         if r['exception'] is not None:
@@ -353,8 +353,20 @@ class Counter:
         self.count += n
 
 class TaskDataset:
-    def __init__(self, args):
+    def __init__(self):
+        pass
+
+    def load_potential_ids(self, args):
         self.tasks = [DaskTask(arg) for arg in args]
+
+    def load_existing_df(self, df):
+        def create_task_from_row(row):
+            t = DaskTask(row['args'])
+            t.completed = row['result']['return'] is not None
+            t.result = row['result']
+            t.exceptions = row['exceptions'].tolist()
+            return t
+        self.tasks = df.apply(create_task_from_row, axis=1).values.tolist()
 
     def get_batch(self, batch_size):
         return [t for t in self.tasks if not t.completed][:batch_size]
@@ -365,22 +377,16 @@ class TaskDataset:
     def __len__(self):
         return len(self.tasks)
 
-def get_workers(cluster, cluster_manager):
-    workers = list(cluster.scheduler.workers.keys())
-    if len(workers) == 0:
-        workers = [f"tcp://{worker_ip}:9000" for worker_ip in cluster_manager.hosts]
-    return workers
-
 async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_size=100000, task_batch_size=1000, max_task_tries=5, task_nthreads=1, task_timeout=10, worker_cpu=256, worker_mem=512, cluster_type='local'):
-    network_interfaces = ['eth0', 'wlan0'] if cluster_type in ['ssh', 'slurm'] else [None]
-    interface_ratios = [0.8, 0.2] if cluster_type in ['ssh', 'slurm'] else [1]
+    network_interfaces = ['eth0'] if cluster_type in ['ssh', 'slurm'] else [None]
+    interface_ratios = [1.0] if cluster_type in ['ssh', 'slurm'] else [1]
     assert all(int(ratio * task_nthreads) > 0 for ratio in interface_ratios), "Must have at least one thread per network interface"
     function = MultiNetworkInterfaceFunc(DaskFunc(function), network_interfaces=network_interfaces, ratios=interface_ratios, task_nthreads=task_nthreads)
     # network_interface = None # 'wlan0' if cluster_type == 'raspi' else None
     # function = BatchNetworkInterfaceFunc(DaskFunc(function), network_interface=network_interface, task_nthreads=task_nthreads)
     dotenv.load_dotenv()
-    tasks_progress_bar = tqdm(total=len(dataset), desc="All Tasks")
-    batch_progress_bar = tqdm(total=min(batch_size, len(dataset)), desc="Batch Tasks", leave=False)
+    tasks_progress_bar = tqdm(total=dataset.num_left(), desc="All Tasks")
+    batch_progress_bar = tqdm(total=min(batch_size, dataset.num_left()), desc="Batch Tasks", leave=False)
 
     wlan_username = os.environ['EDUROAM_USERNAME']
     wlan_password = os.environ['EDUROAM_PASSWORD']
@@ -419,7 +425,7 @@ async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_si
                             batch_progress_bar.reset(total=current_batch_size)
 
                             # start the timeout timer
-                            total_time = len(batch_tasks) * task_timeout
+                            total_time = sum(len(b) for b in batch_tasks) * task_timeout
                             num_actual_workers = len(cluster.workers)
                             if num_actual_workers == 0:
                                 num_actual_workers = 1
@@ -465,7 +471,7 @@ async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_si
                                         wlan_password,
                                         password=slurm_account_password,
                                         on_error='return',
-                                        workers=get_workers(cluster, cluster_manager)
+                                        workers=list(cluster.scheduler.workers.keys())
                                     )
                                     num_res = len(res)
                                     num_success = len([r for addr, r in res.items() if r is None])
@@ -680,7 +686,7 @@ class DaskFunc:
         post_time = datetime.datetime.now()
 
         return {
-            'res': res,
+            'return': res,
             'exception': exception,
             'pre_time': pre_time,
             'post_time': post_time,
@@ -797,29 +803,36 @@ async def get_random_sample(
 
     date_dir = start_time.strftime('%Y_%m_%d')
     results_dir_path = os.path.join(this_dir_path, '..', 'data', 'results', date_dir, 'hours', str(start_time.hour), str(start_time.minute), str(start_time.second))
-    existing_results = False
-    if os.path.exists(results_dir_path):
-        if os.path.exists(os.path.join(results_dir_path, 'results.parquet.gzip')):
-            # remove ids that have already been collected
-            try:
-                existing_df = pd.read_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'), columns=['args'])
-            except Exception as e:
-                print(f"Error reading existing results: {e}")
-            else:
-                existing_results = True
-                collected_ids = set(existing_df['args'])
-                potential_video_ids = [id for id in potential_video_ids if id not in collected_ids]
-                if len(potential_video_ids) == 0:
-                    print("All potential video IDs have been collected")
-                    return
+    
+    if os.path.exists(results_dir_path) and os.path.exists(os.path.join(results_dir_path, 'results.parquet.gzip')):
+        # remove ids that have already been collected
+        try:
+            existing_df = pd.read_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'))
+        except Exception as e:
+            print(f"Error reading existing results: {e}")
+            dataset = TaskDataset()
+            dataset.load_potential_ids(potential_video_ids)
+        else:
+            dataset = TaskDataset()
+            dataset.load_existing_df(existing_df)
 
-    dataset = TaskDataset(potential_video_ids)
+            # add ids that haven't been collected
+            existing_ids = set(existing_df['args'])
+            potential_video_ids = [i for i in potential_video_ids if i not in existing_ids]
+            dataset.tasks += [DaskTask(i) for i in potential_video_ids]
+
+            if dataset.num_left() == 0:
+                print("All potential video IDs have been collected")
+                return
+    else:
+        dataset = TaskDataset()
+        dataset.load_potential_ids(potential_video_ids)
 
     if method == 'async':
         raise NotImplementedError("Async method not implemented")
         dataset = await async_map(async_get_video, dataset, num_workers=num_workers)
     elif method == 'dask':
-        dataset = await dask_map(
+        dataset = await asyncio.wait_for(dask_map(
             get_video, 
             dataset, 
             num_workers=num_workers, 
@@ -832,17 +845,17 @@ async def get_random_sample(
             worker_cpu=worker_cpu, 
             worker_mem=worker_mem,
             cluster_type=cluster_type
-        )
+        ), timeout=60 * 60)
     else:
         raise ValueError("Invalid method")
     results = dataset.tasks
-    num_hits = len([r for r in results if r.result and 'id' in r.result['res']])
-    num_valid = len([r for r in results if len(r.exceptions) < 3])
-    print(f"Num hits: {num_hits}, Num valid: {num_valid}, Num potential video IDs: {len(potential_video_ids)}")
+    num_hits = len([r for r in results if r.result and r.result['return'] is not None and 'id' in r.result['return'] and r.result['return']['id'] is not None])
+    num_valid = len([r for r in results if r.result and r.result['return'] is not None])
+    print(f"Num hits: {num_hits}, Num valid: {num_valid}, Num potential video IDs: {len(dataset)}")
     if num_valid == 0:
         raise ValueError("No valid results")
     print(f"Fraction hits: {num_hits / num_valid}")
-    print(f"Fraction valid: {num_valid / len(potential_video_ids)}")
+    print(f"Fraction valid: {num_valid / len(dataset)}")
 
     date_dir = start_time.strftime('%Y_%m_%d')
     results_dir_path = os.path.join(this_dir_path, '..', 'data', 'results', date_dir, 'hours', str(start_time.hour), str(start_time.minute), str(start_time.second))
@@ -881,7 +894,7 @@ async def get_random_sample(
                 for e in r.exceptions
             ], 
             'result': {
-                'return': r.result['res'] if r.result is not None else None,
+                'return': r.result['return'] if r.result is not None else None,
                 'pre_time': r.result['pre_time'] if r.result is not None else None,
                 'post_time': r.result['post_time'] if r.result is not None else None
             },
@@ -891,30 +904,7 @@ async def get_random_sample(
     ]
     df = pd.DataFrame(dict_results)
 
-    if existing_results:
-        existing_df = pd.read_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'))
-        new_df = df
-        df = pd.concat([new_df, existing_df])
-
-        try:
-            df.to_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'), compression='gzip')
-        except:
-            if existing_df['result'].map(lambda r: isinstance(r['post_time'], str) if r is not None else False).any():
-                existing_df['exceptions'] = existing_df['exceptions'].map(lambda e: [{
-                    'exception': e['exception'], 
-                    'pre_time': datetime.datetime.fromisoformat(e['pre_time']) if e['pre_time'] and isinstance(e['pre_time'], str) else None, 
-                    'post_time': datetime.datetime.fromisoformat(e['post_time']) if isinstance(e['post_time'], str) else None
-                    } for e in e])
-                existing_df['result'] = existing_df['result'].map(lambda r: {
-                    'return': r['return'] if r is not None else None,
-                    'pre_time': datetime.datetime.fromisoformat(r['pre_time']) if r is not None and isinstance(r['pre_time'], str) else None,
-                    'post_time': datetime.datetime.fromisoformat(r['post_time']) if r is not None and isinstance(r['post_time'], str) else None
-                })
-                pd.concat([new_df, existing_df]).to_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'), compression='gzip')
-            else:
-                raise ValueError("Existing results are not in string format")
-    else:
-        df.to_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'), compression='gzip')
+    df.to_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'), compression='gzip')
 
     
 
@@ -925,12 +915,12 @@ async def run_random_sample():
     num_time = 1
     time_unit = 'h'
     num_workers = 36
-    reqs_per_ip = 5000
+    reqs_per_ip = 200000
     batch_size = 10000
     task_batch_size = 50
-    task_nthreads = 10
+    task_nthreads = 4
     task_timeout = 60
-    max_task_tries = 5
+    max_task_tries = 10
     worker_cpu = 256
     worker_mem = 512
     cluster_type = 'slurm'
@@ -995,15 +985,15 @@ async def run_get_ips():
         task_nthreads=5,
         cluster_type='slurm'
     )
-    ips = [r.result['res'] for r in results.tasks if r.result is not None]
+    ips = [r.result['return'] for r in results.tasks if r.result is not None]
     print(collections.Counter(ips))
     print(f"Num unique IPs: {len(set(ips))}")
     
 async def main():
     # logging.basicConfig(level=logging.DEBUG)
     dotenv.load_dotenv()
-    # await run_random_sample()
-    await run_get_ips()
+    await run_random_sample()
+    # await run_get_ips()
 
 if __name__ == '__main__':
     asyncio.run(main())
