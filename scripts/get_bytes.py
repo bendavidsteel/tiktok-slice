@@ -2,7 +2,9 @@ import asyncio
 import datetime
 import json
 import os
+import subprocess
 
+import dotenv
 import httpx
 import pandas as pd
 import tqdm
@@ -18,13 +20,12 @@ def read_result_path(result_path):
             return []
     return [r for r in results]
 
-def get_ids_to_get_bytes(data_dir_path, bytes_dir_path):
-    fetched_filenames = []
-    for dir_path, dir_names, filenames in os.walk(bytes_dir_path):
-        for filename in filenames:
-            if filename.endswith('mp4'):
-                fetched_filenames.append(filename)
-    fetched_ids = set([int(f.split('.')[0]) for f in fetched_filenames])
+def get_ids_to_get_bytes(data_dir_path, read_bytes_dir_paths):
+    fetched_ids = []
+    for bytes_dir_path in read_bytes_dir_paths:
+        for dir_path, dir_names, filenames in os.walk(bytes_dir_path):
+            fetched_ids += [int(f.split('.')[0]) for f in filenames if f.endswith('mp4')]
+    fetched_ids = set(fetched_ids)
 
     for dir_path, dir_names, filenames in os.walk(os.path.join(data_dir_path, 'results')):
         for filename in filenames:
@@ -51,7 +52,7 @@ async def fetch_video_data(video_data):
             id_bits = format(int(video_id), '064b')
             timestamp_bits = id_bits[:32]
             timestamp = int(timestamp_bits, 2)
-            bytes_dir_path = os.path.join('/', 'media', 'bsteel', 'Elements', 'tiktok', 'mp4s')
+            bytes_dir_path = os.path.join('/', 'media', 'bsteel', 'TT_DAY', 'TikTok_Hour', 'mp4s')
             timestamp_dir = os.path.join(bytes_dir_path, str(timestamp))
             
             async with httpx.AsyncClient() as client:
@@ -85,15 +86,17 @@ async def fetch_video_data(video_data):
                 cookies = {c: info_res.cookies[c] for c in info_res.cookies}
                 bytes_res = await client.get(video_d['video']['downloadAddr'], headers=bytes_headers, cookies=cookies)
                 if 200 <= bytes_res.status_code >= 300:
-                    return
+                    return video_d, timestamp
                 content = bytes_res.content
 
                 with open(os.path.join(timestamp_dir, f"{video_id}.mp4"), 'wb') as f:
                     f.write(content)
         except Exception as e:
             print(e)
+            return None, None
         else:
-            return video_d
+            return video_d, timestamp
+    return None, None
 
 async def worker(queue, bytes_dir_path, pbar):
     while True:
@@ -107,27 +110,57 @@ async def worker(queue, bytes_dir_path, pbar):
 async def main():
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
     data_dir_path = os.path.join(this_dir_path, "..", "data")
-    bytes_dir_path = os.path.join('/', 'media', 'bsteel', 'Elements', 'tiktok', 'mp4s')
-    if not os.path.exists(bytes_dir_path):
-        os.makedirs(bytes_dir_path)
+    mount_dir_path = os.path.join('/', 'media', 'bsteel')
+    read_bytes_dir_paths = [
+            os.path.join(mount_dir_path, 'NAS', 'TikTok_Hour', 'mp4s'),
+            os.path.join(mount_dir_path, 'TT_DAY', 'TikTok_Hour', 'mp4s')
+    ]
+    write_bytes_dir_path = os.path.join(mount_dir_path, 'TT_DAY', 'TikTok_Hour', 'mp4s')
+    
+    for bytes_dir_path in read_bytes_dir_paths + [write_bytes_dir_path]:
+        if not os.path.exists(bytes_dir_path):
+            os.makedirs(bytes_dir_path)
+
+    dotenv.load_dotenv()
+
+    username = os.environ['USERNAME']
+    host = os.environ['HOST']
+    server_dir_path = os.environ['SERVER_DIR_PATH']
+    host_dir_path = os.environ['HOST_DIR_PATH']
+
+    r = subprocess.run(f'rsync -avz {username}@{host}:{server_dir_path}/* {host_dir_path}/', shell=True, capture_output=True)
+        
+    if r.returncode != 0:
+        print(f"Failed to copy files from {server_dir_path} to {host_dir_path}: {r.stderr}")
     
     num_workers = 4  # Adjust the number of workers as needed
 
-    for videos in get_ids_to_get_bytes(data_dir_path, bytes_dir_path):
-        video_id = videos[0]['id']
-        id_bits = format(int(video_id), '064b')
-        timestamp_bits = id_bits[:32]
-        timestamp = int(timestamp_bits, 2)
-        bytes_dir_path = os.path.join('/', 'media', 'bsteel', 'Elements', 'tiktok', 'mp4s')
-        timestamp_dir = os.path.join(bytes_dir_path, str(timestamp))
-        if not os.path.exists(timestamp_dir):
-            os.makedirs(timestamp_dir)
+    for videos in get_ids_to_get_bytes(data_dir_path, read_bytes_dir_paths):
+        if not videos:
+            continue
+        try:
+            video_id = videos[0]['id']
+            id_bits = format(int(video_id), '064b')
+            timestamp_bits = id_bits[:32]
+            timestamp = int(timestamp_bits, 2)
+            timestamp_dir = os.path.join(bytes_dir_path, str(timestamp))
+            if not os.path.exists(timestamp_dir):
+                os.makedirs(timestamp_dir)
 
-        videos_data = await async_amap(fetch_video_data, videos, num_workers=num_workers, progress_bar=True, pbar_desc='Downloading Bytes')
-        videos_data = [(v, t) for v, t in videos_data if v is not None]
-        video_df = pd.DataFrame(videos_data, columns=['video', 'timestamp'])
-        df_path = os.path.join(timestamp_dir, f"{timestamp}.parquet.gzip")
-        video_df.to_parquet(df_path, compression='gzip')
+            videos_data = await async_amap(fetch_video_data, videos, num_workers=num_workers, progress_bar=True, pbar_desc='Downloading Bytes')
+            videos_data = [(v, t) for v, t in videos_data if v is not None]
+            if not videos_data:
+                continue
+            video_df = pd.DataFrame(videos_data, columns=['video', 'timestamp'])
+            df_path = os.path.join(timestamp_dir, f"{timestamp}.parquet.gzip")
+            try:
+                video_df.to_parquet(df_path, compression='gzip')
+            except Exception as e:
+                video_df.to_json(df_path.replace('.parquet.gzip', '.json'))
+                print(e)
+        except Exception as e:
+            print(e)
+            continue
 
 if __name__ == "__main__":
     asyncio.run(main())

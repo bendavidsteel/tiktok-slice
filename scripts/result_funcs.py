@@ -1,8 +1,8 @@
 import os
 
-def get_result_paths(data_dir_path, result_filename='results.parquet.gzip'):
+def get_result_paths(result_dir_path, result_filename='results.parquet.gzip'):
 
-    for dir_path, dir_names, filenames in os.walk(os.path.join(data_dir_path, 'results')):
+    for dir_path, dir_names, filenames in os.walk(result_dir_path):
         for filename in filenames:
             if filename == result_filename:
                 result_path = os.path.join(dir_path, filename)
