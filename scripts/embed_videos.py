@@ -1,4 +1,5 @@
 import asyncio
+import configparser
 import datetime
 import json
 import logging
@@ -11,7 +12,7 @@ import av
 import numpy as np
 import pandas as pd
 import torch
-from transformers import XCLIPVisionModel, XCLIPTextModel, AutoProcessor, AutoTokenizer
+from transformers import XCLIPVisionModel, XCLIPTextModel, AutoProcessor, AutoModel
 import tqdm
 
 logger = logging.getLogger(__name__)
@@ -63,7 +64,7 @@ class MultiModalBackend:
     def __init__(self):
         self.device = "cuda"
         self.vision_processor = AutoProcessor.from_pretrained("microsoft/xclip-base-patch32", device=self.device, torch_dtype=torch.float16)
-        self.vision_model = XCLIPVisionModel.from_pretrained("microsoft/xclip-base-patch32", device_map=self.device, torch_dtype=torch.float16)
+        self.vision_model = AutoModel.from_pretrained("microsoft/xclip-base-patch32", device_map=self.device, torch_dtype=torch.float16)
 
         # self.text_model = XCLIPTextModel.from_pretrained("microsoft/xclip-base-patch32")
         # self.tokenizer = AutoTokenizer.from_pretrained("microsoft/xclip-base-patch32")
@@ -80,16 +81,9 @@ class MultiModalBackend:
             max_frames = max(vid_num_frames)
             videos = [video + [video[-1]] * (max_frames - len(video)) for video in videos]
             
-        pixel_values = self.vision_processor(videos=videos, return_tensors="pt").pixel_values
-        pixel_values = pixel_values.to(self.device)
-        num_videos, num_frames, num_channels, height, width = pixel_values.shape
-        pixel_values = pixel_values.reshape(-1, num_channels, height, width)
-        outputs = self.vision_model(pixel_values)
-        video_last_hidden_state = outputs.last_hidden_state
-        batch_size, num_tokens, embed_size = video_last_hidden_state.shape
-        video_last_hidden_state = video_last_hidden_state.reshape(num_videos, num_frames, num_tokens, embed_size)
-        # TODO another way of gettign the video embeddings?
-        video_embeds = torch.mean(video_last_hidden_state, dim=(1,2))
+        inputs = self.vision_processor(videos=videos, return_tensors="pt")
+        inputs = inputs.to(self.device)
+        video_embeds = self.vision_model.get_video_features(**inputs)
         video_embeds = video_embeds.cpu().detach().numpy()
 
         if texts is not None:
@@ -103,8 +97,10 @@ class MultiModalBackend:
         else:
             return video_embeds
 
-def embed_directory(embedding_model, video_df, dir_path):
-    host_file_paths = [os.path.join(dir_path, server_filename) for server_filename in os.listdir(dir_path) if server_filename.endswith('.mp4')]
+def embed_directory(embedding_model, video_df, write_dir_path, read_dir_paths):
+    host_file_paths = []
+    for read_dir_path in read_dir_paths:
+        host_file_paths += [os.path.join(read_dir_path, server_filename) for server_filename in os.listdir(read_dir_path) if server_filename.endswith('.mp4')]
     host_file_paths = sorted(host_file_paths)
     host_file_paths = host_file_paths[200:]
     byte_video_ids = [os.path.splitext(os.path.basename(host_file_path))[0] for host_file_path in host_file_paths]
@@ -128,8 +124,8 @@ def embed_directory(embedding_model, video_df, dir_path):
     if len(host_file_paths) == 0:
         return
 
-    embedding_path = os.path.join(dir_path, 'video_embeddings.npy')
-    video_path = os.path.join(dir_path, 'videos.parquet.gzip')
+    embedding_path = os.path.join(write_dir_path, 'video_embeddings.npy')
+    video_path = os.path.join(write_dir_path, 'videos.parquet.gzip')
 
     add_to_existing = False
     if os.path.exists(embedding_path) and os.path.exists(video_path):
@@ -151,8 +147,8 @@ def embed_directory(embedding_model, video_df, dir_path):
 
     embeddings = None
     i = 0
-    max_batch_file_size = 5e7
-    max_batch_size = 4
+    max_batch_file_size = 2e8
+    max_batch_size = 64
     pbar = tqdm.tqdm(total=len(host_file_paths))
     while i < len(host_file_paths):
         batch_file_size = 0
@@ -201,48 +197,36 @@ def embed_directory(embedding_model, video_df, dir_path):
     #     os.remove(file_path)
 
 async def main():
+    config = configparser.ConfigParser()
+    config.read('./config/config.ini')
+
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
     root_dir_path = os.path.dirname(this_dir_path)
-    host_results_dir_path = os.path.join('/', 'mnt', 'bigone', 'bsteel', 'tiktok', 'data', 'results')
-    host_bytes_dir_path = os.path.join('/', 'mnt', 'bigone', 'bsteel', 'tiktok', 'data', 'bytes')
 
     embedding_model = MultiModalBackend()
 
-    username = os.environ['USERNAME']
-    password = os.environ['PASSWORD']
-    host = os.environ['ELITE_HOST']
-    server_bytes_dir_path = '/media/bsteel/NAS/TikTok_Hour/mp4s/'
-    server_videos_dir_path = '~/repos/what-for-where/data/results/'
+    bytes_dir_paths = config['paths']['mp4_paths'].split(',')
+    videos_dir_path = config['paths']['result_path']
+    embedding_dir_path = config['paths']['embedding_path']
 
-    connection = await asyncssh.connect(host, username=username, password=password)
-    r = await connection.run(f'ls {server_bytes_dir_path}/', check=True)
-    server_dirs = r.stdout.split('\n')
+    server_dirs = [dir_name for byte_dir_path in bytes_dir_paths for dir_name in os.listdir(byte_dir_path)]
     server_dirs = [server_dir for server_dir in server_dirs if server_dir and "." not in server_dir]
+    server_dirs = set(server_dirs)
     for server_dir in server_dirs:
         print(f"Embedding videos in {server_dir}")
         dir_time = datetime.datetime.fromtimestamp(int(server_dir))
         video_path = os.path.join(dir_time.strftime('%Y_%m_%d'), 'hours', str(dir_time.hour), str(dir_time.minute), str(dir_time.second), 'results.parquet.gzip')
-        host_video_path = os.path.join(host_results_dir_path, video_path)
-        if not os.path.exists(host_video_path):
-            os.makedirs(os.path.dirname(host_video_path), exist_ok=True)
-            server_video_path = os.path.join(server_videos_dir_path, video_path)
-            try:
-                await asyncssh.scp((connection, server_video_path), host_video_path)
-            except Exception as e:
-                print(f"Failed to copy {server_video_path} to {host_video_path}: {e}")
-                continue
-        video_df = pd.read_parquet(host_video_path, columns=['result'])
-        server_dir_path = os.path.join(server_bytes_dir_path, server_dir)
-        host_dir_path = os.path.join(host_bytes_dir_path, server_dir)
-        os.makedirs(host_dir_path, exist_ok=True)
+        video_path = os.path.join(videos_dir_path, video_path)
+        video_df = pd.read_parquet(video_path, columns=['result'])
+        read_dir_paths = []
+        for byte_dir_path in bytes_dir_paths:
+            read_dir_path = os.path.join(byte_dir_path, server_dir)
+            if os.path.exists(read_dir_path):
+                read_dir_paths.append(read_dir_path)
+
+        write_dir_path = os.path.join(embedding_dir_path, server_dir)
         
-        r = subprocess.run(f'rsync -avz --include="*.mp4" --exclude="*" {username}@{host}:{server_dir_path}/* {host_dir_path}/', shell=True, capture_output=True)
-        
-        if r.returncode != 0:
-            print(f"Failed to copy files from {server_dir_path} to {host_dir_path}: {r.stderr}")
-            continue
-        
-        embed_directory(embedding_model, video_df, host_dir_path)
+        embed_directory(embedding_model, video_df, write_dir_path, read_dir_paths)
 
 if __name__ == '__main__':
     # logging.basicConfig(level=logging.DEBUG)
