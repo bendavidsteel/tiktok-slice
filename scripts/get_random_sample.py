@@ -20,6 +20,7 @@ from dask.distributed import as_completed as dask_as_completed
 from dask_cloudprovider.aws import FargateCluster as DaskFargateCluster
 from dask_jobqueue import SLURMCluster as DaskSLURMCluster
 import dotenv
+import numpy as np
 import pandas as pd
 import pycurl
 import randmac
@@ -354,25 +355,43 @@ class Counter:
 
 class TaskDataset:
     def __init__(self):
-        pass
+        self.tasks = pd.DataFrame(columns=['args', 'result', 'exceptions', 'completed'])
 
-    def load_potential_ids(self, args):
-        self.tasks = [DaskTask(arg) for arg in args]
+    def add_potential_ids(self, args):
+        new_tasks = pd.DataFrame([
+            {'args': arg, 'result': None, 'exceptions': [], 'completed': False} for arg in args
+        ])
+        self.tasks = pd.concat([self.tasks, new_tasks], ignore_index=True)
 
     def load_existing_df(self, df):
-        def create_task_from_row(row):
-            t = DaskTask(row['args'])
-            t.completed = row['result']['return'] is not None
-            t.result = row['result']
-            t.exceptions = row['exceptions'].tolist()
-            return t
-        self.tasks = df.apply(create_task_from_row, axis=1).values.tolist()
+        df['completed'] = df['result'].apply(lambda r: r is not None and 'return' in r and r['return'] is not None)
+        self.tasks = pd.concat([self.tasks, df], ignore_index=True)
 
     def get_batch(self, batch_size):
-        return [t for t in self.tasks if not t.completed][:batch_size]
+        # return [t for t in self.tasks if not t.completed][:batch_size]
+        task_rows = self.tasks[self.tasks['completed'] == False][:batch_size]
+        def create_task_from_row(row):
+            t = DaskTask(row['args'])
+            t.completed = row['completed']
+            t.result = row['result']
+            if isinstance(row['exceptions'], np.ndarray):
+                t.exceptions = row['exceptions'].tolist()
+            else:
+                t.exceptions = row['exceptions']
+            return t
+        tasks = [create_task_from_row(row) for _, row in task_rows.iterrows()]
+        return tasks
+
+    def update_tasks(self, tasks):
+        self.tasks.set_index('args', inplace=True)
+        for t in tasks:
+            self.tasks.at[t.args, 'result'] = t.result
+            self.tasks.at[t.args, 'exceptions'] = t.exceptions
+            self.tasks.at[t.args, 'completed'] = t.completed
+        self.tasks.reset_index(inplace=True)
     
     def num_left(self):
-        return len([t for t in self.tasks if not t.completed])
+        return len(self.tasks[self.tasks['completed'] == False])
     
     def __len__(self):
         return len(self.tasks)
@@ -447,6 +466,8 @@ async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_si
                                 # cancel all the unfinished tasks, and add the exceptions to the task
                                 for f in task_futures:
                                     await process_future(f, batch_tasks_lookup, timeout, max_task_tries, tasks_progress_bar, exception_counter, cancel_if_unfinished=True)
+
+                            dataset.update_tasks(all_batch_tasks)
                             num_exceptions_for_current_ips += exception_counter.count
 
                             # check if we need to recreate workers
@@ -495,7 +516,7 @@ async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_si
     tasks_progress_bar.close()
     batch_progress_bar.close()
 
-    return dataset
+    return
 
 class InvalidResponseException(Exception):
     pass
@@ -560,8 +581,7 @@ class ProcessVideo:
             if self.headers:
                 err_data['headers'] = self.headers
             raise InvalidResponseException(
-                "Could not find normal JSON section in returned HTML.",
-                json.dumps(err_data),
+                "Could not find normal JSON section in returned HTML."
             )
         video_detail = json.loads(self.text)
         if video_detail.get("statusCode", 0) != 0: # assume 0 if not present
@@ -682,7 +702,7 @@ class DaskFunc:
             exception = None
         except Exception as e:
             res = None
-            exception = {'ex': e, 'tb': traceback.format_exc()}
+            exception = {'ex': e}
         post_time = datetime.datetime.now()
 
         return {
@@ -756,6 +776,7 @@ async def get_random_sample(
         cluster_type,
         method
     ):
+    print(f"Getting random sample at {start_time} for {num_time} {time_unit}")
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
     
     with open(os.path.join(this_dir_path, '..', 'figs', 'all_videos', f'{generation_strategy}_two_segments_combinations.json'), 'r') as file:
@@ -811,7 +832,7 @@ async def get_random_sample(
         except Exception as e:
             print(f"Error reading existing results: {e}")
             dataset = TaskDataset()
-            dataset.load_potential_ids(potential_video_ids)
+            dataset.add_potential_ids(potential_video_ids)
         else:
             dataset = TaskDataset()
             dataset.load_existing_df(existing_df)
@@ -819,38 +840,41 @@ async def get_random_sample(
             # add ids that haven't been collected
             existing_ids = set(existing_df['args'])
             potential_video_ids = [i for i in potential_video_ids if i not in existing_ids]
-            dataset.tasks += [DaskTask(i) for i in potential_video_ids]
+            dataset.add_potential_ids(potential_video_ids)
 
             if dataset.num_left() == 0:
                 print("All potential video IDs have been collected")
                 return
     else:
         dataset = TaskDataset()
-        dataset.load_potential_ids(potential_video_ids)
+        dataset.add_potential_ids(potential_video_ids)
 
     if method == 'async':
         raise NotImplementedError("Async method not implemented")
         dataset = await async_map(async_get_video, dataset, num_workers=num_workers)
     elif method == 'dask':
-        dataset = await asyncio.wait_for(dask_map(
-            get_video, 
-            dataset, 
-            num_workers=num_workers, 
-            reqs_per_ip=reqs_per_ip, 
-            batch_size=batch_size,
-            task_batch_size=task_batch_size,
-            task_timeout=task_timeout,
-            task_nthreads=task_nthreads, 
-            max_task_tries=max_task_tries,
-            worker_cpu=worker_cpu, 
-            worker_mem=worker_mem,
-            cluster_type=cluster_type
-        ), timeout=60 * 60)
+        try:
+            await asyncio.wait_for(dask_map(
+                get_video, 
+                dataset, 
+                num_workers=num_workers, 
+                reqs_per_ip=reqs_per_ip, 
+                batch_size=batch_size,
+                task_batch_size=task_batch_size,
+                task_timeout=task_timeout,
+                task_nthreads=task_nthreads, 
+                max_task_tries=max_task_tries,
+                worker_cpu=worker_cpu, 
+                worker_mem=worker_mem,
+                cluster_type=cluster_type
+            ), timeout=60 * 60)
+        except asyncio.exceptions.TimeoutError:
+            print(f"Ran out of time to complete task, saving current results")
     else:
         raise ValueError("Invalid method")
     results = dataset.tasks
-    num_hits = len([r for r in results if r.result and r.result['return'] is not None and 'id' in r.result['return'] and r.result['return']['id'] is not None])
-    num_valid = len([r for r in results if r.result and r.result['return'] is not None])
+    num_hits = len(results[results['result'].map(lambda x: x is not None and x['return'] is not None and 'id' in x['return'] and x['return']['id'] is not None)])
+    num_valid = len(results[results['result'].map(lambda x: x is not None and x['return'] is not None)])
     print(f"Num hits: {num_hits}, Num valid: {num_valid}, Num potential video IDs: {len(dataset)}")
     if num_valid == 0:
         raise ValueError("No valid results")
@@ -883,42 +907,22 @@ async def get_random_sample(
     with open(os.path.join(results_dir_path, 'parameters.json'), 'w') as f:
         json.dump(params, f)
 
-    dict_results = [
-        {
-            'args': r.args, 
-            'exceptions': [{
-                    'exception': str(e['exception']),
-                    'pre_time': e['pre_time'] if e['pre_time'] else None,
-                    'post_time': e['post_time']
-                }
-                for e in r.exceptions
-            ], 
-            'result': {
-                'return': r.result['return'] if r.result is not None else None,
-                'pre_time': r.result['pre_time'] if r.result is not None else None,
-                'post_time': r.result['post_time'] if r.result is not None else None
-            },
-            'completed': r.completed
-        }
-        for r in results
-    ]
-    df = pd.DataFrame(dict_results)
-
+    df = dataset.tasks
+    df['exceptions'] = df['exceptions'].map(lambda exs: [{'exception': str(e['exception']), 'pre_time': e['pre_time'], 'post_time': e['post_time']} for e in exs])
     df.to_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'), compression='gzip')
 
     
-
 async def run_random_sample():
     generation_strategy = 'all'
     # TODO run at persistent time after collection, i.e. if collection takes an hour, run after 24s after post time
-    start_time = datetime.datetime(2024, 4, 10, 19, 0, 0)
+    start_time = datetime.datetime(2024, 4, 10, 19, 59, 45)
     num_time = 1
     time_unit = 'h'
     num_workers = 36
     reqs_per_ip = 200000
     batch_size = 10000
     task_batch_size = 50
-    task_nthreads = 4
+    task_nthreads = 2
     task_timeout = 60
     max_task_tries = 10
     worker_cpu = 256
@@ -964,6 +968,49 @@ async def run_random_sample():
             max_task_tries,
             worker_cpu,
             worker_mem,
+        )
+
+
+async def run_min_each_hour_sample():
+    generation_strategy = 'all'
+    # TODO run at persistent time after collection, i.e. if collection takes an hour, run after 24s after post time
+    num_workers = 36
+    reqs_per_ip = 200000
+    batch_size = 10000
+    task_batch_size = 50
+    task_nthreads = 2
+    task_timeout = 10
+    max_task_tries = 10
+    worker_cpu = 256
+    worker_mem = 512
+    cluster_type = 'slurm'
+    method = 'dask'
+    actual_start_times = []
+    actual_num_time = 1
+    actual_time_unit = 's'
+    min_time = datetime.datetime(2024, 4, 10, 23, 42, 59)
+    for h in range(24):
+        for s in range(60):
+            s_time = datetime.datetime(2024, 4, 10, h, 42, s)
+            if s_time < min_time:
+                continue
+            actual_start_times.append(s_time)
+
+    for actual_start_time in actual_start_times:
+        await get_random_sample(
+            generation_strategy,
+            actual_start_time,
+            actual_num_time,
+            actual_time_unit,
+            num_workers,
+            reqs_per_ip,
+            batch_size,
+            task_batch_size,
+            task_nthreads,
+            task_timeout,
+            max_task_tries,
+            worker_cpu,
+            worker_mem,
             cluster_type,
             method
         )
@@ -992,7 +1039,8 @@ async def run_get_ips():
 async def main():
     # logging.basicConfig(level=logging.DEBUG)
     dotenv.load_dotenv()
-    await run_random_sample()
+    # await run_random_sample()
+    await run_min_each_hour_sample()
     # await run_get_ips()
 
 if __name__ == '__main__':

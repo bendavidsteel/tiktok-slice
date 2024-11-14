@@ -863,7 +863,7 @@ async def main():
                     rewrite_slurm_conf = True
                     slurm_conf = slurm_conf.replace(node_addr, host_ip_map[node_name])
         if rewrite_slurm_conf:
-            print("Rewriting slurm.conf file, move to config directory on controller")
+            print("Rewriting slurm.conf file, move to path /usr/local/etc/slurm.conf on controller")
             with open(slurm_conf_host_path, 'w') as f:
                 f.write(slurm_conf)
 
@@ -883,7 +883,7 @@ async def main():
                     rewrite_hosts_file = True
 
         if rewrite_hosts_file:
-            print("Rewriting hosts file, move to config directory on controller")
+            print("Rewriting hosts file, move to path (/etc/hosts) on controller")
             with open('./config/hosts', 'w') as f:
                 f.write(hosts_file)
 
