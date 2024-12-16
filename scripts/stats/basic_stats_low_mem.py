@@ -1,10 +1,22 @@
+import configparser
+import os
+
 import matplotlib.pyplot as plt
 import numpy as np
-import os
 import polars as pl
 import tqdm
 
-from result_funcs import get_result_paths
+def get_result_paths(result_dir_path, result_filename='results.parquet.gzip', minute=None, hour=None):
+    for dir_path, dir_names, filenames in os.walk(result_dir_path):
+        for filename in filenames:
+            if filename == result_filename:
+                file_hour, file_minute = map(int, dir_path.split('/')[-3:-1])
+                if hour is not None and file_hour != hour:
+                    continue
+                if minute is not None and file_minute != minute:
+                    continue
+                result_path = os.path.join(dir_path, filename)
+                yield result_path
 
 def extract_video_data(df):
     return df.filter(
@@ -18,7 +30,7 @@ def extract_video_data(df):
         pl.col('return').struct.field('stats').struct.field('playCount').cast(pl.Int64).alias('playCount'),
         pl.col('return').struct.field('video').struct.field('duration').cast(pl.Int64).alias('videoDuration'),
         pl.col('return').struct.field('imagePost').is_not_null().alias('isImagePost'),
-        pl.col('return').map_elements(lambda r: len(r['imagePost']['images']) if 'imagePost' in r and r['imagePost'] else 0).alias('numImages'),
+        pl.col('return').map_elements(lambda r: len(r['imagePost']['images']) if 'imagePost' in r and r['imagePost'] else 0, return_dtype=pl.Int32).alias('numImages'),
         pl.col('return').struct.field('locationCreated').alias('locationCreated')
     ]).select(['video_id', 'authorUniqueId', 'commentCount', 'diggCount', 'shareCount', 'playCount', 'videoDuration', 'isImagePost', 'numImages', 'locationCreated'])
 
@@ -39,30 +51,6 @@ def update_value_counts(df, column, existing_counts):
         updated_counts = new_counts.sort('count', descending=True)
     
     return updated_counts
-
-def plot_loglog_hist(df, col_name, title, xlabel, ylabel, fig_path, bins=50):
-    fig, ax = plt.subplots()
-
-    bin_start = df[col_name].min()
-    bin_end = df[col_name].max()
-    if bin_start == 0:
-        start = 1
-        logbins = np.logspace(np.log10(start),np.log10(bin_end),bins-1)
-        logbins = np.concatenate([np.array([0]), logbins])
-    else:
-        logbins = np.logspace(np.log10(bins[0]), np.log10(bin_end), bins)
-    # convert value counts to histogram
-    hist = np.zeros(len(logbins) - 1)
-    for i in range(len(logbins) - 1):
-        hist[i] = df.filter(pl.col(col_name).ge(logbins[i]) & pl.col(col_name).lt(logbins[i+1]))['count'].sum()
-
-    ax.bar(logbins[:-1], hist, width=np.diff(logbins), align='edge')
-    ax.set_xscale('symlog')
-    ax.set_yscale('symlog')
-    ax.set_title(title)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    fig.savefig(fig_path)
 
 def process_batch(result_path, val_count_dfs):
     batch_result_df = pl.read_parquet(result_path, columns=['result', 'args'])
@@ -99,11 +87,6 @@ def process_batch(result_path, val_count_dfs):
 
     return batch_df, val_count_dfs
 
-def load_and_plot(df, col_name, title, xlabel, ylabel, fig_path):
-    df = df.drop_nulls()
-    plot_loglog_hist(df, col_name, title, xlabel, ylabel, fig_path)
-    print(f"Average number of {col_name}: {np.average(df[col_name], weights=df['count'])}")
-
 def finalize_results(unique_video_df, output_dir_path, val_count_dfs):
 
     # Calculate and print overall statistics
@@ -118,19 +101,31 @@ def finalize_results(unique_video_df, output_dir_path, val_count_dfs):
     user_df = None
     location_counts_df.write_csv(os.path.join(output_dir_path, "location_created_value_counts.csv"))
     error_counts_df.write_csv(os.path.join(output_dir_path, "error_value_counts.csv"))
-    
-    # Convert distribution parquet files to CSV
-    load_and_plot(comment_counts_df, "commentCount", "Comment Count Histogram", "Comment Count", "Frequency", os.path.join(output_dir_path, "comment_count_hist.png"))
-    load_and_plot(like_counts_df, "diggCount", "Like Count Histogram", "Like Count", "Frequency", os.path.join(output_dir_path, "like_count_hist.png"))
-    load_and_plot(share_counts_df, "shareCount", "Share Count Histogram", "Share Count", "Frequency", os.path.join(output_dir_path, "share_count_hist.png"))
-    load_and_plot(play_counts_df, "playCount", "Play Count Histogram", "Play Count", "Frequency", os.path.join(output_dir_path, "play_count_hist.png"))
-    load_and_plot(duration_counts_df, "videoDuration", "Video Duration Histogram", "Video Duration", "Frequency", os.path.join(output_dir_path, "video_duration_hist.png"))
 
+    comment_counts_df.write_csv(os.path.join(output_dir_path, "comment_count_value_counts.csv"))
+    like_counts_df.write_csv(os.path.join(output_dir_path, "like_count_value_counts.csv"))
+    share_counts_df.write_csv(os.path.join(output_dir_path, "share_count_value_counts.csv"))
+    play_counts_df.write_csv(os.path.join(output_dir_path, "play_count_value_counts.csv"))
+    duration_counts_df.write_csv(os.path.join(output_dir_path, "video_duration_value_counts.csv"))
+    
 def main():
+    config = configparser.ConfigParser()
+    config.read('./config/config.ini')
+
+    base_result_path = config['paths']['result_path']
+    base_result_path = os.path.join(base_result_path, '2024_04_10')
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
-    data_dir_path = os.path.join(this_dir_path, "..", "data", "results", "2024_04_10", "hours", "19")
-    output_dir_path = os.path.join(this_dir_path, "..", "data", "results", "2024_04_10", "outputs")
-    result_paths = list(get_result_paths(data_dir_path))
+    use = '24hour'
+    if use == 'all':
+        output_dir_path = os.path.join(this_dir_path, "..", "data", "stats", 'all')
+        result_paths = list(get_result_paths(base_result_path))
+    elif use == '24hour':
+        output_dir_path = os.path.join(this_dir_path, "..", "data", "stats", '24hour')
+        result_paths = list(get_result_paths(base_result_path, minute=42))
+    elif use == '1hour':
+        output_dir_path = os.path.join(this_dir_path, "..", "data", "stats", '1hour')
+        result_paths = list(get_result_paths(base_result_path, hour=19))
+
     result_paths = sorted(result_paths)
 
     os.makedirs(output_dir_path, exist_ok=True)

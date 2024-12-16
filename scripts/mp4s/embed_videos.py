@@ -1,13 +1,10 @@
-import asyncio
 import configparser
 import datetime
 import json
 import logging
 import multiprocessing
 import os
-import subprocess
 
-import asyncssh
 import av
 import numpy as np
 import pandas as pd
@@ -58,7 +55,10 @@ def load_video(video_file_path):
             video = read_video_pyav(container, indices)
         return video
     except Exception as e:
-        raise
+        os.remove(video_file_path)
+        return None
+        raise Exception(e, f"Failed to load video: {video_file_path}")
+        
 
 class MultiModalBackend:
     def __init__(self):
@@ -73,6 +73,9 @@ class MultiModalBackend:
         logger.debug(f"Loading {len(video_file_paths)} videos...")
         with multiprocessing.Pool(min(8, len(video_file_paths))) as p:
             videos = list(p.imap(load_video, video_file_paths))
+
+        processed_video_file_paths = [video_file_path for video_file_path, video in zip(video_file_paths, videos) if video is not None]
+        videos = [video for video in videos if video is not None]
         
         logger.debug(f"Embedding {len(videos)} videos...")
         # padding videos to the same length
@@ -83,19 +86,47 @@ class MultiModalBackend:
             
         inputs = self.vision_processor(videos=videos, return_tensors="pt")
         inputs = inputs.to(self.device)
-        video_embeds = self.vision_model.get_video_features(**inputs)
+
+        # Use X_CLIP model's config for some fields (if specified) instead of those of vision & text components.
+        pixel_values = inputs["pixel_values"]
+        output_attentions = self.vision_model.config.output_attentions
+        output_hidden_states = self.vision_model.config.output_hidden_states
+        return_dict = self.vision_model.config.use_return_dict
+
+        batch_size, num_frames, num_channels, height, width = pixel_values.shape
+        pixel_values = pixel_values.reshape(-1, num_channels, height, width)
+
+        vision_outputs = self.vision_model.vision_model(
+            pixel_values=pixel_values,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            interpolate_pos_encoding=False,
+            return_dict=return_dict,
+        )
+
+        video_embeds = vision_outputs[1]
+        video_embeds = self.vision_model.visual_projection(video_embeds)
+
+        cls_features = video_embeds.view(batch_size, num_frames, -1)
+
+        mit_outputs = self.vision_model.mit(
+            cls_features,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        video_embeds = mit_outputs[1]
+
+        img_features = vision_outputs[0][:, 1:, :]
+        img_features = self.vision_model.prompts_visual_layernorm(img_features)
+        img_features = img_features @ self.vision_model.prompts_visual_projection
+        img_features = img_features.view(batch_size, num_frames, -1, video_embeds.shape[-1])
+        img_features = img_features.mean(dim=1, keepdim=False)
+
         video_embeds = video_embeds.cpu().detach().numpy()
+        img_features = img_features.cpu().detach().numpy()
 
-        if texts is not None:
-            raise NotImplementedError()
-            inputs = self.tokenizer(texts, padding=True, return_tensors="pt")
-            outputs = self.text_model(**inputs)
-            text_last_hidden_state = outputs.last_hidden_state
-            pooled_output = outputs.pooler_output  # pooled (EOS token) states
-
-            return video_embeds, text_last_hidden_state
-        else:
-            return video_embeds
+        return video_embeds, img_features, processed_video_file_paths
 
 def embed_directory(embedding_model, video_df, write_dir_path, read_dir_paths):
     host_file_paths = []
@@ -125,15 +156,17 @@ def embed_directory(embedding_model, video_df, write_dir_path, read_dir_paths):
         return
 
     embedding_path = os.path.join(write_dir_path, 'video_embeddings.npy')
+    img_features_path = os.path.join(write_dir_path, 'img_features.npy')
     video_path = os.path.join(write_dir_path, 'videos.parquet.gzip')
 
     add_to_existing = False
-    if os.path.exists(embedding_path) and os.path.exists(video_path):
+    if os.path.exists(embedding_path) and os.path.exists(img_features_path) and os.path.exists(video_path):
         try:
             saved_embeddings = np.load(embedding_path)
+            saved_img_features = np.load(img_features_path)
             saved_video_df = pd.read_parquet(video_path)
             
-            if saved_embeddings.shape[0] == saved_video_df.shape[0]:
+            if saved_embeddings.shape[0] == saved_video_df.shape[0] and saved_img_features.shape[0] == saved_video_df.shape[0]:
                 saved_video_ids = set(saved_video_df['id'].tolist())
                 video_ids = set(video_df['id'].tolist())
                 if saved_video_ids == video_ids:
@@ -146,9 +179,10 @@ def embed_directory(embedding_model, video_df, write_dir_path, read_dir_paths):
             print(f"Failed to load embeddings: {e}")
 
     embeddings = None
+    img_features = None
     i = 0
     max_batch_file_size = 2e8
-    max_batch_size = 64
+    max_batch_size = 32
     pbar = tqdm.tqdm(total=len(host_file_paths))
     while i < len(host_file_paths):
         batch_file_size = 0
@@ -163,32 +197,52 @@ def embed_directory(embedding_model, video_df, write_dir_path, read_dir_paths):
 
         # embed the videos
         try:
-            batch_embeddings = embedding_model.embed_videos(batch_file_paths)
+            batch_embeddings, batch_img_features, processed_video_file_paths = embedding_model.embed_videos(batch_file_paths)
         except Exception as e:
-            print(f"Failed to embed videos: {e}")
+            print(f"Failed to embed video batch: {e}")
             video_df = video_df[~video_df['id'].isin([os.path.splitext(os.path.basename(file_path))[0] for file_path in batch_file_paths])]
             continue
+
+        failed_file_paths = [file_path for file_path in batch_file_paths if file_path not in processed_video_file_paths]
+        if len(failed_file_paths) > 0:
+            print(f"Failed to embed some videos: {failed_file_paths}")
+            assert len(video_df[video_df['id'].isin([os.path.splitext(os.path.basename(file_path))[0] for file_path in failed_file_paths])]) == len(failed_file_paths)
+            video_df = video_df[~video_df['id'].isin([os.path.splitext(os.path.basename(file_path))[0] for file_path in failed_file_paths])]
+            
         pbar.update(batch_size)
         if embeddings is None:
             embeddings = batch_embeddings
         else:
             embeddings = np.concatenate([embeddings, batch_embeddings], axis=0)
 
+        if img_features is None:
+            img_features = batch_img_features
+        else:
+            img_features = np.concatenate([img_features, batch_img_features], axis=0)
+
     if embeddings is None:
         return
 
-    assert embeddings.shape[0] == video_df.shape[0]
+    if embeddings.shape[0] != len(video_df):
+        raise ValueError(f"Embeddings shape {embeddings.shape} does not match video_df length {len(video_df)}")
     assert embeddings.shape[0] > 0
 
     if add_to_existing:
         embeddings = np.concatenate([saved_embeddings, embeddings], axis=0)
+        img_features = np.concatenate([saved_img_features, img_features], axis=0)
         video_df = pd.concat([saved_video_df, video_df], axis=0)
+
 
     assert embeddings.shape[0] == video_df.shape[0]
     assert embeddings.shape[0] > 0
 
+    os.makedirs(write_dir_path, exist_ok=True)
+
     with open(embedding_path, 'wb') as f:
         np.save(f, embeddings)
+
+    with open(img_features_path, 'wb') as f:
+        np.save(f, img_features)
 
     video_df.to_parquet(video_path, compression='gzip')
 
@@ -196,7 +250,7 @@ def embed_directory(embedding_model, video_df, write_dir_path, read_dir_paths):
     # for file_path in host_file_paths:
     #     os.remove(file_path)
 
-async def main():
+def main():
     config = configparser.ConfigParser()
     config.read('./config/config.ini')
 
@@ -226,8 +280,11 @@ async def main():
 
         write_dir_path = os.path.join(embedding_dir_path, server_dir)
         
-        embed_directory(embedding_model, video_df, write_dir_path, read_dir_paths)
+        try:
+            embed_directory(embedding_model, video_df, write_dir_path, read_dir_paths)
+        except Exception as e:
+            print(f"Failed to embed videos: {e}, in {server_dir}")
 
 if __name__ == '__main__':
     # logging.basicConfig(level=logging.DEBUG)
-    asyncio.run(main())
+    main()

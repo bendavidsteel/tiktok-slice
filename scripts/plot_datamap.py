@@ -4,7 +4,7 @@ import re
 import datamapplot
 import matplotlib as mpl
 import numpy as np
-import pandas as pd
+import polars as pl
 from PIL import Image
 
 def convert_to_image(cols):
@@ -12,31 +12,32 @@ def convert_to_image(cols):
 
 def main():
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
-    data_dir_path = os.path.join(this_dir_path, '..', 'data')
+    data_dir_path = os.path.join(this_dir_path, '..', 'data', f'topic_model_videos_1000')
 
-    video_df = pd.read_parquet(os.path.join(data_dir_path, 'video_topics.parquet.gzip'))
+    video_df = pl.read_parquet(os.path.join(data_dir_path, 'video_topics.parquet.gzip'))
 
     embeddings_2d = np.load(os.path.join(data_dir_path, 'reduced_embeddings.npy'))
 
-    topic_info_df = pd.read_parquet(os.path.join(data_dir_path, 'topic_info.parquet.gzip'))
-    topic_info_df['Visual_Aspect'] = topic_info_df[['Visual_Aspect_Mode', 'Visual_Aspect_Size', 'Visual_Aspect_Bytes']].apply(convert_to_image, axis=1)
+    topic_info_df = pl.read_parquet(os.path.join(data_dir_path, 'topic_info.parquet.gzip'))
+    # topic_info_df['Visual_Aspect'] = topic_info_df[['Visual_Aspect_Mode', 'Visual_Aspect_Size', 'Visual_Aspect_Bytes']].apply(convert_to_image, axis=1)
+
+    topic_info_df = topic_info_df.with_columns(pl.col('Name').map_elements(lambda n: ','.join(n.split('_')[1:]), return_dtype=pl.String).alias('Desc'))
+
+    top_n_topics = 50
+    if top_n_topics:
+        topic_info_df = topic_info_df.sort('Count', descending=True).head(top_n_topics)
 
     # Prepare text and names
-    topic_name_mapping = {row['Topic']: f"Topic-{row['Topic']}" for _, row in topic_info_df[['Topic', 'Name']].iterrows()}
-    # if isinstance(custom_labels, str):
-    #     names = [[[str(topic), None]] + topic_model.topic_aspects_[custom_labels][topic] for topic in unique_topics]
-    #     names = [" ".join([label[0] for label in labels[:4]]) for labels in names]
-    #     names = [label if len(label) < 30 else label[:27] + "..." for label in names]
-    # elif topic_model.custom_labels_ is not None and custom_labels:
-    #     names = [topic_model.custom_labels_[topic + topic_model._outliers] for topic in unique_topics]
-    # else:
-    #     names = [f"Topic-{topic}: " + " ".join([word for word, value in topic_model.get_topic(topic)][:3]) for topic in unique_topics]
-
-    # topic_name_mapping = {topic_num: topic_name for topic_num, topic_name in zip(unique_topics, names)}
+    topic_name_mapping = {row['Topic']: row['Desc'] for row in topic_info_df[['Topic', 'Desc']].to_dicts()}
     topic_name_mapping[-1] = "Unlabelled"
 
+    if top_n_topics:
+        for topic_num in topic_info_df['Topic'].to_list():
+            if topic_num not in topic_name_mapping:
+                topic_name_mapping[topic_num] = "Unlabelled"
+
     # If a set of topics is chosen, set everything else to "Unlabelled"
-    chosen_topics = list(range(1, 3))
+    chosen_topics = None
     if chosen_topics:
         selected_topics = set(chosen_topics)
         for topic_num in topic_name_mapping:
@@ -44,42 +45,28 @@ def main():
                 topic_name_mapping[topic_num] = "Unlabelled"
 
     # Map in topic names and plot
-    named_topic_per_doc = video_df['topic'].map(topic_name_mapping).values
+    named_topic_per_doc = video_df['topic'].replace_strict(topic_name_mapping, default='Unlabelled').to_list()
 
-    images = {f"Topic-{topic_num}": topic_info_df[topic_info_df['Topic'] == topic_num]['Visual_Aspect'].values[0] for topic_num in topic_name_mapping.keys()}
-    images = {k: np.asarray(v) for (k, v) in images.items()}
+    # TODO dot size determined by view count
 
-    width, height = 1200, 1200
-
-    figure, axes = datamapplot.create_plot(
+    fig, axes = datamapplot.create_plot(
         embeddings_2d,
         labels=named_topic_per_doc,
-        images=images,
-        figsize=(width/100, height/100),
-        dpi=100,
+        label_over_points=True,
+        dynamic_label_size=True,
+        # dynamic_label_size_scaling_factor=0.75,
+        min_font_size=8.0,
+        max_font_size=16.0,
+        dpi=300,
+        marker_size_array=video_df['playCount'].to_numpy(),
     )
-    # child_artists = axes.get_children()
-    # for artist in child_artists:
-    #     if isinstance(artist, mpl.text.Text):
-    #         # replace the text with representative images
-    #         text = artist.get_text()
-    #         if not text:
-    #             continue
-    #         topic_num = int(re.search(r'\d+', text).group())
-    #         # artist.set_text("")
-    #         # artist.set_visible(False)
-    #         # artist.remove()
-    #         coords = artist.get_position()
-    #         image = topic_info_df[topic_info_df['Topic'] == topic_num]['Visual_Aspect'].values[0]
-    #         image_width, image_height = 0.1, 0.1
-    #         axes.imshow(
-    #             np.asarray(image),
-    #             extent=[coords[0], coords[0] + image_width, coords[1], coords[1] + image_height],
-    #             transform=axes.transAxes,
-    #         )
 
+    axes.set_axis_off()
+    fig.subplots_adjust(left=0, bottom=0, right=1, top=1, wspace=0, hspace=0)
 
-    figure.savefig(os.path.join(this_dir_path, '..', 'figs', 'datamapplot.png'), bbox_inches='tight')
+    figs_dir_path = os.path.join(this_dir_path, '..', 'figs')
+    os.makedirs(figs_dir_path, exist_ok=True)
+    fig.savefig(os.path.join(figs_dir_path, 'datamapplot.png'), bbox_inches='tight')
 
 if __name__ == '__main__':
     main()
