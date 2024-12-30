@@ -355,12 +355,12 @@ class Counter:
 
 class TaskDataset:
     def __init__(self):
-        self.tasks = pl.DataFrame(columns=['args', 'result', 'exceptions', 'completed'])
+        self.tasks = pl.DataFrame(schema={'args': pl.UInt64, 'result': pl.Object, 'exceptions': pl.List, 'completed': pl.Boolean})
 
     def add_potential_ids(self, args):
         new_tasks = pl.DataFrame([
             {'args': arg, 'result': None, 'exceptions': [], 'completed': False} for arg in args
-        ])
+            ], schema={'args': pl.UInt64, 'result': pl.Object, 'exceptions': pl.List, 'completed': pl.Boolean})
         self.tasks = pl.concat([self.tasks, new_tasks])
 
     def load_existing_df(self, df):
@@ -793,7 +793,7 @@ async def get_random_sample(
     print(f"Getting random sample at {start_time} for {num_time} {time_unit}")
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
     
-    with open(os.path.join(this_dir_path, '..', 'figs', 'all_videos', f'{generation_strategy}_two_segments_combinations.json'), 'r') as file:
+    with open(os.path.join(this_dir_path, '..', '..', 'figs', 'all_videos', f'{generation_strategy}_two_segments_combinations.json'), 'r') as file:
         data = json.load(file)
 
     # get bits of non timestamp sections of ID
