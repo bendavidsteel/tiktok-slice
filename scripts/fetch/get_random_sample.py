@@ -356,12 +356,23 @@ class Counter:
 
 class TaskDataset:
     def __init__(self):
-        self.tasks = pl.DataFrame(schema={'args': pl.UInt64, 'result': pl.Struct, 'exceptions': pl.List, 'completed': pl.Boolean})
+        self.tasks = pl.DataFrame(
+            schema={
+                'args': pl.UInt64, 
+                'result': pl.Struct({
+                    'return': pl.Struct, 
+                    'post_time': pl.Datetime, 
+                    'pre_time': pl.Datetime
+                }), 
+                'exceptions': pl.List(pl.Struct({'exception': pl.String, 'pre_time': pl.Datetime, 'post_time': pl.Datetime})), 
+                'completed': pl.Boolean
+            }
+        )
 
     def add_potential_ids(self, args):
         new_tasks = pl.DataFrame([
             {'args': arg, 'result': None, 'exceptions': [], 'completed': False} for arg in args
-            ], schema={'args': pl.UInt64, 'result': pl.Struct, 'exceptions': pl.List, 'completed': pl.Boolean})
+            ], schema=self.tasks.schema)
         self.tasks = pl.concat([self.tasks, new_tasks], how='diagonal_relaxed')
 
     def load_existing_df(self, df):
@@ -387,12 +398,15 @@ class TaskDataset:
 
     def update_tasks(self, tasks):
         # Create a DataFrame from the tasks
-        updates_df = pl.DataFrame({
-            "args": [t.args for t in tasks],
-            "result": [t.result for t in tasks],
-            "exceptions": [t.exceptions for t in tasks],
-            "completed": [t.completed for t in tasks]
-        }, schema={'args': pl.UInt64, 'result': pl.Struct, 'exceptions': pl.List, 'completed': pl.Boolean})
+        updates_df = pl.DataFrame(
+            {
+                "args": [t.args for t in tasks],
+                "result": [t.result for t in tasks],
+                "exceptions": [[{k: str(v) if k == 'exception' else v for k, v in e.items()} for e in t.exceptions] for t in tasks],
+                "completed": [t.completed for t in tasks]
+            },
+            schema_overrides={'args': pl.UInt64}
+        )
         
         # Update the existing DataFrame using join and coalesce
         self.tasks = self.tasks.join(
