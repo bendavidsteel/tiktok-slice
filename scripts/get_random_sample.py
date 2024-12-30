@@ -828,7 +828,7 @@ async def get_random_sample(
     if os.path.exists(results_dir_path) and os.path.exists(os.path.join(results_dir_path, 'results.parquet.gzip')):
         # remove ids that have already been collected
         try:
-            existing_df = pd.read_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'))
+            existing_df = pl.read_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'))
         except Exception as e:
             print(f"Error reading existing results: {e}")
             dataset = TaskDataset()
@@ -909,20 +909,20 @@ async def get_random_sample(
 
     df = dataset.tasks
     df['exceptions'] = df['exceptions'].map(lambda exs: [{'exception': str(e['exception']), 'pre_time': e['pre_time'], 'post_time': e['post_time']} for e in exs])
-    df.to_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'), compression='gzip')
+    df.write_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'), compression='gzip')
 
     
 async def run_random_sample():
     generation_strategy = 'all'
     # TODO run at persistent time after collection, i.e. if collection takes an hour, run after 24s after post time
-    start_time = datetime.datetime(2024, 4, 10, 19, 59, 45)
+    start_time = datetime.datetime(2024, 4, 10, 19, 1, 15)
     num_time = 1
     time_unit = 'h'
     num_workers = 36
     reqs_per_ip = 200000
-    batch_size = 10000
+    batch_size = 20000
     task_batch_size = 50
-    task_nthreads = 2
+    task_nthreads = 5
     task_timeout = 60
     max_task_tries = 10
     worker_cpu = 256
@@ -968,6 +968,8 @@ async def run_random_sample():
             max_task_tries,
             worker_cpu,
             worker_mem,
+            cluster_type,
+            method
         )
 
 
@@ -988,7 +990,7 @@ async def run_min_each_hour_sample():
     actual_start_times = []
     actual_num_time = 1
     actual_time_unit = 's'
-    min_time = datetime.datetime(2024, 4, 10, 23, 42, 59)
+    min_time = datetime.datetime(2024, 4, 10, 0, 42, 0)
     for h in range(24):
         for s in range(60):
             s_time = datetime.datetime(2024, 4, 10, h, 42, s)
@@ -1039,7 +1041,7 @@ async def run_get_ips():
 async def main():
     # logging.basicConfig(level=logging.DEBUG)
     dotenv.load_dotenv()
-    # await run_random_sample()
+    await run_random_sample()
     await run_min_each_hour_sample()
     # await run_get_ips()
 
