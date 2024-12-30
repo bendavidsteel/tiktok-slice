@@ -5,11 +5,12 @@ import math
 import multiprocessing
 import os
 
-import copia.rarefaction_extrapolation
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy.spatial.distance import jensenshannon
 import tqdm
+
 
 from copia.data import to_copia_dataset
 from copia.estimators import ace, iChao1, chao1, egghe_proot
@@ -90,25 +91,84 @@ def do_country_analysis(country):
     return country_videos, last_section
 
 def get_overlaps(country_sections):
-    overlaps = np.zeros((len(country_sections), len(country_sections)))
+    """
+    Create two heatmaps showing both set overlaps and distribution overlaps
+    between countries' sections.
+    """
     countries = list(country_sections.keys())
-    for country1, section1 in country_sections.items():
-        for country2, section2 in country_sections.items():
-            overlap = set(section1).intersection(section2)
-            union = set(section1).union(section2)
-            overlaps[countries.index(country1), countries.index(country2)] = len(overlap) / len(union)
-    fig, ax = plt.subplots()
-    im = ax.imshow(overlaps)
-    ax.set_xticks(np.arange(len(countries)))
-    ax.set_yticks(np.arange(len(countries)))
-    ax.set_xticklabels(countries)
-    ax.set_yticklabels(countries)
-    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
-    for i in range(len(countries)):
-        for j in range(len(countries)):
-            text = ax.text(j, i, f"{overlaps[i, j]:.2f}", ha="center", va="center", color="w")
-    fig.tight_layout()
+    n_countries = len(countries)
+    
+    # Calculate set overlaps
+    set_overlaps = np.zeros((n_countries, n_countries))
+    
+    # Calculate distribution overlaps
+    dist_overlaps = np.zeros((n_countries, n_countries))
+    
+    # Get all unique sections for distribution analysis
+    all_sections = sorted(set().union(*country_sections.values()))
+    
+    # Create distribution vectors for each country
+    country_distributions = {}
+    for country, sections in country_sections.items():
+        # Count frequency of each section
+        counts = collections.Counter(sections)
+        # Create normalized distribution vector
+        dist = np.array([counts.get(section, 0) for section in all_sections])
+        dist = dist / np.sum(dist) if np.sum(dist) > 0 else dist
+        country_distributions[country] = dist
+    
+    # Calculate both overlap matrices
+    for i, country1 in enumerate(countries):
+        for j, country2 in enumerate(countries):
+            # Set overlap (Jaccard index)
+            set1 = set(country_sections[country1])
+            set2 = set(country_sections[country2])
+            overlap = set1.intersection(set2)
+            union = set1.union(set2)
+            set_overlaps[i, j] = len(overlap) / len(union)
+            
+            # Distribution overlap (1 - Jensen-Shannon divergence)
+            dist1 = country_distributions[country1]
+            dist2 = country_distributions[country2]
+            if i == j:
+                dist_overlaps[i, j] = 1.0
+            else:
+                # JSD returns a value between 0 and 1, where 0 means identical distributions
+                # We subtract from 1 to make it an overlap measure rather than a distance
+                dist_overlaps[i, j] = 1 - jensenshannon(dist1, dist2)
+    
+    # Create figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+    
+    # Plot set overlaps
+    im1 = ax1.imshow(set_overlaps)
+    ax1.set_title('Set Overlap (Jaccard Index)')
+    plt.colorbar(im1, ax=ax1)
+    
+    # Plot distribution overlaps
+    im2 = ax2.imshow(dist_overlaps)
+    ax2.set_title('Distribution Overlap (1 - Jensen-Shannon)')
+    plt.colorbar(im2, ax=ax2)
+    
+    # Configure both axes
+    for ax in (ax1, ax2):
+        ax.set_xticks(np.arange(len(countries)))
+        ax.set_yticks(np.arange(len(countries)))
+        ax.set_xticklabels(countries)
+        ax.set_yticklabels(countries)
+        plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+        
+        # Add text annotations
+        for i in range(len(countries)):
+            for j in range(len(countries)):
+                value = set_overlaps[i, j] if ax == ax1 else dist_overlaps[i, j]
+                text = ax.text(j, i, f"{value:.2f}",
+                             ha="center", va="center",
+                             color="white" if value > 0.5 else "black")
+    
+    plt.tight_layout()
     fig.savefig(os.path.join('.', 'figs', 'overlaps.png'))
+
 
 def read_result_path(result_path):
     with open(result_path, 'r') as f:
@@ -123,7 +183,7 @@ def main():
     data_dir_path = os.path.join(this_dir_path, "..", "data")
 
     all_videos = []
-    countries = ['brazil', 'canada', 'germany', 'indonesia', 'nigeria']
+    countries = ['brazil', 'canada', 'germany', 'indonesia', 'nigeria', 'india', 'australia', 'japan', 'russia']
 
     print("All countries")
     # with multiprocessing.Pool(processes=len(countries)) as pool:

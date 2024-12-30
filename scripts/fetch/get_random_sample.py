@@ -1,11 +1,11 @@
 import asyncio
 import collections
 from concurrent.futures import ThreadPoolExecutor
+import configparser
 import datetime
 import io
 import itertools
 import json
-import logging
 import os
 import subprocess
 import time
@@ -20,6 +20,7 @@ from dask.distributed import as_completed as dask_as_completed
 from dask_cloudprovider.aws import FargateCluster as DaskFargateCluster
 from dask_jobqueue import SLURMCluster as DaskSLURMCluster
 import dotenv
+import hydra
 import numpy as np
 import polars as pl
 import pycurl
@@ -355,12 +356,12 @@ class Counter:
 
 class TaskDataset:
     def __init__(self):
-        self.tasks = pl.DataFrame(schema={'args': pl.UInt64, 'result': pl.Object, 'exceptions': pl.List, 'completed': pl.Boolean})
+        self.tasks = pl.DataFrame(schema={'args': pl.UInt64, 'result': pl.Struct, 'exceptions': pl.List, 'completed': pl.Boolean})
 
     def add_potential_ids(self, args):
         new_tasks = pl.DataFrame([
             {'args': arg, 'result': None, 'exceptions': [], 'completed': False} for arg in args
-            ], schema={'args': pl.UInt64, 'result': pl.Object, 'exceptions': pl.List, 'completed': pl.Boolean})
+            ], schema={'args': pl.UInt64, 'result': pl.Struct, 'exceptions': pl.List, 'completed': pl.Boolean})
         self.tasks = pl.concat([self.tasks, new_tasks])
 
     def load_existing_df(self, df):
@@ -397,11 +398,12 @@ class TaskDataset:
                 how="left"
             )\
             .with_columns([
-                pl.col("result_right").alias("result").fill_null(pl.col("result")),
-                pl.col("exceptions_right").alias("exceptions").fill_null(pl.col("exceptions")),
-                pl.col("completed_right").alias("completed").fill_null(pl.col("completed"))
+                pl.col("result_right").fill_null(pl.col("result")),
+                pl.col("exceptions_right").fill_null(pl.col("exceptions")),
+                pl.col("completed_right").fill_null(pl.col("completed"))
             ])\
-            .drop(["result_right", "exceptions_right", "completed_right"])
+            .drop(["result", "exceptions", "completed"])\
+            .rename({'result_right': 'result', 'exceptions_right': 'exceptions', 'completed_right': 'completed'})
         
     
     def num_left(self):
@@ -926,23 +928,12 @@ async def get_random_sample(
     df.write_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'), compression='gzip')
 
     
-async def run_random_sample():
+async def run_random_sample(config):
+    num_time = 1
+    time_unit = 'h'
     generation_strategy = 'all'
     # TODO run at persistent time after collection, i.e. if collection takes an hour, run after 24s after post time
     start_time = datetime.datetime(2024, 4, 10, 19, 1, 15)
-    num_time = 1
-    time_unit = 'h'
-    num_workers = 36
-    reqs_per_ip = 200000
-    batch_size = 20000
-    task_batch_size = 50
-    task_nthreads = 5
-    task_timeout = 60
-    max_task_tries = 10
-    worker_cpu = 256
-    worker_mem = 512
-    cluster_type = 'local'
-    method = 'dask'
     if (num_time > 1 and time_unit == 's') or (time_unit == 'm') or (time_unit == 'h'):
         if time_unit == 's':
             num_seconds = num_time
@@ -952,7 +943,7 @@ async def run_random_sample():
             num_seconds = num_time * 3600
         else:
             raise ValueError("Invalid time unit")
-        if num_seconds > 60 and cluster_type == 'fargate':
+        if num_seconds > 60 and config.cluster_type == 'fargate':
             raise ValueError("Too expensive to run for more than 60 seconds on Fargate")
         actual_num_time = 1
         actual_time_unit = 's'
@@ -973,34 +964,23 @@ async def run_random_sample():
             actual_start_time,
             actual_num_time,
             actual_time_unit,
-            num_workers,
-            reqs_per_ip,
-            batch_size,
-            task_batch_size,
-            task_nthreads,
-            task_timeout,
-            max_task_tries,
-            worker_cpu,
-            worker_mem,
-            cluster_type,
-            method
+            config.num_workers,
+            config.reqs_per_ip,
+            config.batch_size,
+            config.task_batch_size,
+            config.task_nthreads,
+            config.task_timeout,
+            config.max_task_tries,
+            config.worker_cpu,
+            config.worker_mem,
+            config.cluster_type,
+            config.method
         )
 
 
-async def run_min_each_hour_sample():
+async def run_min_each_hour_sample(config):
     generation_strategy = 'all'
     # TODO run at persistent time after collection, i.e. if collection takes an hour, run after 24s after post time
-    num_workers = 36
-    reqs_per_ip = 200000
-    batch_size = 10000
-    task_batch_size = 50
-    task_nthreads = 2
-    task_timeout = 10
-    max_task_tries = 10
-    worker_cpu = 256
-    worker_mem = 512
-    cluster_type = 'slurm'
-    method = 'dask'
     actual_start_times = []
     actual_num_time = 1
     actual_time_unit = 's'
@@ -1018,17 +998,17 @@ async def run_min_each_hour_sample():
             actual_start_time,
             actual_num_time,
             actual_time_unit,
-            num_workers,
-            reqs_per_ip,
-            batch_size,
-            task_batch_size,
-            task_nthreads,
-            task_timeout,
-            max_task_tries,
-            worker_cpu,
-            worker_mem,
-            cluster_type,
-            method
+            config.num_workers,
+            config.reqs_per_ip,
+            config.batch_size,
+            config.task_batch_size,
+            config.task_nthreads,
+            config.task_timeout,
+            config.max_task_tries,
+            config.worker_cpu,
+            config.worker_mem,
+            config.cluster_type,
+            config.method
         )
 
 def get_ip(_, network_interface):
@@ -1052,12 +1032,16 @@ async def run_get_ips():
     print(collections.Counter(ips))
     print(f"Num unique IPs: {len(set(ips))}")
     
-async def main():
+async def async_main(config):
     # logging.basicConfig(level=logging.DEBUG)
     dotenv.load_dotenv()
-    await run_random_sample()
-    await run_min_each_hour_sample()
+    await run_random_sample(config)
+    await run_min_each_hour_sample(config)
     # await run_get_ips()
 
+@hydra.main(config_path='../../config', config_name='config')
+def main(config):
+    asyncio.run(async_main(config))
+
 if __name__ == '__main__':
-    asyncio.run(main())
+    main()
