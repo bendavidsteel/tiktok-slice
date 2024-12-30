@@ -268,19 +268,19 @@ def main():
     server_dirs = set(server_dirs)
     for server_dir in server_dirs:
         print(f"Embedding videos in {server_dir}")
-        dir_time = datetime.datetime.fromtimestamp(int(server_dir))
-        video_path = os.path.join(dir_time.strftime('%Y_%m_%d'), 'hours', str(dir_time.hour), str(dir_time.minute), str(dir_time.second), 'results.parquet.gzip')
-        video_path = os.path.join(videos_dir_path, video_path)
-        video_df = pd.read_parquet(video_path, columns=['result'])
-        read_dir_paths = []
-        for byte_dir_path in bytes_dir_paths:
-            read_dir_path = os.path.join(byte_dir_path, server_dir)
-            if os.path.exists(read_dir_path):
-                read_dir_paths.append(read_dir_path)
-
-        write_dir_path = os.path.join(embedding_dir_path, server_dir)
-        
         try:
+            dir_time = datetime.datetime.fromtimestamp(int(server_dir))
+            video_path = os.path.join(dir_time.strftime('%Y_%m_%d'), 'hours', str(dir_time.hour), str(dir_time.minute), str(dir_time.second), 'results.parquet.gzip')
+            video_path = os.path.join(videos_dir_path, video_path)
+            video_df = pd.read_parquet(video_path, columns=['result'])
+            read_dir_paths = []
+            for byte_dir_path in bytes_dir_paths:
+                read_dir_path = os.path.join(byte_dir_path, server_dir)
+                if os.path.exists(read_dir_path):
+                    read_dir_paths.append(read_dir_path)
+
+            write_dir_path = os.path.join(embedding_dir_path, server_dir)
+        
             embed_directory(embedding_model, video_df, write_dir_path, read_dir_paths)
         except Exception as e:
             print(f"Failed to embed videos: {e}, in {server_dir}")

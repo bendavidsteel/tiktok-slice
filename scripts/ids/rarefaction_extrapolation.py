@@ -123,7 +123,7 @@ def main():
     data_dir_path = os.path.join(this_dir_path, "..", "data")
 
     all_videos = []
-    countries = ['brazil', 'canada', 'germany', 'indonesia', 'nigeria']
+    countries = ['brazil', 'canada', 'germany', 'indonesia', 'nigeria', 'japan', 'australia', 'india']
 
     print("All countries")
     # with multiprocessing.Pool(processes=len(countries)) as pool:
