@@ -1,3 +1,4 @@
+import datetime
 import os
 
 import polars as pl
@@ -11,12 +12,20 @@ def test_task_dataset():
     dataset.add_potential_ids(potential_video_ids)
 
     tasks = dataset.get_batch(5)
-    for task in tasks:
-        task.result = {'result': 1}
+    results = []
+    for i, task in enumerate(tasks):
+        if i % 2 == 0:
+            task.result = {'return': {'video_id': 1}, 'post_time': datetime.datetime.now()}
+            results.append(task.result)
+        else:
+            task.result = {'return': None, 'post_time': datetime.datetime.now()}
+            task.exceptions.append({'exception': Exception()})
+            results.append(task.result)
 
     dataset.update_tasks(tasks)
 
-    assert dataset.tasks['result'].to_list() == [{'result': 1} for _ in range(5)]
+    for r, row in zip(results, dataset.tasks.to_dicts()):
+        assert r['return'] == row['result']['return']
 
 def test_existing_task_dataset():
 
