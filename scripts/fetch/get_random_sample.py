@@ -17,16 +17,14 @@ import certifi
 from dask.distributed import Client as DaskClient
 from dask.distributed import LocalCluster as DaskLocalCluster
 from dask.distributed import as_completed as dask_as_completed
-from dask_cloudprovider.aws import FargateCluster as DaskFargateCluster
-from dask_jobqueue import SLURMCluster as DaskSLURMCluster
 import dotenv
 import hydra
 import numpy as np
 import polars as pl
 import pycurl
 import randmac
-from random_user_agent import user_agent as rug_user_agent
-from random_user_agent import params as rug_params
+# from random_user_agent import user_agent as rug_user_agent
+# from random_user_agent import params as rug_params
 from tqdm import tqdm
 from tqdm.asyncio import tqdm as atqdm
 
@@ -220,6 +218,7 @@ class DaskCluster:
         subprocess.run('ulimit -n 100000', shell=True, capture_output=True)
 
         if self.cluster_type == 'fargate':
+            from dask_cloudprovider.aws import FargateCluster as DaskFargateCluster
             self.cluster = DaskFargateCluster(
                 fargate_spot=True,
                 image="daskdev/dask:latest-py3.10", 
@@ -281,6 +280,7 @@ class DaskCluster:
             else:
                 raise asyncio.TimeoutError("Timed out creating cluster...")
         elif self.cluster_type == 'slurm':
+            from dask_jobqueue import SLURMCluster as DaskSLURMCluster
             remote_python='~/tiktok/venv/bin/python'
             account = 'bsteel'
             # TODO could run this via slurm
@@ -362,11 +362,14 @@ class TaskDataset:
         new_tasks = pl.DataFrame([
             {'args': arg, 'result': None, 'exceptions': [], 'completed': False} for arg in args
             ], schema={'args': pl.UInt64, 'result': pl.Struct, 'exceptions': pl.List, 'completed': pl.Boolean})
-        self.tasks = pl.concat([self.tasks, new_tasks])
+        self.tasks = pl.concat([self.tasks, new_tasks], how='diagonal_relaxed')
 
     def load_existing_df(self, df):
-        df = df.with_columns(pl.col('result').map_elements(lambda r: r is not None and 'return' in r and r['return'] is not None, pl.Boolean).alias('completed'))
-        self.tasks = pl.concat([self.tasks, df])
+        df = df.with_columns([
+            pl.col('args').cast(pl.UInt64),
+            pl.col('result').map_elements(lambda r: r is not None and 'return' in r and r['return'] is not None, pl.Boolean).alias('completed')
+        ])
+        self.tasks = pl.concat([self.tasks, df], how='diagonal_relaxed')
 
     def get_batch(self, batch_size):
         task_rows = self.tasks.filter(pl.col('completed') == False).head(batch_size)
@@ -389,7 +392,7 @@ class TaskDataset:
             "result": [t.result for t in tasks],
             "exceptions": [t.exceptions for t in tasks],
             "completed": [t.completed for t in tasks]
-        })
+        }, schema={'args': pl.UInt64, 'result': pl.Struct, 'exceptions': pl.List, 'completed': pl.Boolean})
         
         # Update the existing DataFrame using join and coalesce
         self.tasks = self.tasks.join(
