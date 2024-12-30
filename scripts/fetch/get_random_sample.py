@@ -793,7 +793,7 @@ async def get_random_sample(
     print(f"Getting random sample at {start_time} for {num_time} {time_unit}")
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
     
-    with open(os.path.join(this_dir_path, '..', 'figs', 'all_videos', f'{generation_strategy}_two_segments_combinations.json'), 'r') as file:
+    with open(os.path.join(this_dir_path, '..', '..', 'figs', 'all_videos', f'{generation_strategy}_two_segments_combinations.json'), 'r') as file:
         data = json.load(file)
 
     # get bits of non timestamp sections of ID
@@ -896,7 +896,7 @@ async def get_random_sample(
     print(f"Fraction valid: {num_valid / len(dataset)}")
 
     date_dir = start_time.strftime('%Y_%m_%d')
-    results_dir_path = os.path.join(this_dir_path, '..', 'data', 'results', date_dir, 'hours', str(start_time.hour), str(start_time.minute), str(start_time.second))
+    results_dir_path = os.path.join(this_dir_path, '..', '..', 'data', 'results', date_dir, 'hours', str(start_time.hour), str(start_time.minute), str(start_time.second))
     os.makedirs(results_dir_path, exist_ok=True)
 
     params = {
