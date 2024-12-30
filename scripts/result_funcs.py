@@ -1,6 +1,6 @@
 import os
 
-def get_result_paths(result_dir_path, result_filename='results.parquet.gzip'):
+def get_result_paths(result_dir_path, result_filename='results.parquet.gzip', minute=None, hour=None):
 
     for dir_path, dir_names, filenames in os.walk(result_dir_path):
         for filename in filenames:

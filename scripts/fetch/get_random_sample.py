@@ -21,7 +21,7 @@ from dask_cloudprovider.aws import FargateCluster as DaskFargateCluster
 from dask_jobqueue import SLURMCluster as DaskSLURMCluster
 import dotenv
 import numpy as np
-import pandas as pd
+import polars as pl
 import pycurl
 import randmac
 from random_user_agent import user_agent as rug_user_agent
@@ -355,21 +355,20 @@ class Counter:
 
 class TaskDataset:
     def __init__(self):
-        self.tasks = pd.DataFrame(columns=['args', 'result', 'exceptions', 'completed'])
+        self.tasks = pl.DataFrame(columns=['args', 'result', 'exceptions', 'completed'])
 
     def add_potential_ids(self, args):
-        new_tasks = pd.DataFrame([
+        new_tasks = pl.DataFrame([
             {'args': arg, 'result': None, 'exceptions': [], 'completed': False} for arg in args
         ])
-        self.tasks = pd.concat([self.tasks, new_tasks], ignore_index=True)
+        self.tasks = pl.concat([self.tasks, new_tasks])
 
     def load_existing_df(self, df):
-        df['completed'] = df['result'].apply(lambda r: r is not None and 'return' in r and r['return'] is not None)
-        self.tasks = pd.concat([self.tasks, df], ignore_index=True)
+        df = df.with_columns(pl.col('result').map_elements(lambda r: r is not None and 'return' in r and r['return'] is not None, pl.Boolean).alias('completed'))
+        self.tasks = pl.concat([self.tasks, df])
 
     def get_batch(self, batch_size):
-        # return [t for t in self.tasks if not t.completed][:batch_size]
-        task_rows = self.tasks[self.tasks['completed'] == False][:batch_size]
+        task_rows = self.tasks.filter(pl.col('completed') == False).head(batch_size)
         def create_task_from_row(row):
             t = DaskTask(row['args'])
             t.completed = row['completed']
@@ -379,19 +378,34 @@ class TaskDataset:
             else:
                 t.exceptions = row['exceptions']
             return t
-        tasks = [create_task_from_row(row) for _, row in task_rows.iterrows()]
+        tasks = [create_task_from_row(row) for row in task_rows.to_dicts()]
         return tasks
 
     def update_tasks(self, tasks):
-        self.tasks.set_index('args', inplace=True)
-        for t in tasks:
-            self.tasks.at[t.args, 'result'] = t.result
-            self.tasks.at[t.args, 'exceptions'] = t.exceptions
-            self.tasks.at[t.args, 'completed'] = t.completed
-        self.tasks.reset_index(inplace=True)
+        # Create a DataFrame from the tasks
+        updates_df = pl.DataFrame({
+            "args": [t.args for t in tasks],
+            "result": [t.result for t in tasks],
+            "exceptions": [t.exceptions for t in tasks],
+            "completed": [t.completed for t in tasks]
+        })
+        
+        # Update the existing DataFrame using join and coalesce
+        self.tasks = self.tasks.join(
+                updates_df,
+                on="args",
+                how="left"
+            )\
+            .with_columns([
+                pl.col("result_right").alias("result").fill_null(pl.col("result")),
+                pl.col("exceptions_right").alias("exceptions").fill_null(pl.col("exceptions")),
+                pl.col("completed_right").alias("completed").fill_null(pl.col("completed"))
+            ])\
+            .drop(["result_right", "exceptions_right", "completed_right"])
+        
     
     def num_left(self):
-        return len(self.tasks[self.tasks['completed'] == False])
+        return len(self.tasks.filter(pl.col('completed') == False))
     
     def __len__(self):
         return len(self.tasks)
@@ -873,8 +887,8 @@ async def get_random_sample(
     else:
         raise ValueError("Invalid method")
     results = dataset.tasks
-    num_hits = len(results[results['result'].map(lambda x: x is not None and x['return'] is not None and 'id' in x['return'] and x['return']['id'] is not None)])
-    num_valid = len(results[results['result'].map(lambda x: x is not None and x['return'] is not None)])
+    num_hits = len(results.filter(pl.col('result').map_elements(lambda x: x is not None and x['return'] is not None and 'id' in x['return'] and x['return']['id'] is not None, pl.Boolean)))
+    num_valid = len(results.filter(pl.col('result').map_elements(lambda x: x is not None and x['return'] is not None, pl.Boolean)))
     print(f"Num hits: {num_hits}, Num valid: {num_valid}, Num potential video IDs: {len(dataset)}")
     if num_valid == 0:
         raise ValueError("No valid results")
@@ -908,7 +922,7 @@ async def get_random_sample(
         json.dump(params, f)
 
     df = dataset.tasks
-    df['exceptions'] = df['exceptions'].map(lambda exs: [{'exception': str(e['exception']), 'pre_time': e['pre_time'], 'post_time': e['post_time']} for e in exs])
+    df = df.with_columns(pl.col('exceptions').map_elements(lambda exs: str([{'exception': str(e['exception']), 'pre_time': e['pre_time'], 'post_time': e['post_time']} for e in exs]), pl.String))
     df.write_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'), compression='gzip')
 
     
@@ -927,7 +941,7 @@ async def run_random_sample():
     max_task_tries = 10
     worker_cpu = 256
     worker_mem = 512
-    cluster_type = 'slurm'
+    cluster_type = 'local'
     method = 'dask'
     if (num_time > 1 and time_unit == 's') or (time_unit == 'm') or (time_unit == 'h'):
         if time_unit == 's':
