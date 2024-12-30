@@ -1,11 +1,11 @@
 import asyncio
 import collections
 from concurrent.futures import ThreadPoolExecutor
+import configparser
 import datetime
 import io
 import itertools
 import json
-import logging
 import os
 import subprocess
 import time
@@ -20,8 +20,9 @@ from dask.distributed import as_completed as dask_as_completed
 from dask_cloudprovider.aws import FargateCluster as DaskFargateCluster
 from dask_jobqueue import SLURMCluster as DaskSLURMCluster
 import dotenv
+import hydra
 import numpy as np
-import pandas as pd
+import polars as pl
 import pycurl
 import randmac
 from random_user_agent import user_agent as rug_user_agent
@@ -355,21 +356,20 @@ class Counter:
 
 class TaskDataset:
     def __init__(self):
-        self.tasks = pd.DataFrame(columns=['args', 'result', 'exceptions', 'completed'])
+        self.tasks = pl.DataFrame(schema={'args': pl.UInt64, 'result': pl.Struct, 'exceptions': pl.List, 'completed': pl.Boolean})
 
     def add_potential_ids(self, args):
-        new_tasks = pd.DataFrame([
+        new_tasks = pl.DataFrame([
             {'args': arg, 'result': None, 'exceptions': [], 'completed': False} for arg in args
-        ])
-        self.tasks = pd.concat([self.tasks, new_tasks], ignore_index=True)
+            ], schema={'args': pl.UInt64, 'result': pl.Struct, 'exceptions': pl.List, 'completed': pl.Boolean})
+        self.tasks = pl.concat([self.tasks, new_tasks])
 
     def load_existing_df(self, df):
-        df['completed'] = df['result'].apply(lambda r: r is not None and 'return' in r and r['return'] is not None)
-        self.tasks = pd.concat([self.tasks, df], ignore_index=True)
+        df = df.with_columns(pl.col('result').map_elements(lambda r: r is not None and 'return' in r and r['return'] is not None, pl.Boolean).alias('completed'))
+        self.tasks = pl.concat([self.tasks, df])
 
     def get_batch(self, batch_size):
-        # return [t for t in self.tasks if not t.completed][:batch_size]
-        task_rows = self.tasks[self.tasks['completed'] == False][:batch_size]
+        task_rows = self.tasks.filter(pl.col('completed') == False).head(batch_size)
         def create_task_from_row(row):
             t = DaskTask(row['args'])
             t.completed = row['completed']
@@ -379,19 +379,35 @@ class TaskDataset:
             else:
                 t.exceptions = row['exceptions']
             return t
-        tasks = [create_task_from_row(row) for _, row in task_rows.iterrows()]
+        tasks = [create_task_from_row(row) for row in task_rows.to_dicts()]
         return tasks
 
     def update_tasks(self, tasks):
-        self.tasks.set_index('args', inplace=True)
-        for t in tasks:
-            self.tasks.at[t.args, 'result'] = t.result
-            self.tasks.at[t.args, 'exceptions'] = t.exceptions
-            self.tasks.at[t.args, 'completed'] = t.completed
-        self.tasks.reset_index(inplace=True)
+        # Create a DataFrame from the tasks
+        updates_df = pl.DataFrame({
+            "args": [t.args for t in tasks],
+            "result": [t.result for t in tasks],
+            "exceptions": [t.exceptions for t in tasks],
+            "completed": [t.completed for t in tasks]
+        })
+        
+        # Update the existing DataFrame using join and coalesce
+        self.tasks = self.tasks.join(
+                updates_df,
+                on="args",
+                how="left"
+            )\
+            .with_columns([
+                pl.col("result_right").fill_null(pl.col("result")),
+                pl.col("exceptions_right").fill_null(pl.col("exceptions")),
+                pl.col("completed_right").fill_null(pl.col("completed"))
+            ])\
+            .drop(["result", "exceptions", "completed"])\
+            .rename({'result_right': 'result', 'exceptions_right': 'exceptions', 'completed_right': 'completed'})
+        
     
     def num_left(self):
-        return len(self.tasks[self.tasks['completed'] == False])
+        return len(self.tasks.filter(pl.col('completed') == False))
     
     def __len__(self):
         return len(self.tasks)
@@ -779,7 +795,7 @@ async def get_random_sample(
     print(f"Getting random sample at {start_time} for {num_time} {time_unit}")
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
     
-    with open(os.path.join(this_dir_path, '..', 'figs', 'all_videos', f'{generation_strategy}_two_segments_combinations.json'), 'r') as file:
+    with open(os.path.join(this_dir_path, '..', '..', 'figs', 'all_videos', f'{generation_strategy}_two_segments_combinations.json'), 'r') as file:
         data = json.load(file)
 
     # get bits of non timestamp sections of ID
@@ -828,7 +844,7 @@ async def get_random_sample(
     if os.path.exists(results_dir_path) and os.path.exists(os.path.join(results_dir_path, 'results.parquet.gzip')):
         # remove ids that have already been collected
         try:
-            existing_df = pd.read_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'))
+            existing_df = pl.read_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'))
         except Exception as e:
             print(f"Error reading existing results: {e}")
             dataset = TaskDataset()
@@ -873,8 +889,8 @@ async def get_random_sample(
     else:
         raise ValueError("Invalid method")
     results = dataset.tasks
-    num_hits = len(results[results['result'].map(lambda x: x is not None and x['return'] is not None and 'id' in x['return'] and x['return']['id'] is not None)])
-    num_valid = len(results[results['result'].map(lambda x: x is not None and x['return'] is not None)])
+    num_hits = len(results.filter(pl.col('result').map_elements(lambda x: x is not None and x['return'] is not None and 'id' in x['return'] and x['return']['id'] is not None, pl.Boolean)))
+    num_valid = len(results.filter(pl.col('result').map_elements(lambda x: x is not None and x['return'] is not None, pl.Boolean)))
     print(f"Num hits: {num_hits}, Num valid: {num_valid}, Num potential video IDs: {len(dataset)}")
     if num_valid == 0:
         raise ValueError("No valid results")
@@ -882,7 +898,7 @@ async def get_random_sample(
     print(f"Fraction valid: {num_valid / len(dataset)}")
 
     date_dir = start_time.strftime('%Y_%m_%d')
-    results_dir_path = os.path.join(this_dir_path, '..', 'data', 'results', date_dir, 'hours', str(start_time.hour), str(start_time.minute), str(start_time.second))
+    results_dir_path = os.path.join(this_dir_path, '..', '..', 'data', 'results', date_dir, 'hours', str(start_time.hour), str(start_time.minute), str(start_time.second))
     os.makedirs(results_dir_path, exist_ok=True)
 
     params = {
@@ -908,27 +924,16 @@ async def get_random_sample(
         json.dump(params, f)
 
     df = dataset.tasks
-    df['exceptions'] = df['exceptions'].map(lambda exs: [{'exception': str(e['exception']), 'pre_time': e['pre_time'], 'post_time': e['post_time']} for e in exs])
-    df.to_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'), compression='gzip')
+    df = df.with_columns(pl.col('exceptions').map_elements(lambda exs: str([{'exception': str(e['exception']), 'pre_time': e['pre_time'], 'post_time': e['post_time']} for e in exs]), pl.String))
+    df.write_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'), compression='gzip')
 
     
-async def run_random_sample():
-    generation_strategy = 'all'
-    # TODO run at persistent time after collection, i.e. if collection takes an hour, run after 24s after post time
-    start_time = datetime.datetime(2024, 4, 10, 19, 59, 45)
+async def run_random_sample(config):
     num_time = 1
     time_unit = 'h'
-    num_workers = 36
-    reqs_per_ip = 200000
-    batch_size = 10000
-    task_batch_size = 50
-    task_nthreads = 2
-    task_timeout = 60
-    max_task_tries = 10
-    worker_cpu = 256
-    worker_mem = 512
-    cluster_type = 'slurm'
-    method = 'dask'
+    generation_strategy = 'all'
+    # TODO run at persistent time after collection, i.e. if collection takes an hour, run after 24s after post time
+    start_time = datetime.datetime(2024, 4, 10, 19, 1, 15)
     if (num_time > 1 and time_unit == 's') or (time_unit == 'm') or (time_unit == 'h'):
         if time_unit == 's':
             num_seconds = num_time
@@ -938,7 +943,7 @@ async def run_random_sample():
             num_seconds = num_time * 3600
         else:
             raise ValueError("Invalid time unit")
-        if num_seconds > 60 and cluster_type == 'fargate':
+        if num_seconds > 60 and config.cluster_type == 'fargate':
             raise ValueError("Too expensive to run for more than 60 seconds on Fargate")
         actual_num_time = 1
         actual_time_unit = 's'
@@ -959,36 +964,27 @@ async def run_random_sample():
             actual_start_time,
             actual_num_time,
             actual_time_unit,
-            num_workers,
-            reqs_per_ip,
-            batch_size,
-            task_batch_size,
-            task_nthreads,
-            task_timeout,
-            max_task_tries,
-            worker_cpu,
-            worker_mem,
+            config.num_workers,
+            config.reqs_per_ip,
+            config.batch_size,
+            config.task_batch_size,
+            config.task_nthreads,
+            config.task_timeout,
+            config.max_task_tries,
+            config.worker_cpu,
+            config.worker_mem,
+            config.cluster_type,
+            config.method
         )
 
 
-async def run_min_each_hour_sample():
+async def run_min_each_hour_sample(config):
     generation_strategy = 'all'
     # TODO run at persistent time after collection, i.e. if collection takes an hour, run after 24s after post time
-    num_workers = 36
-    reqs_per_ip = 200000
-    batch_size = 10000
-    task_batch_size = 50
-    task_nthreads = 2
-    task_timeout = 10
-    max_task_tries = 10
-    worker_cpu = 256
-    worker_mem = 512
-    cluster_type = 'slurm'
-    method = 'dask'
     actual_start_times = []
     actual_num_time = 1
     actual_time_unit = 's'
-    min_time = datetime.datetime(2024, 4, 10, 23, 42, 59)
+    min_time = datetime.datetime(2024, 4, 10, 0, 42, 0)
     for h in range(24):
         for s in range(60):
             s_time = datetime.datetime(2024, 4, 10, h, 42, s)
@@ -1002,17 +998,17 @@ async def run_min_each_hour_sample():
             actual_start_time,
             actual_num_time,
             actual_time_unit,
-            num_workers,
-            reqs_per_ip,
-            batch_size,
-            task_batch_size,
-            task_nthreads,
-            task_timeout,
-            max_task_tries,
-            worker_cpu,
-            worker_mem,
-            cluster_type,
-            method
+            config.num_workers,
+            config.reqs_per_ip,
+            config.batch_size,
+            config.task_batch_size,
+            config.task_nthreads,
+            config.task_timeout,
+            config.max_task_tries,
+            config.worker_cpu,
+            config.worker_mem,
+            config.cluster_type,
+            config.method
         )
 
 def get_ip(_, network_interface):
@@ -1036,12 +1032,16 @@ async def run_get_ips():
     print(collections.Counter(ips))
     print(f"Num unique IPs: {len(set(ips))}")
     
-async def main():
+async def async_main(config):
     # logging.basicConfig(level=logging.DEBUG)
     dotenv.load_dotenv()
-    # await run_random_sample()
-    await run_min_each_hour_sample()
+    await run_random_sample(config)
+    await run_min_each_hour_sample(config)
     # await run_get_ips()
 
+@hydra.main(config_path='../../config', config_name='config')
+def main(config):
+    asyncio.run(async_main(config))
+
 if __name__ == '__main__':
-    asyncio.run(main())
+    main()

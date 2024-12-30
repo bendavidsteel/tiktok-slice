@@ -11,13 +11,13 @@ from pytok.tiktok import PyTok
 from pytok.exceptions import NotAvailableException
 
 async def main():
-    origin_region = "fyp"
+    origin_region = "australia"
 
-    headless = True
+    headless = False
     request_delay = 1
 
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
-    data_dir_path = os.path.join(this_dir_path, "..", "data", origin_region)
+    data_dir_path = os.path.join(this_dir_path, "..", "data", 'countries', origin_region)
 
     if not os.path.exists(data_dir_path):
         os.makedirs(data_dir_path)
@@ -52,18 +52,18 @@ async def main():
 
     if len(users) > 0:
         videos = []
-        for user in tqdm(users[:10]):
-            try:
-                async with PyTok(headless=headless, request_delay=request_delay) as api:
+        async with PyTok(headless=headless, request_delay=request_delay, manual_captcha_solves=True) as api:
+            for user in tqdm(users[:10]):
+                try:
                     user_obj = api.user(username=user)
                     user_info = await user_obj.info()
                     async for video in user_obj.videos():
                         video_info = await video.info()
                         videos.append(video_info)
-            except NotAvailableException:
-                pass
-            except Exception as e:
-                print(f"Error fetching videos for user {user}: {e}")
+                except NotAvailableException:
+                    pass
+                except Exception as e:
+                    print(f"Error fetching videos for user {user}: {e}")
 
         video_df = pd.DataFrame(videos)
         today = datetime.datetime.today()
@@ -73,10 +73,14 @@ async def main():
             'brazil': 'brasil',
             'nigeria': 'nigeria',
             'indonesia': 'indonesia',
+            'australia': 'australia',
+            'india': 'india',
+            'japan': '日本',
+            'russia': 'Россия'
         }
         hashtag_name = hashtag_names[origin_region] if origin_region in hashtag_names else origin_region
         videos = []
-        async with PyTok(headless=headless, request_delay=request_delay) as api:
+        async with PyTok(headless=headless, request_delay=request_delay, manual_captcha_solves=True) as api:
             hashtag_obj = api.hashtag(name=hashtag_name)
             async for video in atqdm(hashtag_obj.videos(count=1000), total=1000):
                 video_info = await video.info()
