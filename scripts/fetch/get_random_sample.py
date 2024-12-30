@@ -414,11 +414,6 @@ class TaskDataset:
                 on="args",
                 how="left"
             )\
-            .with_columns([
-                pl.col("result_right").fill_null(pl.col("result")),
-                pl.col("exceptions_right").fill_null(pl.col("exceptions")),
-                pl.col("completed_right").fill_null(pl.col("completed"))
-            ])\
             .drop(["result", "exceptions", "completed"])\
             .rename({'result_right': 'result', 'exceptions_right': 'exceptions', 'completed_right': 'completed'})
         
