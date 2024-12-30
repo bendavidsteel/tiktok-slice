@@ -414,6 +414,11 @@ class TaskDataset:
                 on="args",
                 how="left"
             )\
+            .with_columns([
+                pl.col("result_right").fill_null(pl.col("result")),
+                pl.col("exceptions_right").fill_null(pl.col("exceptions")),
+                pl.col("completed_right").fill_null(pl.col("completed"))
+            ])\
             .drop(["result", "exceptions", "completed"])\
             .rename({'result_right': 'result', 'exceptions_right': 'exceptions', 'completed_right': 'completed'})
         
@@ -448,7 +453,7 @@ async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_si
             cluster_manager = ClusterManager()
             async with DaskCluster(cluster_type, cluster_manager, worker_cpu=worker_cpu, worker_mem=worker_mem) as cluster:
                 async with DaskClient(cluster) as client:
-                    if cluster_type == 'fargate':
+                    if isinstance(cluster, DaskFargateCluster):
                         cluster.adapt(minimum=1, maximum=num_workers)
                         # wait for workers to start
                         client.wait_for_workers(1, timeout=120)
@@ -851,7 +856,7 @@ async def get_random_sample(
     potential_video_ids = [int(bits, 2) for bits in potential_video_bits]
 
     date_dir = start_time.strftime('%Y_%m_%d')
-    results_dir_path = os.path.join(this_dir_path, '..', '..', 'data', 'results', date_dir, 'hours', str(start_time.hour), str(start_time.minute), str(start_time.second))
+    results_dir_path = os.path.join(this_dir_path, '..', 'data', 'results', date_dir, 'hours', str(start_time.hour), str(start_time.minute), str(start_time.second))
     
     if os.path.exists(results_dir_path) and os.path.exists(os.path.join(results_dir_path, 'results.parquet.gzip')):
         # remove ids that have already been collected
@@ -945,7 +950,7 @@ async def run_random_sample(config):
     time_unit = 'h'
     generation_strategy = 'all'
     # TODO run at persistent time after collection, i.e. if collection takes an hour, run after 24s after post time
-    start_time = datetime.datetime(2024, 4, 10, 19, 1, 21)
+    start_time = datetime.datetime(2024, 4, 10, 19, 1, 15)
     if (num_time > 1 and time_unit == 's') or (time_unit == 'm') or (time_unit == 'h'):
         if time_unit == 's':
             num_seconds = num_time

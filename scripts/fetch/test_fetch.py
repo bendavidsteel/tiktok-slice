@@ -43,6 +43,15 @@ def test_existing_task_dataset():
 
     assert dataset.num_left() == 3
 
+    tasks = dataset.get_batch(dataset.num_left())
+
+    for t in tasks:
+        t.result = {'return': {'video_id': 1}, 'post_time': datetime.datetime.now()}
+        t.completed = True
+
+    dataset.update_tasks(tasks)
+    assert dataset.num_left() == 0
+
 def main():
     test_existing_task_dataset()
     test_task_dataset()
