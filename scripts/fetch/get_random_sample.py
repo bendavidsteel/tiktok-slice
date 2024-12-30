@@ -238,7 +238,7 @@ class DaskCluster:
                 region_name='ca-central-1'
             )
         elif self.cluster_type == 'local':
-            self.cluster = DaskLocalCluster()
+            self.cluster = DaskLocalCluster(asynchronous=True)
         elif self.cluster_type == 'ssh':
             print("Finding hosts...")
             hosts, connect_options = await self.manager.get_hosts()
@@ -440,11 +440,6 @@ async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_si
     tasks_progress_bar = tqdm(total=dataset.num_left(), desc="All Tasks")
     batch_progress_bar = tqdm(total=min(batch_size, dataset.num_left()), desc="Batch Tasks", leave=False)
 
-    wlan_username = os.environ['EDUROAM_USERNAME']
-    wlan_password = os.environ['EDUROAM_PASSWORD']
-    raspi_password = os.environ['RASPI_PASSWORD']
-    slurm_account_password = os.environ['SCHEDULER_PASSWORD']
-
     num_cluster_errors = 0
     max_cluster_errors = 3
 
@@ -519,6 +514,9 @@ async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_si
                                     num_reqs_for_current_ips = 0
                                     num_exceptions_for_current_ips = 0
                                     # await cluster_manager.change_mac_addresses()
+                                    wlan_username = os.environ['EDUROAM_USERNAME']
+                                    wlan_password = os.environ['EDUROAM_PASSWORD']
+                                    slurm_account_password = os.environ['SCHEDULER_PASSWORD']
                                     res = await client.run(
                                         change_mac_address, 
                                         wlan_username, 
@@ -856,7 +854,7 @@ async def get_random_sample(
     potential_video_ids = [int(bits, 2) for bits in potential_video_bits]
 
     date_dir = start_time.strftime('%Y_%m_%d')
-    results_dir_path = os.path.join(this_dir_path, '..', 'data', 'results', date_dir, 'hours', str(start_time.hour), str(start_time.minute), str(start_time.second))
+    results_dir_path = os.path.join(this_dir_path, '..', '..', 'data', 'results', date_dir, 'hours', str(start_time.hour), str(start_time.minute), str(start_time.second))
     
     if os.path.exists(results_dir_path) and os.path.exists(os.path.join(results_dir_path, 'results.parquet.gzip')):
         # remove ids that have already been collected

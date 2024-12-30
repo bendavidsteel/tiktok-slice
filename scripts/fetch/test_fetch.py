@@ -19,7 +19,7 @@ def test_task_dataset():
             results.append(task.result)
         else:
             task.result = {'return': None, 'post_time': datetime.datetime.now()}
-            task.exceptions.append({'exception': Exception()})
+            task.exceptions.append({'exception': Exception(), 'return': None})
             results.append(task.result)
 
     dataset.update_tasks(tasks)
@@ -29,7 +29,7 @@ def test_task_dataset():
 
 def test_existing_task_dataset():
 
-    results_dir_path = './data/results/2024_04_10/hours/19/0/0'
+    results_dir_path = '/media/bsteel/TT_DAY/TikTok_Hour/results/2024_04_10/hours/19/1/15'
     existing_df = pl.read_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'))
 
     dataset = TaskDataset()
