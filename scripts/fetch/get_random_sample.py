@@ -453,7 +453,7 @@ async def dask_map(function, dataset, num_workers=16, reqs_per_ip=1000, batch_si
             cluster_manager = ClusterManager()
             async with DaskCluster(cluster_type, cluster_manager, worker_cpu=worker_cpu, worker_mem=worker_mem) as cluster:
                 async with DaskClient(cluster) as client:
-                    if isinstance(cluster, DaskFargateCluster):
+                    if cluster_type == 'fargate':
                         cluster.adapt(minimum=1, maximum=num_workers)
                         # wait for workers to start
                         client.wait_for_workers(1, timeout=120)
