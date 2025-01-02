@@ -333,7 +333,10 @@ async def process_future(f, batch_tasks_lookup, timeout, max_task_tries, tasks_p
     assert len(batch_tasks) == len(batch_results), "Number of tasks and results must match"
     for t, r in zip(batch_tasks, batch_results):
         if r['exception'] is not None:
-            t.exceptions.append(r)
+            try:
+                t.exceptions.append(r)
+            except Exception:
+                t.exceptions = [r]
             exception_counter.add(1)
             if len(t.exceptions) >= max_task_tries:
                 t.completed = True
@@ -405,7 +408,7 @@ class TaskDataset:
                 "exceptions": [[{k: str(v) if k == 'exception' else v for k, v in e.items()} for e in t.exceptions] for t in tasks],
                 "completed": [t.completed for t in tasks]
             },
-            schema_overrides={'args': pl.UInt64}
+            schema_overrides=self.tasks.schema
         )
         
         # Update the existing DataFrame using join and coalesce
@@ -939,7 +942,7 @@ async def get_random_sample(
         json.dump(params, f)
 
     df = dataset.tasks
-    df = df.with_columns(pl.col('exceptions').map_elements(lambda exs: str([{'exception': str(e['exception']), 'pre_time': e['pre_time'], 'post_time': e['post_time']} for e in exs]), pl.String))
+    df = df.with_columns(pl.col('exceptions').map_elements(lambda exs: str([{'exception': str(e['exception'])[:100], 'pre_time': e['pre_time'], 'post_time': e['post_time']} for e in exs]), pl.String))
     df.write_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'), compression='gzip')
 
     
