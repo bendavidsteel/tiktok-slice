@@ -333,6 +333,7 @@ async def process_future(f, batch_tasks_lookup, timeout, max_task_tries, tasks_p
     assert len(batch_tasks) == len(batch_results), "Number of tasks and results must match"
     for t, r in zip(batch_tasks, batch_results):
         if r['exception'] is not None:
+            r['exception'] = str(r['exception'])[:100]
             try:
                 t.exceptions.append(r)
             except Exception:
@@ -381,7 +382,8 @@ class TaskDataset:
     def load_existing_df(self, df):
         df = df.with_columns([
             pl.col('args').cast(pl.UInt64),
-            pl.col('result').map_elements(lambda r: r is not None and 'return' in r and r['return'] is not None, pl.Boolean).alias('completed')
+            pl.col('result').map_elements(lambda r: r is not None and 'return' in r and r['return'] is not None, pl.Boolean).alias('completed'),
+            pl.col('exceptions').map_elements(lambda exs: [{'exception': str(e['exception'])[:100], 'pre_time': e['pre_time'], 'post_time': e['post_time']} for e in exs], self.tasks.schema['exceptions'])
         ])
         self.tasks = pl.concat([self.tasks, df], how='diagonal_relaxed')
 
@@ -875,6 +877,7 @@ async def get_random_sample(
             existing_ids = set(existing_df['args'])
             potential_video_ids = [i for i in potential_video_ids if i not in existing_ids]
             dataset.add_potential_ids(potential_video_ids)
+            existing_df = None
 
             if dataset.num_left() == 0:
                 print("All potential video IDs have been collected")
