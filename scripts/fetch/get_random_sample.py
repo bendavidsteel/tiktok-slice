@@ -7,9 +7,10 @@ import io
 import itertools
 import json
 import os
-import subprocess
+import re
 import time
 import traceback
+import subprocess
 
 import asyncssh
 import brotli
@@ -358,6 +359,54 @@ class Counter:
     def add(self, n):
         self.count += n
 
+def str_to_list_struct(log_str: str):
+    if log_str == '[]':
+        return []
+
+    entries = []
+    # Remove outer brackets and split by '}, {'
+    items = log_str.strip('[]').split('}, {')
+    
+    for item in items:
+        if not item.endswith('}'): item += '}'
+        if not item.startswith('{'): item = '{' + item
+        
+        datetime_pattern = r"datetime\.datetime\((\d{4}),\s*(\d{1,2}),\s*(\d{1,2}),\s*(\d{1,2}),\s*(\d{1,2}),\s*(\d{1,2}),\s*(\d{6})\)"
+        dates = re.findall(datetime_pattern, item)
+        
+        datetime_start_str = 'datetime.datetime('
+        datetime_end_str = ')'
+
+        exception_start_str = "'exception': "
+        exception_start = item.find(exception_start_str) + len(exception_start_str)
+        exception_end = item.find("', 'pre_time")
+        exception = item[exception_start:exception_end]
+
+        pre_time_start_str = "'pre_time': "
+        pre_time_start = item.find(pre_time_start_str) + len(pre_time_start_str)
+        pre_time_end = item.find(", 'post_time")
+        pre_time_str = item[pre_time_start:pre_time_end]
+        if pre_time_str == 'None':
+            pre_time = None
+        else:
+            pre_time_str = pre_time_str[len(datetime_start_str):-len(datetime_end_str)]
+            pre_time = datetime.datetime(*map(int, pre_time_str.split(', ')))
+
+        post_time_start_str = "'post_time': "
+        post_time_start = item.find(post_time_start_str) + len(post_time_start_str)
+        post_time_end = item.find("}")
+        post_time_str = item[post_time_start:post_time_end]
+        if post_time_str == 'None':
+            post_time = None
+        else:
+            post_time_str = post_time_str[len(datetime_start_str):-len(datetime_end_str)]
+            post_time = datetime.datetime(*map(int, post_time_str.split(', ')))
+        
+        entries.append({'exception': exception, 'pre_time': pre_time, 'post_time': post_time})
+   
+    return entries
+
+
 class TaskDataset:
     def __init__(self):
         self.tasks = pl.DataFrame(
@@ -380,10 +429,23 @@ class TaskDataset:
         self.tasks = pl.concat([self.tasks, new_tasks], how='diagonal_relaxed')
 
     def load_existing_df(self, df):
+        if df.schema['exceptions'] == pl.String:
+            df = df.with_columns(pl.col('exceptions').map_elements(
+                str_to_list_struct, 
+                return_dtype=pl.List(pl.Struct({'exception': pl.String, 'pre_time': pl.Datetime, 'post_time': pl.Datetime})),
+                strategy='threading'
+            ))
+
         df = df.with_columns([
             pl.col('args').cast(pl.UInt64),
-            pl.col('result').map_elements(lambda r: r is not None and 'return' in r and r['return'] is not None, pl.Boolean).alias('completed'),
-            pl.col('exceptions').map_elements(lambda exs: [{'exception': str(e['exception'])[:100], 'pre_time': e['pre_time'], 'post_time': e['post_time']} for e in exs], self.tasks.schema['exceptions'])
+            (pl.col('result').struct.field('return').struct.field('statusCode').is_not_null() | pl.col('result').struct.field('return').struct.field('id').is_not_null()).alias('completed'),
+            pl.col('exceptions').list.eval(
+                pl.struct([
+                    pl.col('').struct.field('exception').str.slice(0, 100), 
+                    pl.col('').struct.field('pre_time'), 
+                    pl.col('').struct.field('post_time')
+                ])
+            )
         ])
         self.tasks = pl.concat([self.tasks, df], how='diagonal_relaxed')
 
@@ -945,7 +1007,6 @@ async def get_random_sample(
         json.dump(params, f)
 
     df = dataset.tasks
-    df = df.with_columns(pl.col('exceptions').map_elements(lambda exs: str([{'exception': str(e['exception'])[:100], 'pre_time': e['pre_time'], 'post_time': e['post_time']} for e in exs]), pl.String))
     df.write_parquet(os.path.join(results_dir_path, 'results.parquet.gzip'), compression='gzip')
 
     
@@ -954,7 +1015,7 @@ async def run_random_sample(config):
     time_unit = 'h'
     generation_strategy = 'all'
     # TODO run at persistent time after collection, i.e. if collection takes an hour, run after 24s after post time
-    start_time = datetime.datetime(2024, 4, 10, 19, 1, 15)
+    start_time = datetime.datetime(2024, 4, 10, 19, 1, 23)
     if (num_time > 1 and time_unit == 's') or (time_unit == 'm') or (time_unit == 'h'):
         if time_unit == 's':
             num_seconds = num_time
