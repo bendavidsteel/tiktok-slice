@@ -1015,7 +1015,7 @@ async def run_random_sample(config):
     time_unit = 'h'
     generation_strategy = 'all'
     # TODO run at persistent time after collection, i.e. if collection takes an hour, run after 24s after post time
-    start_time = datetime.datetime(2024, 4, 10, 19, 1, 23)
+    start_time = datetime.datetime(2024, 4, 10, 19, 1, 28)
     if (num_time > 1 and time_unit == 's') or (time_unit == 'm') or (time_unit == 'h'):
         if time_unit == 's':
             num_seconds = num_time
