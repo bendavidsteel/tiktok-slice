@@ -972,7 +972,7 @@ async def get_random_sample(
     else:
         raise ValueError("Invalid method")
     results = dataset.tasks
-    num_hits = len(results.filter(pl.col('result').map_elements(lambda x: x is not None and x['return'] is not None and 'id' in x['return'] and x['return']['id'] is not None, pl.Boolean)))
+    num_hits = len(dataset.tasks.filter(pl.col('result').struct.field('return').struct.field('id').is_not_null()))
     num_valid = len(results.filter(pl.col('result').map_elements(lambda x: x is not None and x['return'] is not None, pl.Boolean)))
     print(f"Num hits: {num_hits}, Num valid: {num_valid}, Num potential video IDs: {len(dataset)}")
     if num_valid == 0:
@@ -1015,7 +1015,7 @@ async def run_random_sample(config):
     time_unit = 'h'
     generation_strategy = 'all'
     # TODO run at persistent time after collection, i.e. if collection takes an hour, run after 24s after post time
-    start_time = datetime.datetime(2024, 4, 10, 19, 1, 23)
+    start_time = datetime.datetime(2024, 4, 10, 19, 1, 15)
     if (num_time > 1 and time_unit == 's') or (time_unit == 'm') or (time_unit == 'h'):
         if time_unit == 's':
             num_seconds = num_time
@@ -1073,6 +1073,38 @@ async def run_min_each_hour_sample(config):
             if s_time < min_time:
                 continue
             actual_start_times.append(s_time)
+
+    for actual_start_time in actual_start_times:
+        await get_random_sample(
+            generation_strategy,
+            actual_start_time,
+            actual_num_time,
+            actual_time_unit,
+            config.num_workers,
+            config.reqs_per_ip,
+            config.batch_size,
+            config.task_batch_size,
+            config.task_nthreads,
+            config.task_timeout,
+            config.max_task_tries,
+            config.worker_cpu,
+            config.worker_mem,
+            config.cluster_type,
+            config.method
+        )
+
+async def run_sec_each_hour_sample(config):
+    generation_strategy = 'all'
+    # TODO run at persistent time after collection, i.e. if collection takes an hour, run after 24s after post time
+    actual_start_times = []
+    actual_num_time = 1
+    actual_time_unit = 's'
+    min_time = datetime.datetime(2024, 4, 10, 0, 42, 0)
+    for h in range(24):
+        s_time = datetime.datetime(2024, 4, 10, h, 42, 0)
+        if s_time < min_time:
+            continue
+        actual_start_times.append(s_time)
 
     for actual_start_time in actual_start_times:
         await get_random_sample(
