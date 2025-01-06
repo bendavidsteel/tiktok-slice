@@ -23,7 +23,7 @@ def main():
 
     topic_info_df = topic_info_df.with_columns(pl.col('Name').map_elements(lambda n: ','.join(n.split('_')[1:]), return_dtype=pl.String).alias('Desc'))
 
-    top_n_topics = 50
+    top_n_topics = 30
     if top_n_topics:
         topic_info_df = topic_info_df.sort('Count', descending=True).head(top_n_topics)
 

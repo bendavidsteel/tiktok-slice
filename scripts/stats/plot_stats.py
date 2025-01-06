@@ -62,7 +62,7 @@ def finalize_results(output_dir_path, fig_dir_path):
 def main():
     config = configparser.ConfigParser()
     config.read('./config/config.ini')
-    output_dir_path = os.path.join(".", "data", "stats")
+    output_dir_path = os.path.join(".", "data", "stats", "1hour") # TODO to change to 1 hour
     os.makedirs(output_dir_path, exist_ok=True)
     fig_dir_path = os.path.join(".", "figs", "stats")
     os.makedirs(fig_dir_path, exist_ok=True)

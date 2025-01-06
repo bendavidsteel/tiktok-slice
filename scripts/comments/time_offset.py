@@ -101,11 +101,11 @@ def main():
             pass
 
     ax.set_xscale('log')
-    ax.set_yscale('symlog')
+    # ax.set_yscale('symlog')
     ax.set_ylim(bottom=0)
     ax.set_xlabel('Time offset')
     ax.set_ylabel('Frequency')
-    ax.set_title('Time offset between video and comment creation\nby commenter frequency')
+    # ax.set_title('Time offset between video and comment creation\nby commenter frequency')
     ax.legend()
 
     # Set major ticks
