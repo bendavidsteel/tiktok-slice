@@ -32,16 +32,19 @@ def main():
             if file == 'results.parquet.gzip':
                 video_pbar.update(1)
                 result_path = os.path.join(root, file)
-                batch_result_df = pl.read_parquet(result_path, columns=['result', 'args'])
+                batch_result_df = pl.read_parquet(result_path, columns=['result'])
                 batch_result_df = batch_result_df.filter(
                     pl.col('result').is_not_null() & 
                     pl.col('result').struct.field('return').is_not_null()
                 ).with_columns(
                     pl.col('result').struct.field('return').alias('return')
-                ).drop('result')
+                )
                 
-                batch_video_df = extract_video_data(batch_result_df)
-                batch_video_df.write_parquet(os.path.join(root, 'videos.parquet.zstd'), compression='zstd')
+                error_df = batch_result_df.with_columns(
+                    pl.col('return').struct.field('statusMsg').fill_null('success').alias('statusMsg'),
+                    pl.col('result').struct.field('post_time')
+                ).select(['statusMsg', 'post_time'])
+                error_df.write_parquet(os.path.join(root, 'errors.parquet.zstd'), compression='zstd')
 
 
 if __name__ == '__main__':

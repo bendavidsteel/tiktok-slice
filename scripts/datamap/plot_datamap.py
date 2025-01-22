@@ -6,17 +6,22 @@ import matplotlib as mpl
 import numpy as np
 import polars as pl
 from PIL import Image
+import umap
 
 def convert_to_image(cols):
     return Image.frombytes(cols['Visual_Aspect_Mode'], tuple(cols['Visual_Aspect_Size']), cols['Visual_Aspect_Bytes'])
 
 def main():
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
-    data_dir_path = os.path.join(this_dir_path, '..', 'data', f'topic_model_videos_1000')
+    data_dir_path = os.path.join(this_dir_path, '..', '..', 'data', f'topic_model_videos_1000')
 
     video_df = pl.read_parquet(os.path.join(data_dir_path, 'video_topics.parquet.gzip'))
 
-    embeddings_2d = np.load(os.path.join(data_dir_path, 'reduced_embeddings.npy'))
+    embedding_path = os.path.join(data_dir_path, '2d_embeddings.npy')
+    if os.path.exists(embedding_path):
+        embeddings_2d = np.load(embedding_path)
+    elif os.path.exists(os.path.join(data_dir_path, 'reduced_embeddings.npy')):
+        embeddings_2d = np.load(os.path.join(data_dir_path, 'reduced_embeddings.npy'))
 
     topic_info_df = pl.read_parquet(os.path.join(data_dir_path, 'topic_info.parquet.gzip'))
     # topic_info_df['Visual_Aspect'] = topic_info_df[['Visual_Aspect_Mode', 'Visual_Aspect_Size', 'Visual_Aspect_Bytes']].apply(convert_to_image, axis=1)
@@ -59,12 +64,13 @@ def main():
         max_font_size=16.0,
         dpi=300,
         marker_size_array=video_df['playCount'].to_numpy(),
+        # force_matplotlib=True
     )
 
     axes.set_axis_off()
     fig.subplots_adjust(left=0, bottom=0, right=1, top=1, wspace=0, hspace=0)
 
-    figs_dir_path = os.path.join(this_dir_path, '..', 'figs')
+    figs_dir_path = os.path.join(this_dir_path, '..', '..', 'figs')
     os.makedirs(figs_dir_path, exist_ok=True)
     fig.savefig(os.path.join(figs_dir_path, 'datamapplot.png'), bbox_inches='tight')
 

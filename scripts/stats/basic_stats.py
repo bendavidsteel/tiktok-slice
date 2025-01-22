@@ -23,6 +23,7 @@ def extract_video_data(df):
         pl.col('return').struct.field('id').is_not_null()
     ).with_columns([
         pl.col('return').struct.field('id').alias('video_id'),
+        pl.col('return').struct.field('desc').alias('desc'),
         pl.col('return').struct.field('author').struct.field('uniqueId').alias('authorUniqueId'),
         pl.col('return').struct.field('stats').struct.field('commentCount').cast(pl.Int64).alias('commentCount'),
         pl.col('return').struct.field('stats').struct.field('diggCount').cast(pl.Int64).alias('diggCount'),
@@ -32,7 +33,7 @@ def extract_video_data(df):
         pl.col('return').struct.field('imagePost').is_not_null().alias('isImagePost'),
         pl.col('return').map_elements(lambda r: len(r['imagePost']['images']) if 'imagePost' in r and r['imagePost'] else 0, return_dtype=pl.Int32).alias('numImages'),
         pl.col('return').struct.field('locationCreated').alias('locationCreated')
-    ]).select(['video_id', 'authorUniqueId', 'commentCount', 'diggCount', 'shareCount', 'playCount', 'videoDuration', 'isImagePost', 'numImages', 'locationCreated'])
+    ]).select(['video_id', 'desc', 'authorUniqueId', 'commentCount', 'diggCount', 'shareCount', 'playCount', 'videoDuration', 'isImagePost', 'numImages', 'locationCreated'])
 
 def extract_error_data(df):
     return df.filter(
@@ -116,13 +117,13 @@ def main():
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
     use = '1hour'
     if use == 'all':
-        output_dir_path = os.path.join(this_dir_path, "..", "data", "stats", 'all')
+        output_dir_path = os.path.join(this_dir_path, '..', "..", "data", "stats", 'all')
         result_paths = list(get_result_paths(base_result_path, result_filename='videos.parquet.zstd'))
     elif use == '24hour':
-        output_dir_path = os.path.join(this_dir_path, "..", "data", "stats", '24hour')
+        output_dir_path = os.path.join(this_dir_path, '..', "..", "data", "stats", '24hour')
         result_paths = list(get_result_paths(base_result_path, result_filename='videos.parquet.zstd', minute=42))
     elif use == '1hour':
-        output_dir_path = os.path.join(this_dir_path, "..", "data", "stats", '1hour')
+        output_dir_path = os.path.join(this_dir_path, '..', "..", "data", "stats", '1hour')
         result_paths = list(get_result_paths(base_result_path, result_filename='videos.parquet.zstd', hour=19))
 
     result_paths = sorted(result_paths)

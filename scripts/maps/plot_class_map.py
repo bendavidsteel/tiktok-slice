@@ -1,5 +1,7 @@
 import configparser
 import os
+
+from adjustText import adjust_text
 import polars as pl
 import matplotlib.pyplot as plt
 import geopandas as gpd
@@ -24,7 +26,7 @@ def main():
     config = configparser.ConfigParser()
     config.read('./config/config.ini')
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
-    video_df = pl.read_parquet(os.path.join('.', 'data', 'video_child_prob.parquet.gzip'))
+    video_df = pl.read_parquet(os.path.join('.', 'data', '24hour', 'video_child_prob.parquet.gzip'))
     
     # Process video data
     threshold = 0.6
@@ -74,6 +76,60 @@ def main():
     
     country_df = country_df.join(demographic_df, left_on='iso_alpha', right_on='Code', how='left')
     country_df = country_df.with_columns((pl.col('share_child_videos') / pl.col('share_under_14')).alias('child_video_ratio'))
+
+    pop_df = pl.read_csv(os.path.join('.', 'data', 'worlddata', 'pop_data.csv'), skip_rows=4)
+    country_df = country_df.join(pop_df, left_on='iso_alpha', right_on='Country Code')
+
+    # Take logarithm of both variables
+    reg_df = country_df.filter(pl.col('share_under_14').is_not_null() & pl.col('share_child_videos').is_not_null() & pl.col('is_significant'))
+    share_child_videos = reg_df['share_child_videos'].to_numpy()
+    share_children = reg_df['share_under_14'].to_numpy()
+
+    # Perform linear regression on log-transformed data
+    result = stats.linregress(share_children, share_child_videos)
+
+    # Calculate predicted values and residuals in log space
+    predicted_log = result.intercept + result.slope * share_children
+    residuals = share_child_videos - predicted_log
+
+    # Get indices of top and bottom 3 residuals
+    top_indices = np.argsort(residuals)[-3:]
+    bottom_indices = np.argsort(residuals)[:3]
+    outlier_indices = np.concatenate([top_indices, bottom_indices])
+
+    # Create the plot
+    fig, ax = plt.subplots(figsize=(4, 4))
+    scatter = ax.scatter(reg_df['share_under_14'], reg_df['share_child_videos'], s=10)
+
+    # Generate points for the fitted line
+    x_range = np.linspace(min(share_children), max(share_children), 100)
+    y_fit = result.intercept + result.slope * x_range
+
+    # Plot the fitted line
+    line = ax.plot(x_range, y_fit, color='red')
+
+    # Create texts for adjustText
+    fontsize = 12
+    texts = []
+    for i in outlier_indices:
+        texts.append(ax.text(reg_df['share_under_14'][int(i)], 
+                            reg_df['share_child_videos'][int(i)],
+                            reg_df['Country Name'][int(i)],
+                            fontsize=fontsize))
+
+    # Adjust text positions to avoid overlaps
+    adjust_text(texts, objects=scatter, force_static=(0.3, 0.3), arrowprops=dict(arrowstyle='-'))
+
+    # Add R² and p-value
+    ax.set_title(f"$R^2$: {result.rvalue**2:.2f}, p-value: {result.pvalue:.2f}", transform=ax.transAxes)
+
+    ax.set_xlabel("Share Under 14")
+    ax.set_ylabel("Share Videos Containing Children")
+
+    # Adjust layout to prevent label clipping
+    fig.tight_layout()
+
+    fig.savefig('./figs/child_reg.png')
 
     # Convert to pandas for compatibility with geopandas
     country_data = country_df.to_pandas()

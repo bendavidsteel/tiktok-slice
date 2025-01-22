@@ -68,7 +68,7 @@ def main():
     comment_thresholds = [1, 5, 25]
 
     # Create plot
-    fig, ax = plt.subplots()
+    fig, ax = plt.subplots(figsize=(4, 2.5))
 
     # Function to create histogram for a given threshold
     def create_histogram_for_threshold(df, threshold):
@@ -143,7 +143,7 @@ def main():
     ax.xaxis.set_major_formatter(FuncFormatter(timedelta_formatter))
     plt.xticks(rotation=45)
 
-    fig.savefig('./figs/time_offset_hist_by_frequency_symlog.png', dpi=300, bbox_inches='tight', pad_inches=0.1)
+    fig.savefig('./figs/time_offset_hist_by_frequency_symlog.png', dpi=600, bbox_inches='tight', pad_inches=0.1)
 
 
 if __name__ == '__main__':

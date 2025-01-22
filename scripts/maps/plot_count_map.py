@@ -1,5 +1,7 @@
 import configparser
 import os
+
+from adjustText import adjust_text
 import polars as pl
 import matplotlib.pyplot as plt
 import geopandas as gpd
@@ -24,7 +26,7 @@ def main():
     config = configparser.ConfigParser()
     config.read('./config/config.ini')
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
-    country_df = pl.read_csv(os.path.join('.', 'data', 'stats', 'all', 'location_created_value_counts.csv'))
+    country_df = pl.read_csv(os.path.join('.', 'data', 'stats', '24hour', 'location_created_value_counts.csv'))
     
     country_df = country_df.filter(pl.col('locationCreated').is_not_null())
     
@@ -58,8 +60,100 @@ def main():
     ])
     pop_df = pl.read_csv(os.path.join('.', 'data', 'worlddata', 'pop_data.csv'), skip_rows=4)
     country_df = country_df.join(pop_df, left_on='iso_alpha', right_on='Country Code')
+
+    coverage = {
+        'IND': 0.97,
+        'AUS': 0.92,
+        'JPN': 0.96,
+        'RUS': 0.91,
+        'CAN': 1.00,
+        'DEU': 1.00,
+        'IDN': 1.00,
+        'BRA': 1.00,
+        'NGA': 1.00
+    }
+
+    coverage = [
+        ('Oceania', 0.92, ['AUS', 'PNG', 'NZL', 'FJI', 'SLB', 'FSM', 'VUT', 'KIR', 'TON', 'MHL', 'PLW', 'NRU', 'TUV']),
+        ('East Asia', 0.96, ['CHN', 'JPN', 'MNG', 'PRK', 'KOR', 'TWN', 'HKG', 'MAC']),
+        ('South Asia', 0.97, ['AFG', 'BGD', 'BTN', 'IND', 'MDV', 'NPL', 'PAK', 'LKA']),
+        ('Eastern Europe', 0.91, ['BLR', 'RUS', 'UKR', 'MDA', 'ROU'])
+    ]
+
+    def get_coverage(alpha_3):
+        for region, cov, countries in coverage:
+            if alpha_3 in countries:
+                return cov
+        return 1.0
+
+    country_df = country_df.with_columns(pl.col('iso_alpha').map_elements(lambda x: get_coverage(x), pl.Float32).alias('coverage'))
+    country_df = country_df.with_columns((pl.col('count') / pl.col('coverage')).alias('count'))
+
+    # Take logarithm of both variables
+    log_pop = np.log(country_df['2022'].to_numpy())
+    log_count = np.log(country_df['count'].to_numpy())
+
+    # Perform linear regression on log-transformed data
+    result = stats.linregress(log_pop, log_count)
+
+    # Calculate predicted values and residuals in log space
+    predicted_log = result.intercept + result.slope * log_pop
+    residuals = log_count - predicted_log
+
+    # Get indices of top and bottom 3 residuals
+    top_indices = np.argsort(residuals)[-3:]
+    bottom_indices = np.argsort(residuals)[:3]
+    outlier_indices = np.concatenate([top_indices, bottom_indices])
+
+    # Create the plot
+    fig, ax = plt.subplots(figsize=(4, 4))
+    scatter = ax.scatter(country_df['2022'], country_df['count'], s=10)
+
+    # Generate points for the fitted line
+    x_range = np.linspace(min(log_pop), max(log_pop), 100)
+    y_fit = np.exp(result.intercept + result.slope * x_range)
+    x_range = np.exp(x_range)
+
+    # Plot the fitted line
+    line = ax.plot(x_range, y_fit, color='red')
+
+    # Create texts for adjustText
+    fontsize = 12
+    texts = []
+    for i in outlier_indices:
+        if country_df['Country Name'][int(i)] == 'United Arab Emirates':
+            texts.append(ax.text(country_df['2022'][int(i)], 
+                                country_df['count'][int(i)],
+                                'UAE',
+                                fontsize=fontsize))
+            continue
+        texts.append(ax.text(country_df['2022'][int(i)], 
+                            country_df['count'][int(i)],
+                            country_df['Country Name'][int(i)],
+                            fontsize=fontsize))
+
+    # Set scales to log
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+    
+    # Adjust text positions to avoid overlaps
+    adjust_text(texts, objects=scatter, force_static=(0.4, 0.4), arrowprops=dict(arrowstyle='-'))
+
+    # Add R² and p-value
+    ax.set_title(f"$R^2$: {result.rvalue**2:.2f}, p-value: {result.pvalue:.2f}")
+
+    ax.set_xlabel("Population")
+    ax.set_ylabel("No. of Videos from Country")
+
+    # Adjust layout to prevent label clipping
+    fig.tight_layout()
+
+    fig.savefig('./figs/population_vs_count.png')
+
+
     # country_df = country_df.with_columns(pl.col('count').alias('log_count'))
-    country_df = country_df.with_columns((pl.col('count') / (pl.col('2022') / 1000)).log1p().alias('count_per_capita'))
+    # count is from 24 minutes from one day. So multiply by 60 to get expected count for a day, then multiply by 365 to get expected count for a year
+    country_df = country_df.with_columns((pl.col('count') * 60 / (pl.col('2022') / 1000)).log1p().alias('count_per_capita'))
 
     # Convert to pandas for compatibility with geopandas
     country_data = country_df.to_pandas()
@@ -78,7 +172,7 @@ def main():
     vmax = world['count_per_capita'].max()
     
     # Create figure and axis
-    fig, ax = plt.subplots(1, 1, figsize=(20, 10))
+    fig, ax = plt.subplots(1, 1, figsize=(10, 5))
     
     # Create custom colormap similar to Turbo
     colors = ['#30123b', '#4777ef', '#1ac7c2', '#a6e622', '#fca50a', '#b41325']
@@ -91,7 +185,7 @@ def main():
         ax=ax,
         legend=True,
         legend_kwds={
-            'label': 'Log Count Per Thousand People',
+            'label': 'Log Estimated Daily Post Count Per Thousand People',
             'orientation': 'vertical',
             'shrink': 0.8,
             'fraction': 0.046,

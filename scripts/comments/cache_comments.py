@@ -5,7 +5,7 @@ import polars as pl
 import tqdm
 
 def main():
-    comment_cols = ['aweme_id', 'cid', 'uid', 'create_time', 'text']
+    comment_cols = ['aweme_id', 'cid', 'uid', 'create_time', 'text', 'comment_language']
 
     comments_dir_path = os.path.join('.', 'data', 'comments')
     comment_pbar = tqdm.tqdm(total=len(list(os.listdir(comments_dir_path))), desc='Reading comments')
