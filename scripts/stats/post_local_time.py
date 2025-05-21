@@ -1,5 +1,6 @@
 import configparser
 import os
+from typing import List
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -32,18 +33,21 @@ def get_country_timezone(country_code: str) -> str:
     Falls back to UTC if country code is not found.
     """
     try:
-        # Get first timezone for the country (primary timezone)
+        # Get all timezones
         timezones = pytz.country_timezones(country_code)
-        return timezones[0] if timezones else 'UTC'
+        return timezones if timezones else 'UTC'
     except KeyError:
         return 'UTC'
 
-def convert_to_local_hour(ts, tz_str: str) -> int:
+def convert_to_local_hour(ts, tz_list: List[str]) -> int:
     """Convert UTC timestamp to local hour in specified timezone."""
     try:
-        timezone = pytz.timezone(tz_str)
-        local_time = ts.replace(tzinfo=pytz.UTC).astimezone(timezone)
-        return local_time.hour
+        local_times = []
+        for tz_str in tz_list:
+            timezone = pytz.timezone(tz_str)
+            local_time = ts.replace(tzinfo=pytz.UTC).astimezone(timezone)
+            local_times.append(local_time.hour)
+        return sum(local_times) // len(local_times)
     except Exception:
         return None
 
@@ -89,20 +93,19 @@ def plot_local_time_histogram(df: pl.DataFrame,
     """
     plt.figure(figsize=(4, 3))
     
+    df = df.filter(pl.col('local_hour').is_not_null())
+
     # Get hour counts using Polars
-    hour_counts = (
-        df.filter(pl.col('local_hour').is_not_null())
-        .group_by('local_hour')
-        .count()
+    hour_counts = df.group_by('local_hour')\
+        .agg((pl.count('local_hour') / df.shape[0]).alias('share'))\
         .sort('local_hour')
-    )
     
     # Plot using the Polars data
-    plt.bar(hour_counts['local_hour'], hour_counts['count'])
+    plt.bar(hour_counts['local_hour'], hour_counts['share'])
     
     # plt.title('Distribution of TikTok Posts by Local Hour')
     plt.xlabel('Hour of Day (Local Time)')
-    plt.ylabel('Number of Posts')
+    plt.ylabel('Share of Posts')
     
     # Set x-axis ticks for each hour
     # plt.xticks(range(0, 24))
@@ -134,7 +137,7 @@ def main():
 
     os.makedirs(output_dir_path, exist_ok=True)
 
-    # result_paths = result_paths[:5]
+    result_paths = result_paths[:5]
     video_df = None
     val_count_dfs = None
     for result_path in tqdm.tqdm(result_paths):

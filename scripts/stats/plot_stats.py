@@ -43,7 +43,9 @@ def plot_loglog_hist(df, col_name, title, xlabel, ylabel, fig_path, bins=20):
     widths = np.diff(logbins)
     
     # Plot bars
-    ax.bar(logbins[:-1], hist, width=widths, align='edge')
+    # ax.bar(logbins[:-1], hist, width=widths, align='edge')
+    df = df.sort(col_name)
+    ax.plot(df[col_name], df['count'])
     
     # Set scales with appropriate parameters and custom tick spacing
     ax.set_xscale('symlog', linthresh=1.0)  # Linear below 1.0

@@ -115,7 +115,7 @@ def main():
 
     base_result_path = os.path.join('.', 'data', 'results', '2024_04_10')
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
-    use = '1hour'
+    use = 'all'
     if use == 'all':
         output_dir_path = os.path.join(this_dir_path, '..', "..", "data", "stats", 'all')
         result_paths = list(get_result_paths(base_result_path, result_filename='videos.parquet.zstd'))

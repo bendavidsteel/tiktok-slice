@@ -38,7 +38,7 @@ def extract_video_data(df):
 
 
 def main():
-    video_df = None
+    result_df = None
     video_dir_path = os.path.join('.', 'data', 'results', '2024_04_10')
     video_pbar = tqdm.tqdm(total=60*60 + 24*60, desc='Reading videos')
     for root, dirs, files in os.walk(video_dir_path):
@@ -47,15 +47,19 @@ def main():
                 video_pbar.update(1)
                 result_path = os.path.join(root, file)
                 batch_result_df = pl.read_parquet(result_path, columns=['result', 'args'])
-                batch_result_df = batch_result_df.filter(
-                    pl.col('result').is_not_null() & 
-                    pl.col('result').struct.field('return').is_not_null()
-                ).with_columns(
-                    pl.col('result').struct.field('return').alias('return')
-                ).drop('result')
+                batch_result_df = batch_result_df.with_columns([
+                    pl.col('args').cast(pl.UInt64),
+                        ((pl.col('result').struct.field('return').struct.field('statusMsg') != "item doesn't exist")\
+                        | pl.col('result').struct.field('return').struct.field('id').is_not_null()).alias('success')
+                    ])\
+                    .select(['args', 'success'])
                 
-                batch_video_df = extract_video_data(batch_result_df)
-                batch_video_df.write_parquet(os.path.join(root, 'videos.parquet.zstd'), compression='zstd')
+                if result_df is not None:
+                    result_df = pl.concat([result_df, batch_result_df])
+                else:
+                    result_df = batch_result_df
+
+    result_df.write_parquet('./data/stats/all/hit_rate.parquet.zstd', compression='zstd')
 
 
 if __name__ == '__main__':

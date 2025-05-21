@@ -26,10 +26,10 @@ def main():
     config = configparser.ConfigParser()
     config.read('./config/config.ini')
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
-    video_df = pl.read_parquet(os.path.join('.', 'data', '24hour', 'video_child_prob.parquet.gzip'))
+    video_df = pl.read_parquet(os.path.join('.', 'data', 'stats', '24hour', 'video_class_prob_test.parquet.gzip'))
     
     # Process video data
-    threshold = 0.6
+    threshold = 0.43
     video_df = video_df.with_columns((pl.col('child_prob') > threshold).cast(pl.Int32).alias('child_present'))
     country_df = video_df.group_by('locationCreated').agg([
         pl.col('child_present').sum().alias('num_child_videos'),
@@ -93,8 +93,9 @@ def main():
     residuals = share_child_videos - predicted_log
 
     # Get indices of top and bottom 3 residuals
-    top_indices = np.argsort(residuals)[-3:]
-    bottom_indices = np.argsort(residuals)[:3]
+    top_num = 2
+    top_indices = np.argsort(residuals)[-top_num:]
+    bottom_indices = np.argsort(residuals)[:top_num]
     outlier_indices = np.concatenate([top_indices, bottom_indices])
 
     # Create the plot
@@ -116,9 +117,10 @@ def main():
                             reg_df['share_child_videos'][int(i)],
                             reg_df['Country Name'][int(i)],
                             fontsize=fontsize))
+        ax.scatter(reg_df['share_under_14'][int(i)], reg_df['share_child_videos'][int(i)], s=12, c='r')
 
     # Adjust text positions to avoid overlaps
-    adjust_text(texts, objects=scatter, force_static=(0.3, 0.3), arrowprops=dict(arrowstyle='-'))
+    adjust_text(texts, objects=scatter, force_text=(0.2, 0.5), force_static=(0.1, 0.1), force_explode=(0.1, 0.9))
 
     # Add R² and p-value
     ax.set_title(f"$R^2$: {result.rvalue**2:.2f}, p-value: {result.pvalue:.2f}", transform=ax.transAxes)
@@ -139,32 +141,33 @@ def main():
     
     # Remove Antarctica
     world = world[world['CONTINENT'] != 'Antarctica']
+    world = world.to_crs('+proj=wintri')
     
     # Merge data with world map
     world = world.merge(country_data, how='left', left_on=['ISO_A3_EH'], right_on=['iso_alpha'])
     
     # Get the actual data range
-    vmin = world['child_video_ratio'].min()
-    vmax = world['child_video_ratio'].max()
+    world_significant = world[world['is_significant'].fillna(False)]
+    vmin = world_significant['child_video_ratio'].min()
+    vmax = world_significant['child_video_ratio'].max()
     
     # Create figure and axis
     fig, ax = plt.subplots(1, 1, figsize=(20, 10))
 
     # Create custom colormap similar to Turbo
-    colors = ['#30123b', '#4777ef', '#1ac7c2', '#a6e622', '#fca50a', '#b41325']
-    custom_cmap = LinearSegmentedColormap.from_list('custom_turbo', colors)
+    custom_cmap = plt.get_cmap('turbo')
 
     # Plot all countries first with full color
-    world.plot(
+    world_significant.plot(
         column='child_video_ratio',
         ax=ax,
         legend=True,
         legend_kwds={
-            'label': 'Share of videos containing children, adjusted by share of population under 14.\n(Solid: statistically significant,\nHatched: not significant)',
-            'orientation': 'vertical',
+            # 'label': 'Share of videos containing children divided by share of population under 14.',
+            'orientation': 'horizontal',
             'shrink': 0.8,
-            'fraction': 0.046,
-            'pad': 0.04
+            'fraction': 0.02,
+            'pad': 0.02
         },
         missing_kwds={'color': 'lightgrey'},
         cmap=custom_cmap,
@@ -172,16 +175,24 @@ def main():
         vmax=vmax
     )
 
+    fig.axes[1].set_title('Share of videos containing children divided by share of population under 14.', fontsize=14)
+
     # Add hatching to non-significant countries
     world_not_significant = world[~world['is_significant'].fillna(False)]
     world_not_significant.plot(
         ax=ax,
-        color='none',
+        color='grey',
         hatch='///',
         edgecolor='white',
         linewidth=0,
         alpha=0.5
     )
+
+    bounds = world.total_bounds
+    buffer_x = (bounds[2] - bounds[0]) * 0.02  # 2% buffer
+    buffer_y = (bounds[3] - bounds[1]) * 0.02
+    ax.set_xlim(bounds[0] - buffer_x, bounds[2] + buffer_x)
+    ax.set_ylim(bounds[1] - buffer_y, bounds[3] + buffer_y)
 
     # Customize the appearance
     ax.axis('off')
@@ -192,7 +203,7 @@ def main():
     plt.savefig(os.path.join(figs_dir_path, 'world_child_map.png'),
                 dpi=300,
                 bbox_inches='tight',
-                pad_inches=0.1)
+                pad_inches=0.)
     plt.close()
 
 if __name__ == '__main__':

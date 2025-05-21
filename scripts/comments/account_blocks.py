@@ -176,17 +176,6 @@ def main():
     comment_df = comment_df.with_columns((pl.col('comment_create_time_epoch') - pl.col('video_create_time_epoch')).alias('time_offset'))
     comment_df = comment_df.with_columns(pl.col('time_offset').dt.total_seconds().alias('time_offset_seconds'))
 
-    results = analyze_suspicious_patterns(comment_df, min_group_size=5, min_interactors=10)
-    
-    print(f"Found {results['observed_suspicious_groups']} suspicious groups")
-    print("\nStatistically significant patterns:")
-    for pattern in results['significant_patterns']:
-        stats = results['simulation_results'][pattern]
-        print(f"\n{pattern}:")
-        print(f"  Observed: {stats['observed_count']}")
-        print(f"  Expected: {stats['mean_simulated']:.1f} ± {stats['std_simulated']:.1f}")
-        print(f"  p-value: {stats['p_value']:.4f}")
-
     comment_interactions_df = comment_df.group_by('uid')\
         .agg(pl.col('authorUniqueId'))
 

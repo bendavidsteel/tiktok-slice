@@ -4,6 +4,7 @@ import os
 import re
 
 import matplotlib as mpl
+import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
 from PIL import Image
@@ -19,44 +20,38 @@ def get_videos_embeddings(embeddings_dir_path):
     embeddings = None
     img_features = None
     video_df = None
-    num_files = 0
-    for dir_name in os.listdir(embeddings_dir_path):
-        try:
-            filenames = os.listdir(os.path.join(embeddings_dir_path, dir_name, 'vids'))
-            if 'video_embeddings.npy' in filenames and 'videos.parquet.gzip' in filenames and 'img_features.npy' in filenames:
-                batch_embeddings = np.load(os.path.join(embeddings_dir_path, dir_name, 'vids', 'video_embeddings.npy'), allow_pickle=True)
-                batch_img_features = np.load(os.path.join(embeddings_dir_path, dir_name, 'vids', 'img_features.npy'), allow_pickle=True)
-                if not batch_embeddings.shape:
-                    continue
+    filenames = os.listdir(embeddings_dir_path)
+    if 'video_embeddings.npy' in filenames and 'videos.parquet.gzip' in filenames and 'img_features.npy' in filenames:
+        batch_embeddings = np.load(os.path.join(embeddings_dir_path, 'video_embeddings.npy'), allow_pickle=True)
+        batch_img_features = np.load(os.path.join(embeddings_dir_path, 'img_features.npy'), allow_pickle=True)
+        if not batch_embeddings.shape:
+            raise ValueError(f"Embeddings shape is empty")
 
-                batch_video_df = pl.read_parquet(os.path.join(embeddings_dir_path, dir_name, 'vids', 'videos.parquet.gzip'))
+        batch_video_df = pl.read_parquet(os.path.join(embeddings_dir_path, 'videos.parquet.gzip'))
 
-                if batch_embeddings.shape[0] != len(batch_video_df):
-                    continue
-                
-                assert batch_embeddings.shape[0] == len(batch_video_df)
+        if batch_embeddings.shape[0] != len(batch_video_df):
+            raise ValueError(f"Embeddings shape {batch_embeddings.shape[0]} does not match number of videos {len(batch_video_df)}")
+        
+        assert batch_embeddings.shape[0] == len(batch_video_df)
 
-                if embeddings is None:
-                    embeddings = batch_embeddings
-                else:
-                    embeddings = np.concatenate([embeddings, batch_embeddings])
+        if embeddings is None:
+            embeddings = batch_embeddings
+        else:
+            embeddings = np.concatenate([embeddings, batch_embeddings])
 
-                if img_features is None:
-                    img_features = batch_img_features
-                else:
-                    img_features = np.concatenate([img_features, batch_img_features])
+        if img_features is None:
+            img_features = batch_img_features
+        else:
+            img_features = np.concatenate([img_features, batch_img_features])
 
-                if video_df is None:
-                    video_df = batch_video_df
-                else:
-                    video_df = pl.concat([video_df, batch_video_df], how='diagonal_relaxed')
+        if video_df is None:
+            video_df = batch_video_df
+        else:
+            video_df = pl.concat([video_df, batch_video_df], how='diagonal_relaxed')
+    else:
+        raise ValueError(f"Missing files in {embeddings_dir_path}")
 
-        except Exception as e:
-            print(f"Error with {dir_name}: {e}")
-            continue
 
-    if embeddings is None and video_df is None:
-        raise ValueError("No embeddings found")
 
     return embeddings, img_features, video_df
 
@@ -78,6 +73,8 @@ class Classifier:
         ]
         
         non_child_prompts = [
+            "a social media post",
+            "some text saying family",
             "a man alone",
             "a woman alone",
             "men",
@@ -133,23 +130,41 @@ class Classifier:
         child_prob = child_prob / (child_prob + non_child_prob)
         return child_prob.cpu().detach().numpy()
 
+def get_dir_probs(classifier, dir_path):
+    embeddings, img_features, video_df = get_videos_embeddings(dir_path)
+    child_prob = classifier.classify_child_presence(embeddings, img_features)
+    return child_prob
+
 def main():
     config = configparser.ConfigParser()
     config.read('./config/config.ini')
 
-    embedding_dir_path = os.path.join('.', 'data', 'children_val_set')
-
-    embeddings, img_features, video_df = get_videos_embeddings(embedding_dir_path)
-
     classifier = Classifier()
-    child_prob = classifier.classify_child_presence(embeddings, img_features)
+
+    embedding_dir_path = os.path.join('.', 'data', 'children_val_set', 'child_videos')
+    child_probs = get_dir_probs(classifier, embedding_dir_path)
+
+    embedding_dir_path = os.path.join('.', 'data', 'children_val_set', 'non_child_videos')
+    non_child_probs = get_dir_probs(classifier, embedding_dir_path)
+
+    
+    
+
+    combined_probs = np.concatenate((child_probs, non_child_probs))
+    true_labels = np.concatenate((np.ones(len(child_probs)), np.zeros(len(non_child_probs))))
 
     # get f1 score
-    threshold = 0.6
-    child_presence = np.array([1 if p > threshold else 0 for p in child_prob])
-    true_child_presence = np.ones(len(video_df))
-    f1 = f1_score(true_child_presence, child_presence)
-    print(f"F1 score: {f1}")
+    thresholds = np.linspace(0.3, 0.9, 20)
+    f1s = []
+    for threshold in thresholds:
+        predictions = combined_probs > threshold
+        f1 = f1_score(true_labels, predictions)
+        f1s.append(f1)
+    fig, ax = plt.subplots()
+    ax.plot(thresholds, f1s)
+    ax.set_xlabel('Threshold')
+    ax.set_ylabel('F1 Score')
+    fig.savefig('./figs/child_thres_f1.png')
 
 if __name__ == '__main__':
     main()

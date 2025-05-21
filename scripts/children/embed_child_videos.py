@@ -55,7 +55,7 @@ def load_video(video_file_path):
             video = read_video_pyav(container, indices)
         return video
     except Exception as e:
-        os.remove(video_file_path)
+        # os.remove(video_file_path)
         return None
         raise Exception(e, f"Failed to load video: {video_file_path}")
         
@@ -71,8 +71,9 @@ class MultiModalBackend:
 
     def embed_videos(self, video_file_paths, texts=None):
         logger.debug(f"Loading {len(video_file_paths)} videos...")
-        with multiprocessing.Pool(min(8, len(video_file_paths))) as p:
-            videos = list(p.imap(load_video, video_file_paths))
+        # with multiprocessing.Pool(min(8, len(video_file_paths))) as p:
+        #     videos = list(p.imap(load_video, video_file_paths))
+        videos = [load_video(video_file_path) for video_file_path in video_file_paths]
 
         processed_video_file_paths = [video_file_path for video_file_path, video in zip(video_file_paths, videos) if video is not None]
         videos = [video for video in videos if video is not None]
@@ -128,23 +129,13 @@ class MultiModalBackend:
 
         return video_embeds, img_features, processed_video_file_paths
 
-def embed_directory(embedding_model, video_df, dir_path):
+def embed_directory(embedding_model, dir_path):
     host_file_paths = []
     host_file_paths = [os.path.join(dir_path, server_filename) for server_filename in os.listdir(dir_path) if server_filename.endswith('.mp4')]
     host_file_paths = sorted(host_file_paths)
     byte_video_ids = [os.path.splitext(os.path.basename(host_file_path))[0] for host_file_path in host_file_paths]
 
-    # get video data for each video
-    meta_video_ids = video_df['aweme_id'].tolist()
-    video_ids = list(set(byte_video_ids).intersection(set(meta_video_ids)))
-
-    host_file_paths = [host_file_path for host_file_path in host_file_paths if os.path.splitext(os.path.basename(host_file_path))[0] in video_ids]
-    bytes_video_id_order = [os.path.splitext(os.path.basename(host_file_path))[0] for host_file_path in host_file_paths]
-    video_df = video_df[video_df['aweme_id'].isin(video_ids)]
-    # reorder based on host_file_paths
-    video_df = video_df.set_index('aweme_id')
-    video_df = video_df.loc[bytes_video_id_order]
-    video_df = video_df.reset_index()
+    video_df = pd.DataFrame({'aweme_id': byte_video_ids})
 
     if len(host_file_paths) == 0:
         return
@@ -168,7 +159,19 @@ def embed_directory(embedding_model, video_df, dir_path):
                 elif saved_video_ids.issubset(video_ids):
                     add_to_existing = True
                     video_df = video_df[~video_df['aweme_id'].isin(saved_video_ids)]
-                    host_file_paths = [host_file_path for host_file_path in host_file_paths if os.path.splitext(os.path.basename(host_file_path))[0] in video_df['id'].tolist()]
+                    host_file_paths = [host_file_path for host_file_path in host_file_paths if os.path.splitext(os.path.basename(host_file_path))[0] in video_df['aweme_id'].tolist()]
+                elif video_ids.issubset(saved_video_ids):
+                    # filter out the videos that no longer exist in this directory
+                    # and resave the embeddings
+                    saved_video_df = saved_video_df[saved_video_df['aweme_id'].isin(video_ids)]
+                    saved_embeddings = saved_embeddings[saved_video_df.index]
+                    saved_img_features = saved_img_features[saved_video_df.index]
+                    saved_video_df.to_parquet(video_path, compression='gzip')
+                    np.save(embedding_path, saved_embeddings)
+                    np.save(img_features_path, saved_img_features)
+                    return
+                else:
+                    raise NotImplementedError("Cannot merge embeddings from different sets of videos")
         except Exception as e:
             print(f"Failed to load embeddings: {e}")
 
@@ -238,7 +241,7 @@ def embed_directory(embedding_model, video_df, dir_path):
     with open(img_features_path, 'wb') as f:
         np.save(f, img_features)
 
-    video_df[['aweme_id', 'author_user_id']].to_parquet(video_path, compression='gzip')
+    video_df[['aweme_id']].to_parquet(video_path, compression='gzip')
 
     # delete the files from the host
     # for file_path in host_file_paths:
@@ -256,20 +259,10 @@ def main():
     bytes_dir_path = config['children_paths']['mp4_path']
     embedding_dir_path = config['children_paths']['embedding_path']
 
-    server_dirs = [dir_name for dir_name in os.listdir(bytes_dir_path)]
-    server_dirs = [server_dir for server_dir in server_dirs if server_dir and "." not in server_dir]
-    server_dirs = set(server_dirs)
+    server_dirs = ['./data/children_val_set/non_child_videos', './data/children_val_set/child_videos']
     for server_dir in server_dirs:
         print(f"Embedding videos in {server_dir}")
-        # try:
-        video_path = os.path.join(bytes_dir_path, server_dir, f"{server_dir}_video_data.json")
-        with open(video_path, 'r') as f:
-            video_data = []
-            for l in f.readlines():
-                video_data.append(json.loads(l))
-        video_df = pd.DataFrame(video_data)
-        dir_path = os.path.join(bytes_dir_path, server_dir, 'vids')
-        embed_directory(embedding_model, video_df, dir_path)
+        embed_directory(embedding_model, server_dir)
         # except Exception as e:
         #     print(f"Failed to embed videos: {e}, in {server_dir}")
 

@@ -860,7 +860,9 @@ def train_topic_model(video_df, embeddings, data_dir_path, HF_TOKEN, umap_embedd
             representation_model=representation_model, 
             embedding_model="paraphrase-MiniLM-L6-v2",
             verbose=True, 
-            nr_repr_docs=num_repr_docs
+            nr_repr_docs=num_repr_docs,
+            min_topic_size=max(int(0.0002 * len(video_df)), 2),
+            # nr_topics=200
         )
         topics, probs = topic_model.fit_transform(
             documents=None, 

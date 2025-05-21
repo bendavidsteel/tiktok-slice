@@ -3,12 +3,18 @@ import os
 
 from adjustText import adjust_text
 import polars as pl
+import matplotlib as mpl
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
+from matplotlib.colorbar import ColorbarBase
+import matplotlib.ticker as ticker
 import geopandas as gpd
 import pycountry
 import numpy as np
 from matplotlib.colors import LinearSegmentedColormap
 from scipy import stats
+import shapely.geometry as geometry
+from shapely.ops import transform
 
 def calculate_significance(success, total, confidence=0.95):
     """Calculate statistical significance using binomial test"""
@@ -126,18 +132,19 @@ def main():
                                 country_df['count'][int(i)],
                                 'UAE',
                                 fontsize=fontsize))
-            continue
-        texts.append(ax.text(country_df['2022'][int(i)], 
-                            country_df['count'][int(i)],
-                            country_df['Country Name'][int(i)],
-                            fontsize=fontsize))
+        else:
+            texts.append(ax.text(country_df['2022'][int(i)], 
+                                country_df['count'][int(i)],
+                                country_df['Country Name'][int(i)],
+                                fontsize=fontsize))
+        ax.scatter(country_df['2022'][int(i)], country_df['count'][int(i)], s=12, c='r')
 
     # Set scales to log
     ax.set_xscale('log')
     ax.set_yscale('log')
     
     # Adjust text positions to avoid overlaps
-    adjust_text(texts, objects=scatter, force_static=(0.4, 0.4), arrowprops=dict(arrowstyle='-'))
+    adjust_text(texts, objects=scatter, force_static=(0.4, 0.4))
 
     # Add R² and p-value
     ax.set_title(f"$R^2$: {result.rvalue**2:.2f}, p-value: {result.pvalue:.2f}")
@@ -153,62 +160,68 @@ def main():
 
     # country_df = country_df.with_columns(pl.col('count').alias('log_count'))
     # count is from 24 minutes from one day. So multiply by 60 to get expected count for a day, then multiply by 365 to get expected count for a year
-    country_df = country_df.with_columns((pl.col('count') * 60 / (pl.col('2022') / 1000)).log1p().alias('count_per_capita'))
+    country_df = country_df.with_columns((pl.col('count') * 60 / (pl.col('2022'))).log1p().alias('count_per_capita'))
 
     # Convert to pandas for compatibility with geopandas
     country_data = country_df.to_pandas()
     
     # Load world map data
     world = gpd.read_file('./data/countries_lakes/ne_110m_admin_0_countries_lakes.shp')
-    
-    # Remove Antarctica
     world = world[world['CONTINENT'] != 'Antarctica']
+    world = world.to_crs('+proj=wintri')
     
-    # Merge data with world map
+    # Merge with country data
+    country_data = country_df.to_pandas()
     world = world.merge(country_data, how='left', left_on=['ISO_A3_EH'], right_on=['iso_alpha'])
-    
+
     # Get the actual data range
     vmin = world['count_per_capita'].min()
     vmax = world['count_per_capita'].max()
-    
-    # Create figure and axis
+
+    custom_cmap = plt.get_cmap('turbo')
+
+    # Create figure and plot
     fig, ax = plt.subplots(1, 1, figsize=(10, 5))
     
-    # Create custom colormap similar to Turbo
-    colors = ['#30123b', '#4777ef', '#1ac7c2', '#a6e622', '#fca50a', '#b41325']
-    custom_cmap = LinearSegmentedColormap.from_list('custom_turbo', colors)
-    
-    
-    # Plot significant countries
+    norm = LogNorm(vmin=vmin, vmax=vmax)
+
+    # Plot the data with log scale for colors
     world.plot(
-        column='count_per_capita',
+        column='count_per_capita',  
         ax=ax,
         legend=True,
         legend_kwds={
-            'label': 'Log Estimated Daily Post Count Per Thousand People',
-            'orientation': 'vertical',
+            'label': 'Daily Posts Per Capita',
+            'orientation': 'horizontal',
             'shrink': 0.8,
             'fraction': 0.046,
-            'pad': 0.04
+            'pad': 0.04,
+            'format': '%.1e'
         },
         missing_kwds={'color': 'lightgrey'},
         cmap=custom_cmap,
-        vmin=vmin,
-        vmax=vmax,
-        alpha=1.0
+        norm=norm,  # Using LogNorm and ensuring vmin > 0
+        alpha=1.0,
     )
-    
-    # Customize the appearance
+
+    # Get the bounds of the geometries and set limits with a small buffer
+    bounds = world.total_bounds
+    buffer_x = (bounds[2] - bounds[0]) * 0.02  # 2% buffer
+    buffer_y = (bounds[3] - bounds[1]) * 0.02
+    ax.set_xlim(bounds[0] - buffer_x, bounds[2] + buffer_x)
+    ax.set_ylim(bounds[1] - buffer_y, bounds[3] + buffer_y)
+
+    # Customize appearance
     ax.axis('off')
-    # plt.title('Share of Child Videos by Country', pad=20, size=16)
     
+    # Adjust layout
     fig.subplots_adjust(left=0, right=1, top=1, bottom=0, wspace=0, hspace=0)
-    # Save the figure
-    figs_dir_path = os.path.join('.', 'figs')
-    plt.savefig(os.path.join(figs_dir_path, 'world_count_map.png'),
+    
+    # Save figure
+    plt.savefig('./figs/world_count_map.png',
                 dpi=300,
                 bbox_inches='tight',
-                pad_inches=0.1)
+                pad_inches=0.)
     plt.close()
 
 if __name__ == '__main__':

@@ -187,11 +187,14 @@ class VLMCaptioning:
         ).eval().cuda()
 
     def __call__(self, images):
-        question = '<image>\nPlease describe the image in detail.'
-        generation_config = dict(max_new_tokens=1024, do_sample=True)
+        question = '<image>\nPlease give a detailed but concise description of the image.'
+        generation_config = dict(max_new_tokens=256, do_sample=True)
         responses = []
         for image in images:
-            pixel_values = load_image(image, max_num=12).to(torch.bfloat16).cuda()
-            response = self.model.chat(self.tokenizer, pixel_values, question, generation_config)
-            responses.append([{ 'generated_text': response }])
+            try:
+                pixel_values = load_image(image, max_num=12).to(torch.bfloat16).cuda()
+                response = self.model.chat(self.tokenizer, pixel_values, question, generation_config)
+                responses.append([{ 'generated_text': response }])
+            except Exception as e:
+                responses.append([{ 'generated_text': '' }])
         return responses
