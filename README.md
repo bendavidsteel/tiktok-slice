@@ -18,3 +18,12 @@ Vary by location of video creation, perhaps associated with a database shard?
 https://smudge.ai/blog/ratelimit-algorithms
 
 https://github.com/SergioMEV/slurm-for-dummies
+
+#TODOS
+ask derek if he can ask journals if results are good story
+potentially also post shorter thing
+play around with regional based world map rather than each individual country
+PNAS Brief Reports
+release data as: list of links
+OR separated by countries/minute, then only captions/some stats, no personally identifiable info
+get view correlations by country/language/hashtag/user stats
