@@ -13,8 +13,6 @@ import tqdm
 import torch
 import transformers
 
-from scripts.children.train_classifier import StackingEnsembleClassifier
-
 def get_videos_embeddings(embeddings_dir_path, max_files=None, hour=None, minute=None):
     embeddings = None
     img_features = None
@@ -158,16 +156,34 @@ class Classifier:
             "a piece of furniture"
         ]
 
+        self.weapons_prompts = [
+            "a gun",
+            "a weapon",
+            "a military weapon",
+            "a piece of military equipment",
+        ]
+
+        self.non_weapons_prompts = [
+            "a selfie",
+            "a person smiling",
+            "a person laughing",
+            "a person eating",
+            "a person drinking",
+            "a landscape",
+            "a building",
+            "a vehicle",
+            "food",
+            "a piece of clothing",
+            "a piece of furniture"
+        ]
+
         inputs = tokenizer(
-            self.porn_prompts + self.non_porn_prompts + self.violence_prompts + self.non_violence_prompts, 
+            self.porn_prompts + self.non_porn_prompts + self.violence_prompts + self.non_violence_prompts + self.weapons_prompts + self.non_weapons_prompts,
             padding=True, 
             return_tensors="pt"
         )
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         self.text_features = self.model.get_text_features(**inputs)
-
-        # load child classifier
-        self.child_classifier = joblib.load('./models/stacking_ensemble.joblib')
 
     def classify(self, embeddings, img_features):
         
@@ -193,7 +209,8 @@ class Classifier:
         
         # Create separate groups for each classifier
         porn_prompts_features = self.text_features[:len(self.porn_prompts) + len(self.non_porn_prompts)]
-        violence_prompts_features = self.text_features[-len(self.violence_prompts) - len(self.non_violence_prompts):]
+        violence_prompts_features = self.text_features[len(self.porn_prompts) + len(self.non_porn_prompts):-len(self.weapons_prompts) - len(self.non_weapons_prompts)]
+        weapons_prompts_features = self.text_features[-len(self.weapons_prompts) - len(self.non_weapons_prompts):]
         
         batch_size = embeddings.shape[0]
         
@@ -206,13 +223,16 @@ class Classifier:
         violence_text_embeds = violence_prompts_features.unsqueeze(0).expand(batch_size, -1, -1)
         violence_text_embeds = violence_text_embeds + self.model.prompts_generator(violence_text_embeds, img_features)
         violence_text_embeds = violence_text_embeds / violence_text_embeds.norm(p=2, dim=-1, keepdim=True)
+
+        # process weapons classifier
+        weapons_text_embeds = weapons_prompts_features.unsqueeze(0).expand(batch_size, -1, -1)
+        weapons_text_embeds = weapons_text_embeds + self.model.prompts_generator(weapons_text_embeds, img_features)
+        weapons_text_embeds = weapons_text_embeds / weapons_text_embeds.norm(p=2, dim=-1, keepdim=True)
         
         # Calculate logits for each classifier separately
         porn_logits = torch.einsum("bd,bkd->bk", video_embeds, logit_scale * porn_text_embeds)
         violence_logits = torch.einsum("bd,bkd->bk", video_embeds, logit_scale * violence_text_embeds)
-        
-        # Process child probabilities
-        child_prob = self.child_classifier.predict_proba(embeddings)
+        weapons_logits = torch.einsum("bd,bkd->bk", video_embeds, logit_scale * weapons_text_embeds)
         
         # Process porn probabilities
         all_porn_probs = torch.softmax(porn_logits, dim=1)
@@ -225,15 +245,22 @@ class Classifier:
         pos_violence_prob = torch.mean(all_violence_probs[:, :len(self.violence_prompts)], dim=1)
         neg_violence_prob = torch.mean(all_violence_probs[:, len(self.violence_prompts):], dim=1)
         violence_prob = pos_violence_prob / (pos_violence_prob + neg_violence_prob)
+
+        # Process weapons probabilities
+        all_weapons_probs = torch.softmax(weapons_logits, dim=1)
+        pos_weapons_prob = torch.mean(all_weapons_probs[:, :len(self.weapons_prompts)], dim=1)
+        neg_weapons_prob = torch.mean(all_weapons_probs[:, len(self.weapons_prompts):], dim=1)
+        weapons_prob = pos_weapons_prob / (pos_weapons_prob + neg_weapons_prob)
         
         # Convert to numpy for dataframe creation
         porn_prob = porn_prob.cpu().detach().numpy()
         violence_prob = violence_prob.cpu().detach().numpy()
-        
+        weapons_prob = weapons_prob.cpu().detach().numpy()
+
         return pl.DataFrame({
-            'child_prob': child_prob,
             'porn_prob': porn_prob,
-            'violence_prob': violence_prob
+            'violence_prob': violence_prob,
+            'weapons_prob': weapons_prob
         })
 
 def main():
@@ -244,7 +271,7 @@ def main():
     bytes_dir_paths = config['paths']['mp4_paths'].split(',')
 
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
-    max_files = None
+    max_files = 500
     use = '24hour'
     if use == 'all':
         hour = None

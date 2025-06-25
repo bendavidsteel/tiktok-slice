@@ -7,9 +7,9 @@ def main():
     dir_path = os.path.join('.', 'data', 'stats', '24hour')
     video_df = pl.read_parquet(os.path.join(dir_path, 'video_class_prob_test.parquet.gzip'))
 
-    cats = ['child_prob', 'porn_prob', 'violence_prob']
+    cats = ['weapons_prob']
     for cat in cats:
-        cat_df = video_df.sort(cat, descending=True).head(5)
+        cat_df = video_df.sort(cat, descending=True).head(10)
         video_ids = cat_df['id'].to_list()
         video_paths = []
         num_not_found = 0

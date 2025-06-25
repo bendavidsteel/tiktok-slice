@@ -29,13 +29,13 @@ def get_result_paths(result_dir_path, result_filename='results.parquet.gzip', mi
                 result_path = os.path.join(dir_path, filename)
                 yield result_path
 
-def calculate_significance(success, total, confidence=0.95):
+def calculate_significance(success, total, default_p=0.0):
     """Calculate statistical significance using binomial test"""
-    if total == 0:
+    if total < 50:
         return False
     
     # Perform binomial test against null hypothesis of p=0.5
-    p_value = stats.binomtest(success, n=total, p=0.5).pvalue
+    p_value = stats.binomtest(success, n=total, p=default_p, alternative='greater').pvalue
     
     # Return whether p-value is significant at 0.05 level
     return p_value < 0.05
@@ -71,7 +71,8 @@ def main():
 
     video_df = video_df.with_columns((pl.col('aigcLabelType').is_in(['1', '2']) & pl.col('aigcLabelType').is_not_null()).alias('is_aigc'))
     
-    print(f"AI generated content ratio: {video_df['is_aigc'].sum() / video_df.shape[0]}")
+    global_p = video_df['is_aigc'].sum() / video_df.shape[0]
+    print(f"AI generated content ratio: {global_p:.4f}")
     
     country_df = video_df.group_by('locationCreated').agg([
         pl.col('is_aigc').count().alias('count'),
@@ -111,7 +112,7 @@ def main():
 
     country_df = country_df.with_columns([
         (pl.col('aigc_count') / pl.col('count')).alias('aigc_ratio'),
-        pl.Series(name='is_significant', values=[calculate_significance(r['aigc_count'], r['count']) for r in country_df.to_dicts()], dtype=pl.Boolean),
+        pl.Series(name='is_significant', values=[calculate_significance(r['aigc_count'], r['count'], default_p=0.0) for r in country_df.to_dicts()], dtype=pl.Boolean),
     ])
 
 
