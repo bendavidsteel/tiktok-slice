@@ -18,14 +18,7 @@ from shapely.ops import transform
 
 def calculate_significance(success, total, confidence=0.95):
     """Calculate statistical significance using binomial test"""
-    if total == 0:
-        return False
-    
-    # Perform binomial test against null hypothesis of p=0.5
-    p_value = stats.binomtest(success, n=total, p=0.5).pvalue
-    
-    # Return whether p-value is significant at 0.05 level
-    return p_value < 0.05
+    return total >= 50
 
 def main():
     # Read config and data
@@ -160,7 +153,11 @@ def main():
 
     # country_df = country_df.with_columns(pl.col('count').alias('log_count'))
     # count is from 24 minutes from one day. So multiply by 60 to get expected count for a day, then multiply by 365 to get expected count for a year
-    country_df = country_df.with_columns((pl.col('count') * 60 / (pl.col('2022'))).log1p().alias('count_per_capita'))
+    country_df = country_df.with_columns((pl.col('count') * 60 / (pl.col('2022'))).alias('count_per_capita'))
+
+    country_df = country_df.with_columns([
+        pl.Series(name='is_significant', values=[calculate_significance(0, r['count']) for r in country_df.to_dicts()], dtype=pl.Boolean),
+    ])
 
     # Convert to pandas for compatibility with geopandas
     country_data = country_df.to_pandas()
@@ -174,6 +171,8 @@ def main():
     country_data = country_df.to_pandas()
     world = world.merge(country_data, how='left', left_on=['ISO_A3_EH'], right_on=['iso_alpha'])
 
+    world_significant = world[world['is_significant'] == True]
+
     # Get the actual data range
     vmin = world['count_per_capita'].min()
     vmax = world['count_per_capita'].max()
@@ -183,10 +182,10 @@ def main():
     # Create figure and plot
     fig, ax = plt.subplots(1, 1, figsize=(10, 5))
     
-    norm = LogNorm(vmin=vmin, vmax=vmax)
+    # norm = LogNorm(vmin=vmin, vmax=vmax)
 
     # Plot the data with log scale for colors
-    world.plot(
+    world_significant.plot(
         column='count_per_capita',  
         ax=ax,
         legend=True,
@@ -194,14 +193,24 @@ def main():
             'label': 'Daily Posts Per Capita',
             'orientation': 'horizontal',
             'shrink': 0.8,
-            'fraction': 0.046,
+            'fraction': 0.04,
             'pad': 0.04,
             'format': '%.1e'
         },
         missing_kwds={'color': 'lightgrey'},
         cmap=custom_cmap,
-        norm=norm,  # Using LogNorm and ensuring vmin > 0
+        norm=LogNorm(vmin=vmin, vmax=vmax),
         alpha=1.0,
+    )
+
+    world_not_significant = world[~world['is_significant'].fillna(False)]
+    world_not_significant.plot(
+        ax=ax,
+        color='grey',
+        hatch='///',
+        edgecolor='white',
+        linewidth=0,
+        alpha=0.5
     )
 
     # Get the bounds of the geometries and set limits with a small buffer

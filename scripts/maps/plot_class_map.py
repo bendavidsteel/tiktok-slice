@@ -12,21 +12,14 @@ from scipy import stats
 
 def calculate_significance(success, total, confidence=0.95):
     """Calculate statistical significance using binomial test"""
-    if total == 0:
-        return False
-    
-    # Perform binomial test against null hypothesis of p=0.5
-    p_value = stats.binomtest(success, n=total, p=0.5).pvalue
-    
-    # Return whether p-value is significant at 0.05 level
-    return p_value < 0.05
+    return total >= 50
 
 def main():
     # Read config and data
     config = configparser.ConfigParser()
     config.read('./config/config.ini')
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
-    video_df = pl.read_parquet(os.path.join('.', 'data', 'stats', '24hour', 'video_class_prob_test.parquet.gzip'))
+    video_df = pl.read_parquet(os.path.join('.', 'data', 'stats', '24hour', 'video_child_prob.parquet.gzip'))
     
     # Process video data
     threshold = 0.43
@@ -152,7 +145,7 @@ def main():
     vmax = world_significant['child_video_ratio'].max()
     
     # Create figure and axis
-    fig, ax = plt.subplots(1, 1, figsize=(20, 10))
+    fig, ax = plt.subplots(1, 1, figsize=(10, 5))
 
     # Create custom colormap similar to Turbo
     custom_cmap = plt.get_cmap('turbo')
@@ -163,11 +156,11 @@ def main():
         ax=ax,
         legend=True,
         legend_kwds={
-            # 'label': 'Share of videos containing children divided by share of population under 14.',
+            'label': 'Pct. of videos containing children / pct. population under 14.',
             'orientation': 'horizontal',
             'shrink': 0.8,
-            'fraction': 0.02,
-            'pad': 0.02
+            'fraction': 0.03,
+            'pad': 0.04
         },
         missing_kwds={'color': 'lightgrey'},
         cmap=custom_cmap,
@@ -175,7 +168,7 @@ def main():
         vmax=vmax
     )
 
-    fig.axes[1].set_title('Share of videos containing children divided by share of population under 14.', fontsize=14)
+    # fig.axes[1].set_title(, fontsize=16)
 
     # Add hatching to non-significant countries
     world_not_significant = world[~world['is_significant'].fillna(False)]

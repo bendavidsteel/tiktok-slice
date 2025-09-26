@@ -210,7 +210,7 @@ class StackingEnsembleClassifier:
 
 def get_dir_probs(dir_path):
     embeddings, img_features, video_df = get_videos_embeddings(dir_path)
-    return embeddings, img_features
+    return embeddings, img_features, video_df
 
 
 def perform_cross_validation(models, X, y, cv=5):
@@ -499,23 +499,18 @@ def main():
     config.read('./config/config.ini')
 
     # Get data from directories
-    child_dir = os.path.join('.', 'data', 'children_val_set', 'child_videos')
-    non_child_dir = os.path.join('.', 'data', 'children_val_set', 'non_child_videos')
+    dir_path = './data/aif_aigc'
     
     # Process data once and store results for both models
     print("\n--- Processing Child Videos ---")
-    child_embeddings, child_img_features = get_dir_probs(child_dir)
-    
-    print("\n--- Processing Non-Child Videos ---")
-    non_child_embeddings, non_child_img_features = get_dir_probs(non_child_dir)
-    
+    embeddings, img_features, id_df = get_dir_probs(dir_path)
+    video_df = pl.read_excel('./data/annotations-tk-20250626-from-results.xlsx')
+    video_df = id_df.join(video_df.unique('id'), left_on='aweme_id', right_on='id', how='left', maintain_order='left')
+
     # Prepare dataset for classifiers
     print("\n--- Preparing Dataset for Classification Models ---")
-    X = np.vstack([child_embeddings, non_child_embeddings])
-    y = np.concatenate([
-        np.ones(len(child_embeddings)),
-        np.zeros(len(non_child_embeddings))
-    ])
+    X = embeddings
+    y = video_df.select(pl.when(pl.col('choice').is_in(['GenAI', 'Partial GenAI'])).then(1).otherwise(0).alias('label'))['label'].to_numpy()
     print(f"Dataset prepared: {X.shape[0]} samples, {X.shape[1]} features")
     
     # Initialize all models - Removed VotingEnsembleClassifier as requested
@@ -538,7 +533,7 @@ def main():
     
     # For the main evaluation, still split 50/50 to be consistent with original code
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.5, random_state=42, stratify=y
+        X, y, test_size=0.3, random_state=42, stratify=y
     )
     
     print(f"Training set: {X_train.shape[0]} samples")
@@ -578,7 +573,6 @@ def main():
         print(f"Precision: {results['precision']:.4f}")
         print(f"Recall: {results['recall']:.4f}")
         print(f"F1 Score: {results['f1']:.4f}")
-        print(f"Confusion Matrix:\n{sklearn.metrics.confusion_matrix(y_test, y_pred)}")
         print(f"Best threshold: {results['best_threshold']:.2f} with F1 score: {results['best_f1']:.4f}")
         
         # Plot evaluation results

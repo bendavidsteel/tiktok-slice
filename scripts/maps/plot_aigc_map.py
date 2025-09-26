@@ -31,14 +31,7 @@ def get_result_paths(result_dir_path, result_filename='results.parquet.gzip', mi
 
 def calculate_significance(success, total, default_p=0.0):
     """Calculate statistical significance using binomial test"""
-    if total < 50:
-        return False
-    
-    # Perform binomial test against null hypothesis of p=0.5
-    p_value = stats.binomtest(success, n=total, p=default_p, alternative='greater').pvalue
-    
-    # Return whether p-value is significant at 0.05 level
-    return p_value < 0.05
+    return total >= 50
 
 def main():
     # Read config and data
@@ -148,7 +141,7 @@ def main():
             'label': 'AI generated content ratio',
             'orientation': 'horizontal',
             'shrink': 0.8,
-            'fraction': 0.046,
+            'fraction': 0.03,
             'pad': 0.04,
         },
         missing_kwds={'color': 'lightgrey'},

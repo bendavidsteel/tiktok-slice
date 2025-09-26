@@ -67,9 +67,9 @@ def process_batch(result_path, val_count_dfs):
 
     # Update value counts
     if val_count_dfs:
-        author_counts_df, location_counts_df, error_counts_df, comment_counts_df, like_counts_df, share_counts_df, play_counts_df, duration_counts_df = val_count_dfs
+        author_counts_df, location_counts_df, error_counts_df, comment_counts_df, like_counts_df, share_counts_df, play_counts_df, duration_counts_df, follower_counts_df = val_count_dfs
     else:
-        author_counts_df, location_counts_df, error_counts_df, comment_counts_df, like_counts_df, share_counts_df, play_counts_df, duration_counts_df = None, None, None, None, None, None, None, None
+        author_counts_df, location_counts_df, error_counts_df, comment_counts_df, like_counts_df, share_counts_df, play_counts_df, duration_counts_df, follower_counts_df = None, None, None, None, None, None, None, None, None
     author_counts_df = update_value_counts(video_df, 'authorUniqueId', author_counts_df)
     location_counts_df = update_value_counts(video_df, 'locationCreated', location_counts_df)
     # error_counts_df = update_value_counts(error_df, ['statusCode', 'statusMsg'], error_counts_df)
@@ -80,11 +80,12 @@ def process_batch(result_path, val_count_dfs):
     share_counts_df = update_value_counts(video_df, 'shareCount', share_counts_df)
     play_counts_df = update_value_counts(video_df, 'playCount', play_counts_df)
     duration_counts_df = update_value_counts(video_df, 'videoDuration', duration_counts_df)
+    follower_counts_df = update_value_counts(video_df, pl.col()'followerCount', follower_counts_df)
     
     # Aggregate statistics
     batch_df = video_df.select(['video_id', 'commentCount'])
     
-    val_count_dfs = author_counts_df, location_counts_df, error_counts_df, comment_counts_df, like_counts_df, share_counts_df, play_counts_df, duration_counts_df
+    val_count_dfs = author_counts_df, location_counts_df, error_counts_df, comment_counts_df, like_counts_df, share_counts_df, play_counts_df, duration_counts_df, follower_counts_df
 
     return batch_df, val_count_dfs
 
@@ -94,7 +95,7 @@ def finalize_results(unique_video_df, output_dir_path, val_count_dfs):
     total_videos = len(unique_video_df)
     print(f"Number of videos: {total_videos}")
 
-    author_counts_df, location_counts_df, error_counts_df, comment_counts_df, like_counts_df, share_counts_df, play_counts_df, duration_counts_df = val_count_dfs
+    author_counts_df, location_counts_df, error_counts_df, comment_counts_df, like_counts_df, share_counts_df, play_counts_df, duration_counts_df, follower_counts_df = val_count_dfs
 
     # Convert final parquet files to CSV
     author_counts_df.write_csv(os.path.join(output_dir_path, "author_unique_id_value_counts.csv"))
@@ -108,6 +109,7 @@ def finalize_results(unique_video_df, output_dir_path, val_count_dfs):
     share_counts_df.write_csv(os.path.join(output_dir_path, "share_count_value_counts.csv"))
     play_counts_df.write_csv(os.path.join(output_dir_path, "play_count_value_counts.csv"))
     duration_counts_df.write_csv(os.path.join(output_dir_path, "video_duration_value_counts.csv"))
+    follower_counts_df.write_csv(os.path.join(output_dir_path, "follower_count_value_counts.csv"))
     
 def main():
     config = configparser.ConfigParser()
@@ -115,7 +117,7 @@ def main():
 
     base_result_path = os.path.join('.', 'data', 'results', '2024_04_10')
     this_dir_path = os.path.dirname(os.path.realpath(__file__))
-    use = 'all'
+    use = '1hour'
     if use == 'all':
         output_dir_path = os.path.join(this_dir_path, '..', "..", "data", "stats", 'all')
         result_paths = list(get_result_paths(base_result_path, result_filename='videos.parquet.zstd'))

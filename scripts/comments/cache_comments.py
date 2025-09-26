@@ -15,10 +15,10 @@ def main():
             continue
         df = None
         comment_path = os.path.join(comments_dir_path, dir_name, 'comments.parquet.zstd')
-        if os.path.exists(comment_path):
-            comment_df = pl.read_parquet(comment_path)
-            if all(col in comment_df.columns for col in comment_cols):
-                continue
+        # if os.path.exists(comment_path):
+        #     comment_df = pl.read_parquet(comment_path)
+        #     if all(col in comment_df.columns for col in comment_cols):
+        #         continue
         if os.path.exists(os.path.join(comments_dir_path, dir_name, dir_name)):
             comment_dir_path = os.path.join(comments_dir_path, dir_name, dir_name)
         else:
@@ -39,11 +39,11 @@ def main():
                         continue
                     file_df = pl.concat(file_dfs, how='diagonal_relaxed')
                 file_df = file_df.with_columns(pl.col('user').struct.field('uid').cast(pl.UInt64).alias('uid'))
-                file_df = file_df.select(comment_cols)
+                # file_df = file_df.select(comment_cols)
                 if df is None:
                     df = file_df
                 else:
-                    df = pl.concat([df, file_df])
+                    df = pl.concat([df, file_df], how='diagonal_relaxed')
         df.write_parquet(comment_path, compression='zstd')
 
 
